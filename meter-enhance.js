@@ -258,7 +258,9 @@ function resolveTargetBinaries(options = {}) {
     options.enhanceBackupDir ||
     options.stateDir ||
     options.skipProcessCheck ||
-    process.env.NODE_TEST_CONTEXT
+    process.env.NODE_TEST_CONTEXT ||
+    process.env.AG_METER_TEST_MODE === '1' ||
+    process.env.NODE_ENV === 'test'
   );
   if (hasIsolationSignal && !(options.homeDir && options.localAppData)) {
     return [];
@@ -964,9 +966,6 @@ function getEnhanceStatus(options = {}) {
 function applyEnhancePatch(payload = {}, options = {}) {
   const platform = options.platform || process.platform;
   const arch = options.arch || process.arch;
-  if (!Array.isArray(options.targets) && (platform !== 'win32' || arch !== 'x64')) {
-    return { ok: false, error: '当前操作系统或架构不支持 Windows PE64 内核原位补丁' };
-  }
 
   const promptTier = normalizePromptTier(payload.promptTier);
   if (promptTier === undefined) {
@@ -985,7 +984,7 @@ function applyEnhancePatch(payload = {}, options = {}) {
     return { ok: false, error: '未指定要应用的提示词档位、中文标题或上下文设置' };
   }
 
-  // 防止测试/隔离调用错传单数路径键或漏传 targets 时误落至本机真实安装目录
+  // 防止测试/隔离调用错传单数路径键或漏传 targets 时误落至本机真实安装目录（必须在平台短路口前校验）
   const typoTargetKey = ['targetPath', 'binPath', 'binaryPath', 'filePath', 'target'].find(
     (k) => (options && options[k]) || (payload && payload[k])
   );
@@ -1002,7 +1001,9 @@ function applyEnhancePatch(payload = {}, options = {}) {
     options.homeDir ||
     options.stateDir ||
     options.skipProcessCheck ||
-    process.env.NODE_TEST_CONTEXT
+    process.env.NODE_TEST_CONTEXT ||
+    process.env.AG_METER_TEST_MODE === '1' ||
+    process.env.NODE_ENV === 'test'
   );
   if (!Array.isArray(options.targets) && hasIsolationContext && !(options.homeDir && options.localAppData)) {
     return {
@@ -1013,6 +1014,10 @@ function applyEnhancePatch(payload = {}, options = {}) {
   }
   if (Array.isArray(options.targets) && options.targets.length === 0) {
     return { ok: false, code: 'MISSING_TARGETS', error: '未提供有效的目标二进制文件 (options.targets 为空)' };
+  }
+
+  if (!Array.isArray(options.targets) && (platform !== 'win32' || arch !== 'x64')) {
+    return { ok: false, error: '当前操作系统或架构不支持 Windows PE64 内核原位补丁' };
   }
 
   const targets = resolveTargetBinaries(options).filter((t) => fs.existsSync(t.path));

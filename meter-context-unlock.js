@@ -20,7 +20,7 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { execFile, execFileSync } = require('child_process');
-const { getStateDir } = require('./asar-engine');
+const { getStateDir, isIsolatedTestPath } = require('./asar-engine');
 
 const PCLNTAB_MAGIC = 0xFFFFFFF1;
 
@@ -153,6 +153,10 @@ function detectTargetBinary(customPath) {
     throw new Error(`指定的目标文件不存在: ${customPath}`);
   }
 
+  if (process.env.AG_METER_TEST_MODE === '1' || process.env.NODE_ENV === 'test') {
+    return null;
+  }
+
   const home = os.homedir();
   const candidates = [];
 
@@ -181,6 +185,32 @@ function detectTargetBinary(customPath) {
     if (fs.existsSync(p)) return p;
   }
   return null;
+}
+
+function isPeBinaryFile(targetPath) {
+  try {
+    if (!targetPath || !fs.existsSync(targetPath)) return false;
+    const st = fs.statSync(targetPath);
+    if (!st.isFile() || st.size < 2) return false;
+    const fd = fs.openSync(targetPath, 'r');
+    try {
+      const hdr = Buffer.alloc(2);
+      return fs.readSync(fd, hdr, 0, 2, 0) === 2 && hdr[0] === 0x4d && hdr[1] === 0x5a;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function isPlatformAllowedForTarget(targetPath, options = {}, explicitTarget = false) {
+  const effectivePlatform = options.platform || process.platform;
+  if (effectivePlatform === 'win32') return true;
+  if (!options.platform && explicitTarget && isPeBinaryFile(targetPath)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -1009,23 +1039,47 @@ async function getRunningLanguageServerInfoAsync(targetPath, forceRefresh = fals
         const binName = targetPath ? path.basename(targetPath) : 'language_server';
         const res = await new Promise((resolve, reject) => {
           execFile('pgrep', ['-f', binName], { encoding: 'utf8', timeout: 2000 }, (err, out) => {
-            if (err) reject(err); else resolve(out);
+            if (err && (err.code === 1 || err.status === 1)) {
+              resolve('');
+            } else if (err) {
+              reject(err);
+            } else {
+              resolve(out);
+            }
           });
         });
-        const pids = String(res || '').trim().split(/\s+/).map(Number).filter(Boolean);
-        if (pids.length > 0) {
+        const rawPids = String(res || '').trim().split(/\s+/).map(Number).filter(p => p > 0 && p !== process.pid);
+        let matchedPids = rawPids;
+        if (rawPids.length > 0 && targetPath && isIsolatedTestPath(targetPath)) {
+          const resolvedTarget = path.resolve(targetPath);
+          const verified = [];
+          for (const pid of rawPids) {
+            try {
+              const cmdOut = await new Promise((resolve, reject) => {
+                execFile('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 1500 }, (err, out) => {
+                  if (err) reject(err); else resolve(out);
+                });
+              });
+              if (String(cmdOut || '').includes(resolvedTarget)) {
+                verified.push(pid);
+              }
+            } catch {}
+          }
+          matchedPids = verified;
+        }
+        if (matchedPids.length > 0) {
           result.isRunning = true;
-          result.pids = pids;
-          result.pid = pids[0];
+          result.pids = matchedPids;
+          result.pid = matchedPids[0];
           try {
             const psOut = await new Promise((resolve, reject) => {
-              execFile('ps', ['-p', String(pids[0]), '-o', 'etimes='], { encoding: 'utf8', timeout: 1500 }, (err, out) => {
+              execFile('ps', ['-p', String(matchedPids[0]), '-o', 'lstart='], { encoding: 'utf8', timeout: 1500 }, (err, out) => {
                 if (err) reject(err); else resolve(out);
               });
             });
-            const elapsedSec = parseInt(String(psOut || '').trim(), 10);
-            if (!isNaN(elapsedSec)) {
-              result.startTimeMs = Date.now() - (elapsedSec * 1000);
+            const parsedStart = Date.parse(String(psOut || '').trim());
+            if (!Number.isNaN(parsedStart) && parsedStart > 0) {
+              result.startTimeMs = parsedStart;
             }
           } catch {}
         } else {
@@ -1307,8 +1361,20 @@ function buildAnalysisResult({
  * 完整分析二进制支持度与补丁状态（纯异步非阻塞版本，供主进程 IPC、CLI 及前端使用）
  */
 async function analyzeBinaryAsync(filePath, options = {}) {
+  const explicitTarget = Boolean(filePath);
   const target = filePath || detectTargetBinary();
   if (!target || !fs.existsSync(target)) {
+    const effectivePlatform = options.platform || process.platform;
+    if (effectivePlatform !== 'win32' && !explicitTarget) {
+      return {
+        status: 'unsupported',
+        targetPath: target,
+        format: effectivePlatform === 'darwin' ? 'Mach-O' : 'ELF',
+        arch: os.arch(),
+        reason: `暂未开放对 ${effectivePlatform} 平台的写入支持：受 macOS/Linux 代码签名校验与动态安全策略限制，当前版本仅在 Windows (x86-64) 平台完成端到端签名与安全回滚验收，以避免导致后端语言服务器异常崩溃。`,
+        isPlatformSupported: false
+      };
+    }
     return {
       status: 'unsupported',
       targetPath: target,
@@ -1316,14 +1382,15 @@ async function analyzeBinaryAsync(filePath, options = {}) {
     };
   }
 
-  // 跨平台安全策略拦截：仅支持 Windows (x86-64)
-  if (process.platform !== 'win32') {
+  // 跨平台安全策略拦截：仅支持 Windows (x86-64)；显式传入 PE (MZ) 文件用于跨平台单测分析时予以放行
+  const effectivePlatform = options.platform || process.platform;
+  if (!isPlatformAllowedForTarget(target, options, explicitTarget)) {
     return {
       status: 'unsupported',
       targetPath: target,
-      format: process.platform === 'darwin' ? 'Mach-O' : 'ELF',
+      format: effectivePlatform === 'darwin' ? 'Mach-O' : 'ELF',
       arch: os.arch(),
-      reason: `暂未开放对 ${process.platform} 平台的写入支持：受 macOS/Linux 代码签名校验与动态安全策略限制，当前版本仅在 Windows (x86-64) 平台完成端到端签名与安全回滚验收，以避免导致后端语言服务器异常崩溃。`,
+      reason: `暂未开放对 ${effectivePlatform} 平台的写入支持：受 macOS/Linux 代码签名校验与动态安全策略限制，当前版本仅在 Windows (x86-64) 平台完成端到端签名与安全回滚验收，以避免导致后端语言服务器异常崩溃。`,
       isPlatformSupported: false
     };
   }
@@ -1331,8 +1398,8 @@ async function analyzeBinaryAsync(filePath, options = {}) {
   let buf;
   let stats;
   try {
-    stats = fs.statSync(target);
-    buf = fs.readFileSync(target);
+    stats = await fs.promises.stat(target);
+    buf = await fs.promises.readFile(target);
   } catch (e) {
     return {
       status: 'failed',
@@ -1642,7 +1709,9 @@ function resolveUnlockTargetPath(options = {}) {
     options.homeDir ||
     options.stateDir ||
     options.skipProcessCheck ||
-    process.env.NODE_TEST_CONTEXT
+    process.env.NODE_TEST_CONTEXT ||
+    process.env.AG_METER_TEST_MODE === '1' ||
+    process.env.NODE_ENV === 'test'
   );
   if (hasIsolationContext) {
     return {
@@ -1666,11 +1735,19 @@ function resolveUnlockTargetPath(options = {}) {
  * 执行上下文长度模式应用与已知态安全互切 (default / fixed / dynamic)
  */
 function applyUnlock(options = {}) {
-  if (process.platform !== 'win32') {
+  const resolvedTarget = resolveUnlockTargetPath(options);
+  if (!resolvedTarget.ok) {
+    return resolvedTarget;
+  }
+  const target = resolvedTarget.target;
+
+  // 跨平台安全策略拦截：优先校验目标参数，随后放行显式 Win32 PE (MZ) 或拦截非 Windows 宿主二进制
+  const effectivePlatform = options.platform || process.platform;
+  if (!isPlatformAllowedForTarget(target, options, Boolean(options.targetPath))) {
     return {
       ok: false,
       code: 'PLATFORM_UNSUPPORTED',
-      error: `当前平台 (${process.platform}) 暂未通过安全写入与签名验证验收，已自动拦截写入操作，确保客户端稳定。`
+      error: `当前平台 (${effectivePlatform}) 暂未通过安全写入与签名验证验收，已自动拦截写入操作，确保客户端稳定。`
     };
   }
 
@@ -1678,12 +1755,6 @@ function applyUnlock(options = {}) {
   if (!targetSpec.ok) {
     return { ok: false, code: targetSpec.code || 'INVALID_INPUT', error: targetSpec.error };
   }
-
-  const resolvedTarget = resolveUnlockTargetPath(options);
-  if (!resolvedTarget.ok) {
-    return resolvedTarget;
-  }
-  const target = resolvedTarget.target;
 
   const analysis = analyzeBinary(target, {
     backupDir: options.backupDir,
@@ -1920,22 +1991,38 @@ function applyUnlock(options = {}) {
  * 恢复原版二进制 (Restore) — 严格校验路径、PE 构建版本与完整哈希匹配
  */
 function restoreUnlock(options = {}) {
-  if (process.platform !== 'win32') {
-    return {
-      ok: false,
-      code: 'PLATFORM_UNSUPPORTED',
-      error: `当前平台 (${process.platform}) 暂未通过安全写入验证，已自动拦截操作。`
-    };
-  }
-
   const resolvedTarget = resolveUnlockTargetPath(options);
   if (!resolvedTarget.ok) {
     return resolvedTarget;
   }
   const target = resolvedTarget.target;
 
+  const effectivePlatform = options.platform || process.platform;
+  if (options.platform && options.platform !== 'win32') {
+    return {
+      ok: false,
+      code: 'PLATFORM_UNSUPPORTED',
+      error: `当前平台 (${effectivePlatform}) 暂未通过安全写入验证，已自动拦截操作。`
+    };
+  }
+
   if (!target || !fs.existsSync(target)) {
+    if (effectivePlatform !== 'win32' && !options.targetPath) {
+      return {
+        ok: false,
+        code: 'PLATFORM_UNSUPPORTED',
+        error: `当前平台 (${effectivePlatform}) 暂未通过安全写入验证，已自动拦截操作。`
+      };
+    }
     return { ok: false, error: '目标文件不存在，无法恢复' };
+  }
+
+  if (!isPlatformAllowedForTarget(target, options, Boolean(options.targetPath))) {
+    return {
+      ok: false,
+      code: 'PLATFORM_UNSUPPORTED',
+      error: `当前平台 (${effectivePlatform}) 暂未通过安全写入验证，已自动拦截操作。`
+    };
   }
 
   const manifest = loadManifest(options.backupDir);

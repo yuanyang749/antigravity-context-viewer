@@ -424,11 +424,11 @@ test('主线程无阻塞验证：异步进程枚举期间 Node.js 事件循环�
     const testFile = path.join(tmpDir, 'language_server.exe');
     fs.writeFileSync(testFile, createMockGoBinary({ isPatched: false }));
 
-    // 启动一个 5ms 的高频事件循环计数器
+    // 启动一个 1ms 的高频事件循环计数器
     let tickCount = 0;
     const interval = setInterval(() => {
       tickCount++;
-    }, 5);
+    }, 1);
 
     // 调用异步分析
     const analysis = await analyzeBinaryAsync(testFile, { backupDir: tmpDir, forceRefresh: true });
@@ -442,16 +442,62 @@ test('主线程无阻塞验证：异步进程枚举期间 Node.js 事件循环�
   }
 });
 
-test('跨平台与安全架构拦截：非支持平台或架构明确拒绝写入', () => {
-  // 模拟非法平台传入
-  const origPlatform = process.platform;
+test('跨平台与安全架构拦截：非支持平台或架构明确拒绝写入', async () => {
+  // 1) 验证 ELF/PE 架构解析器提取正确
+  const mock = createMockGoBinary();
+  const textInfo = findTextSection(mock);
+  assert.equal(textInfo.arch, 'x86-64');
+
+  // 2) 通过 options.platform 覆盖验证非 Windows 平台均返回 unsupported / PLATFORM_UNSUPPORTED
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'unlock-platform-'));
   try {
-    // 验证状态判定中的平台支持说明
-    const mock = createMockGoBinary();
-    const textInfo = findTextSection(mock);
-    assert.equal(textInfo.arch, 'x86-64');
+    const testFile = path.join(tmpDir, 'language_server');
+    fs.writeFileSync(testFile, mock);
+
+    const darwinAnalyze = await analyzeBinaryAsync(testFile, { platform: 'darwin', backupDir: tmpDir });
+    assert.equal(darwinAnalyze.status, 'unsupported');
+    assert.match(darwinAnalyze.reason, /Windows/i);
+
+    const darwinApply = await applyUnlock({
+      platform: 'darwin',
+      targetPath: testFile,
+      targetLimitTokens: 262144,
+      backupDir: tmpDir
+    });
+    assert.equal(darwinApply.ok, false);
+    assert.equal(darwinApply.code, 'PLATFORM_UNSUPPORTED');
+
+    const darwinRestore = await restoreUnlock({
+      platform: 'darwin',
+      targetPath: testFile,
+      backupDir: tmpDir
+    });
+    assert.equal(darwinRestore.ok, false);
+    assert.equal(darwinRestore.code, 'PLATFORM_UNSUPPORTED');
+
+    // 3) 验证显式传入非 PE (Mach-O) 目标文件时，非 Windows 宿主下同样明确拒绝并返回 unsupported / PLATFORM_UNSUPPORTED
+    const machoFile = path.join(tmpDir, 'language_server_macho');
+    fs.writeFileSync(machoFile, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.alloc(128, 0)]));
+
+    const machoAnalyze = await analyzeBinaryAsync(machoFile, { backupDir: tmpDir });
+    assert.equal(machoAnalyze.status, 'unsupported');
+
+    const machoApply = await applyUnlock({
+      targetPath: machoFile,
+      targetLimitTokens: 262144,
+      backupDir: tmpDir
+    });
+    assert.equal(machoApply.ok, false);
+    assert.equal(machoApply.code, 'PLATFORM_UNSUPPORTED');
+
+    const machoRestore = await restoreUnlock({
+      targetPath: machoFile,
+      backupDir: tmpDir
+    });
+    assert.equal(machoRestore.ok, false);
+    assert.equal(machoRestore.code, 'PLATFORM_UNSUPPORTED');
   } finally {
-    Object.defineProperty(process, 'platform', { value: origPlatform });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 

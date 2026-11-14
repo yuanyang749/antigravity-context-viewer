@@ -211,19 +211,21 @@ function generateChinesePreloadCode(dictContent, runtimeContent) {
   return `\n${TAGS.CHINESE_START}
 (function() {
   try {
-    var _i18nConfig = { enabled: true, language: 'zh-CN', brandTitle: 'english' };
+    var _chineseEnabled = false;
+    var _i18nConfig = { enabled: false, language: 'en', brandTitle: 'english' };
     try {
-      if (typeof electron_1 !== 'undefined' && electron_1.ipcRenderer && typeof electron_1.ipcRenderer.sendSync === 'function') {
+      if (typeof electron_1 !== 'undefined' && electron_1 && electron_1.ipcRenderer && typeof electron_1.ipcRenderer.sendSync === 'function') {
         var _syncCfg = electron_1.ipcRenderer.sendSync('context-meter:get-chinese-config-sync');
         if (_syncCfg && typeof _syncCfg === 'object') {
           _i18nConfig.enabled = _syncCfg.enabled !== false && _syncCfg.language !== 'en';
           _i18nConfig.language = _syncCfg.language || (_i18nConfig.enabled ? 'zh-CN' : 'en');
           _i18nConfig.brandTitle = _syncCfg.brandTitle || 'english';
+          _chineseEnabled = Boolean(_i18nConfig.enabled === true || _i18nConfig.brandTitle !== 'english');
         }
       }
     } catch(ipcErr) {}
     try {
-      if (typeof electron_1 !== 'undefined' && electron_1.ipcRenderer && typeof electron_1.ipcRenderer.on === 'function') {
+      if (typeof electron_1 !== 'undefined' && electron_1 && electron_1.ipcRenderer && typeof electron_1.ipcRenderer.on === 'function') {
         electron_1.ipcRenderer.on('context-meter:brand-title-changed', function(_e, newBrand) {
           try {
             _i18nConfig.brandTitle = newBrand || 'english';
@@ -238,12 +240,17 @@ function generateChinesePreloadCode(dictContent, runtimeContent) {
     var _path = typeof require === 'function' ? (function() { try { return require('path'); } catch(e) { return null; } })() : null;
     var _os = typeof require === 'function' ? (function() { try { return require('os'); } catch(e) { return null; } })() : null;
     if (_fs && _path && _os) {
-      var _localApp = process.platform === 'win32'
-        ? (process.env.LOCALAPPDATA || _path.join(_os.homedir(), 'AppData', 'Local'))
-        : (process.platform === 'darwin'
-          ? _path.join(_os.homedir(), 'Library', 'Application Support')
-          : _path.join(_os.homedir(), '.local', 'state'));
-      var _cfgP = _path.join(_localApp, 'AntigravityContextMeter', 'modules.json');
+      var _stateDir = (typeof process !== 'undefined' && process.env && process.env.AG_METER_STATE_DIR)
+        ? process.env.AG_METER_STATE_DIR
+        : (function() {
+            var _localApp = process.platform === 'win32'
+              ? (process.env.LOCALAPPDATA || _path.join(_os.homedir(), 'AppData', 'Local'))
+              : (process.platform === 'darwin'
+                ? _path.join(_os.homedir(), 'Library', 'Application Support')
+                : (process.env.XDG_STATE_HOME || _path.join(_os.homedir(), '.local', 'state')));
+            return _path.join(_localApp, 'AntigravityContextMeter');
+          })();
+      var _cfgP = _path.join(_stateDir, 'modules.json');
       if (_fs.existsSync(_cfgP)) {
         try {
           var _c = JSON.parse(_fs.readFileSync(_cfgP, 'utf8'));
@@ -255,9 +262,21 @@ function generateChinesePreloadCode(dictContent, runtimeContent) {
             if (_c && _c.modules && _c.modules.chinese && _c.modules.chinese.enabled === false && _i18nConfig.brandTitle === 'english') {
               return;
             }
+            _chineseEnabled = Boolean(_i18nConfig.enabled === true || _i18nConfig.brandTitle !== 'english');
           }
         } catch(e) {}
       }
+    } else if (typeof electron_1 !== 'undefined' && electron_1 && electron_1.ipcRenderer && typeof electron_1.ipcRenderer.sendSync === 'function') {
+      try {
+        if (!_chineseEnabled && electron_1.ipcRenderer.sendSync('context-meter:is-chinese-enabled') === true) {
+          _chineseEnabled = true;
+          _i18nConfig.enabled = true;
+          _i18nConfig.language = 'zh-CN';
+        }
+      } catch(e) {}
+    }
+    if (!_chineseEnabled) {
+      return;
     }
 
     var _dictData = ${dictContent.trim()};
