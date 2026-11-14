@@ -4,6 +4,7 @@ const os = require('os');
 const path = require('path');
 const { fileURLToPath } = require('url');
 const { spawn, spawnSync, execFile } = require('child_process');
+const { getAppDataDir } = require('./asar-engine');
 const { buildCliProxyEnv } = require('./meter-proxy');
 
 const windowsTerminalPlacement = `
@@ -729,17 +730,16 @@ function resolveCliExecutable(customCliPath, options = {}) {
  * 探测并解析当前最适合的 CLI 项目工作目录
  */
 async function resolveCliWorkspace(options = {}) {
-  const home = options.homeDir || process.env.USERPROFILE || os.homedir();
-  const agDir = options.agDir || process.env.AG_DIR || path.join(home, '.gemini', 'antigravity');
+  const hasExplicitEnv = Boolean(options && options.env && typeof options.env === 'object');
+  const env = hasExplicitEnv ? options.env : process.env;
+  const hasExplicitHome = Boolean(options && typeof options.homeDir === 'string' && options.homeDir.trim());
+  const home = hasExplicitHome
+    ? options.homeDir.trim()
+    : (env.USERPROFILE || (hasExplicitEnv ? env.HOME : null) || os.homedir());
+  const hasExplicitEnvKey = key => hasExplicitEnv && Object.prototype.hasOwnProperty.call(env, key);
+  const agDir = options.agDir || (((!hasExplicitHome || hasExplicitEnvKey('AG_DIR')) && env.AG_DIR) || path.join(home, '.gemini', 'antigravity'));
   const configDir = options.configDir || path.join(home, '.gemini', 'config');
-  const platform = options.platform || process.platform;
-  const appDataDir = options.appDataDir || process.env.APPDATA || (
-    platform === 'win32'
-      ? path.join(home, 'AppData', 'Roaming')
-      : platform === 'darwin'
-        ? path.join(home, 'Library', 'Application Support')
-        : (process.env.XDG_CONFIG_HOME || path.join(home, '.config'))
-  );
+  const appDataDir = getAppDataDir(options);
 
   // 1. 显式传入的 cwd 优先
   if (options.cwd !== undefined && options.cwd !== null && String(options.cwd).trim() !== '') {

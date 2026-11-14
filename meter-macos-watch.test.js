@@ -248,10 +248,26 @@ async function startStrictOriginCdpServer(initialState = {}) {
 test('macOS 跨平台路径统一：AppData、状态目录、旧配置迁移与代理探测路径均指向 Application Support', () => {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-mac-paths-'));
   const prevStateEnv = process.env.AG_METER_STATE_DIR;
+  const prevAppDataEnv = process.env.APPDATA;
+  const prevLocalAppDataEnv = process.env.LOCALAPPDATA;
   try {
+    process.env.APPDATA = path.join(tmpHome, 'ambient-appdata');
+    process.env.LOCALAPPDATA = path.join(tmpHome, 'ambient-localappdata');
     assert.equal(
       getAppDataDir({ platform: 'darwin', homeDir: tmpHome, env: {} }),
       path.join(tmpHome, 'Library', 'Application Support')
+    );
+    assert.equal(
+      getAppDataDir({ platform: 'darwin', homeDir: tmpHome }),
+      path.join(tmpHome, 'Library', 'Application Support')
+    );
+    assert.equal(
+      getAppDataDir({ platform: 'win32', homeDir: tmpHome }),
+      path.join(tmpHome, 'AppData', 'Roaming')
+    );
+    assert.equal(
+      getAppDataDir({ platform: 'win32', homeDir: tmpHome, env: { APPDATA: path.join(tmpHome, 'custom-roaming') } }),
+      path.join(tmpHome, 'custom-roaming')
     );
 
     if (process.platform === 'darwin') {
@@ -283,6 +299,10 @@ test('macOS 跨平台路径统一：AppData、状态目录、旧配置迁移与�
   } finally {
     if (prevStateEnv !== undefined) process.env.AG_METER_STATE_DIR = prevStateEnv;
     else delete process.env.AG_METER_STATE_DIR;
+    if (prevAppDataEnv !== undefined) process.env.APPDATA = prevAppDataEnv;
+    else delete process.env.APPDATA;
+    if (prevLocalAppDataEnv !== undefined) process.env.LOCALAPPDATA = prevLocalAppDataEnv;
+    else delete process.env.LOCALAPPDATA;
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
 });

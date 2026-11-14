@@ -23,11 +23,11 @@ function getProxyCandidatePaths(customPath = null) {
       path.join(resolvedState, 'modules.json')
     );
   }
-  const localBase = process.env.LOCALAPPDATA || (process.platform === 'win32'
-    ? path.join(os.homedir(), 'AppData', 'Local')
+  const localBase = process.platform === 'win32'
+    ? (process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'))
     : process.platform === 'darwin'
       ? path.join(os.homedir(), 'Library', 'Application Support')
-      : (process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config')));
+      : (process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'));
 
   candidates.push(
     path.join(localBase, 'AntigravityContextMeter', 'proxy.json'),

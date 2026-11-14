@@ -186,15 +186,33 @@ function getAppDataDir(options = {}) {
   if (options && typeof options.appDataDir === 'string' && options.appDataDir.trim()) {
     return path.resolve(options.appDataDir.trim());
   }
-  if (process.env.APPDATA) return process.env.APPDATA;
-  const home = (options && options.homeDir) || os.homedir();
-  if (process.platform === 'win32') {
+  const hasExplicitEnv = Boolean(options && options.env && typeof options.env === 'object');
+  const env = hasExplicitEnv ? options.env : process.env;
+  const hasExplicitPlatform = Boolean(options && typeof options.platform === 'string' && options.platform.trim());
+  const platform = hasExplicitPlatform ? options.platform.trim() : process.platform;
+  const hasExplicitHome = Boolean(options && typeof options.homeDir === 'string' && options.homeDir.trim());
+  const home = hasExplicitHome ? options.homeDir.trim() : (
+    hasExplicitEnv ? (env.USERPROFILE || env.HOME || os.homedir()) : os.homedir()
+  );
+
+  // Only honor APPDATA on win32 or when no platform/homeDir override is specified (preserves legacy process.env.APPDATA test overrides).
+  const allowEnvAppData = platform === 'win32'
+    ? (!hasExplicitHome || (hasExplicitEnv && Object.prototype.hasOwnProperty.call(env, 'APPDATA')))
+    : (!hasExplicitPlatform && !hasExplicitHome && (!hasExplicitEnv || Object.prototype.hasOwnProperty.call(env, 'APPDATA')));
+
+  if (allowEnvAppData && env && typeof env.APPDATA === 'string' && env.APPDATA.trim()) {
+    return env.APPDATA;
+  }
+  if (platform === 'win32') {
     return path.join(home, 'AppData', 'Roaming');
   }
-  if (process.platform === 'darwin') {
+  if (platform === 'darwin') {
     return path.join(home, 'Library', 'Application Support');
   }
-  return process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+  const allowEnvXdg = !hasExplicitHome || (hasExplicitEnv && Object.prototype.hasOwnProperty.call(env, 'XDG_CONFIG_HOME'));
+  return (allowEnvXdg && env && typeof env.XDG_CONFIG_HOME === 'string' && env.XDG_CONFIG_HOME.trim())
+    ? env.XDG_CONFIG_HOME
+    : path.join(home, '.config');
 }
 
 function isIsolatedTestPath(targetPath) {

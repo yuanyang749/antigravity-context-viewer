@@ -125,14 +125,35 @@ test('CLI 启动模块 2b: macOS 路径探测 (~/.gemini/antigravity/bin/agy、P
       })
     );
 
-    const ws = await resolveCliWorkspace({
-      platform: 'darwin',
-      homeDir: tmpDir,
-      configDir: path.join(tmpDir, '.gemini', 'config')
-    });
-    assert.equal(ws.ok, true);
-    assert.equal(ws.source, 'last_selected_project');
-    assert.equal(ws.cwd, workspaceDir);
+    const prevAppData = process.env.APPDATA;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    process.env.APPDATA = path.join(tmpDir, 'ambient-win-roaming');
+    process.env.XDG_CONFIG_HOME = path.join(tmpDir, 'ambient-xdg');
+    try {
+      const ws = await resolveCliWorkspace({
+        platform: 'darwin',
+        homeDir: tmpDir,
+        configDir: path.join(tmpDir, '.gemini', 'config')
+      });
+      assert.equal(ws.ok, true);
+      assert.equal(ws.source, 'last_selected_project');
+      assert.equal(ws.cwd, workspaceDir);
+
+      const wsWithEnv = await resolveCliWorkspace({
+        platform: 'darwin',
+        homeDir: tmpDir,
+        configDir: path.join(tmpDir, '.gemini', 'config'),
+        env: { APPDATA: path.join(tmpDir, 'explicit-env-roaming') }
+      });
+      assert.equal(wsWithEnv.ok, true);
+      assert.equal(wsWithEnv.source, 'last_selected_project');
+      assert.equal(wsWithEnv.cwd, workspaceDir);
+    } finally {
+      if (prevAppData !== undefined) process.env.APPDATA = prevAppData;
+      else delete process.env.APPDATA;
+      if (prevXdgConfig !== undefined) process.env.XDG_CONFIG_HOME = prevXdgConfig;
+      else delete process.env.XDG_CONFIG_HOME;
+    }
 
     // 验证 macOS AppleScript 生成 ($SHELL / zsh + TERM/COLORTERM)
     const macDry = await launchCliSession({
