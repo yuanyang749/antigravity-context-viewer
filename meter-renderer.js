@@ -21,8 +21,36 @@
     getDailyModelCost,
     calculateIntervalCost,
     convertToCNY,
-    resolveEffectivePlanStatus
+    resolveEffectivePlanStatus,
+    resolveModelQuota,
+    getModelPoolKey,
+    formatResetTimeZh,
+    formatResetCountdownZh,
+    formatApproxTokensZh,
+    summarizeModelQuotaPools
   } = (globalThis.__AGContextMeterCore || {});
+
+  const QUOTA_BADGE_STORAGE_KEY = 'ag_show_quota_badge_v1';
+  let showQuotaBadge = true;
+  try {
+    const savedQuotaToggle = typeof localStorage !== 'undefined' && localStorage.getItem(QUOTA_BADGE_STORAGE_KEY);
+    if (savedQuotaToggle === 'false') showQuotaBadge = false;
+  } catch {}
+  let quotaTooltipOpen = false;
+  let quotaTooltipPinned = false;
+  let quotaAt = 0;
+  let quotaBusy = false;
+  let quotaNext = Date.now() + 2500;
+  let quotaError = '';
+  let quotaReqSeq = 0;
+  let cascadeModelConfigs = null;
+  let quotaSummaryPayload = null;
+  let quotaSummary = null;
+  let quotaExplicitModel = '';
+  let lastDomModelCheckAt = 0;
+  let cachedDomModel = '';
+  let quotaCalibrationStore = null;
+  let quotaTestUsageEvents = null;
   const host = document.createElement('div');
   host.id = 'ag-context-meter';
   host.setAttribute('data-layout', 'wide');
@@ -82,7 +110,7 @@
       --ag-token-accent-default:#a78bfa;
 
       /* 0 级主题背景与一级/二级严格统一背景色 */
-      --ag-bg-panel-default:var(--ag-host-bg,var(--background,#181818));
+      --ag-bg-panel-default:var(--ag-host-bg,#181818);
       --ag-unified-bg:var(--ag-custom-panel-bg,var(--ag-bg-panel-default));
 
       --ag-float-bg:var(--ag-unified-bg);
@@ -181,7 +209,7 @@
       --ag-token-total-default:#52525b;
       --ag-token-accent-default:#7c3aed;
 
-      --ag-bg-panel-default:var(--ag-host-bg,var(--background,#ffffff));
+      --ag-bg-panel-default:var(--ag-host-bg,#ffffff);
       --ag-unified-bg:var(--ag-custom-panel-bg,var(--ag-bg-panel-default));
 
       --ag-float-bg:var(--ag-unified-bg);
@@ -256,7 +284,7 @@
       background:var(--ag-toolbar-bg);color:var(--ag-toolbar-fg);
       white-space:nowrap;font-variant-numeric:tabular-nums;
       font-size:12px;font-weight:500;letter-spacing:-0.01em;gap:4px;
-      transition:background-color .14s ease,color .14s ease,border-color .14s ease,opacity .14s ease,transform .1s cubic-bezier(0.16,1,0.3,1);
+      transition:background-color .14s ease,color .14s ease,border-color .14s ease,opacity .14s ease;
       flex-shrink:0;
     }
     .ag-unit:hover,.ag-unit:focus-visible,.ag-unit[aria-expanded="true"]{
@@ -265,7 +293,6 @@
     }
     .ag-unit:active{
       background:var(--ag-toolbar-bg-active);
-      transform:scale(0.96);
     }
 
     /* 单元 1: 上下文小圆环按钮（按内容自适应，圆环+百分比共存） */
@@ -425,6 +452,7 @@
       border:1px solid var(--ag-float-border);
       background:var(--ag-float-bg);color:var(--ag-text-primary);
       box-shadow:var(--ag-float-shadow);font-size:11.5px;line-height:1.4;
+      white-space:pre-wrap;
       pointer-events:auto;transition:opacity .15s ease,transform .15s ease;
     }
     #cli-launch-toast[hidden]{display:none!important}
@@ -453,6 +481,9 @@
     :host([data-layout="compact"]) #badge-cli{
       padding:0 5px;font-size:11.5px;gap:3px;
     }
+    :host([data-layout="compact"]) #badge-quota{
+      padding:0 4px;font-size:11px;gap:2px;
+    }
     :host([data-layout="minimal"]) #badge-speed,
     :host([data-layout="minimal"]) #badge-tokens,
     :host([data-layout="minimal"]) #badge-cli{
@@ -466,6 +497,76 @@
     :host([data-layout="ring-only"]) #badge-cli,
     :host([data-layout="ring-only"]) #badge-overflow{
       display:none!important;
+    }
+    :host([data-layout="minimal"]) .quota-window-tag,
+    :host([data-layout="ring-only"]) .quota-pct-val,
+    :host([data-layout="ring-only"]) .quota-window-tag{
+      display:none!important;
+    }
+
+    /* 单元 2: 当前模型剩余配额圆环 */
+    :host{
+      --ag-quota-normal:#10b981;
+    }
+    :host([data-theme="light"]),
+    :host([data-panel-tone="light"]){
+      --ag-quota-normal:#059669;
+    }
+    #badge-quota{
+      gap:4px;
+      color:var(--ag-toolbar-fg);
+    }
+    #badge-quota[hidden]{display:none!important}
+    #badge-quota:hover,#badge-quota:focus-visible,#badge-quota[aria-expanded="true"]{
+      color:var(--ag-toolbar-fg-hover);
+    }
+    .quota-window-tag{
+      font-size:9.5px;
+      font-weight:700;
+      letter-spacing:0.02em;
+      line-height:1;
+      padding:1.5px 4px;
+      border-radius:4px;
+      background:rgba(128,128,140,0.16);
+      color:var(--ag-text-muted);
+      flex-shrink:0;
+    }
+    :host([data-quota-state="warn"]) .quota-window-tag{
+      color:var(--ag-ring-warn,#f59e0b);
+      background:rgba(245,158,11,0.14);
+    }
+    :host([data-quota-state="danger"]) .quota-window-tag{
+      color:var(--ag-ring-danger,#ef4444);
+      background:rgba(239,68,68,0.14);
+    }
+    #badge-quota[data-busy="true"]{
+      opacity:0.7;
+    }
+    .quota-ring-fill{
+      stroke:var(--ag-quota-normal,#10b981);
+      transition:stroke-dasharray .24s ease,stroke .18s ease,opacity .18s ease;
+    }
+    .quota-pct-val{
+      font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums;
+      color:inherit;
+    }
+    :host([data-quota-state="warn"]) .quota-ring-fill,
+    :host([data-quota-state="warn"]) .quota-pct-val,
+    :host([data-quota-state="warn"]) .quota-tip-pct{
+      stroke:var(--ag-ring-warn,#f59e0b);
+      color:var(--ag-ring-warn,#f59e0b);
+    }
+    :host([data-quota-state="danger"]) .quota-ring-fill,
+    :host([data-quota-state="danger"]) .quota-pct-val,
+    :host([data-quota-state="danger"]) .quota-tip-pct{
+      stroke:var(--ag-ring-danger,#ef4444);
+      color:var(--ag-ring-danger,#ef4444);
+    }
+    :host([data-quota-state="unknown"]) .quota-ring-fill{
+      stroke:var(--ag-text-muted,#71717a);
+    }
+    :host([data-quota-state="normal"]) .quota-tip-pct{
+      color:var(--ag-quota-normal,#10b981);
     }
 
     /* 上下文悬停信息气泡（严格还原参考图三层结构） */
@@ -503,8 +604,150 @@
       margin-top:1px;
     }
 
+    /* 模型剩余配额悬停/展开菜单 */
+    #quota-tooltip{
+      position:fixed;top:0;left:0;z-index:2147483600;
+      min-width:276px;max-width:384px;max-height:calc(100vh - 64px);overflow-y:auto;
+      padding:10px 13px;
+      border-radius:10px;border:1px solid var(--ag-float-border);
+      background:var(--ag-float-bg);color:var(--ag-text-primary);
+      box-shadow:var(--ag-float-shadow);
+      pointer-events:none;opacity:0;visibility:hidden;
+      transform:translateY(2px);
+      transition:opacity .12s ease,transform .12s ease,visibility .12s ease;
+      font-variant-numeric:tabular-nums;
+    }
+    #quota-tooltip[data-visible="true"]{
+      opacity:1;visibility:visible;transform:translateY(0);
+    }
+    #quota-tooltip[data-pinned="true"]{
+      pointer-events:auto;
+      border-color:var(--ag-btn-border-hover,var(--ag-float-border));
+    }
+    #quota-tooltip[data-view="hover"]{
+      min-width:236px;max-width:320px;overflow-y:visible;
+    }
+    #quota-tooltip[data-view="hover"] .quota-tip-refresh,
+    #quota-tooltip[data-view="hover"] .quota-tip-dual,
+    #quota-tooltip[data-view="hover"] .quota-tip-section{
+      display:none!important;
+    }
+    .quota-tip-header{
+      display:flex;align-items:center;justify-content:space-between;gap:8px;
+      margin-bottom:2px;
+    }
+    .quota-tip-title{
+      font-size:11.5px;line-height:1.35;font-weight:500;
+      color:var(--ag-text-muted);
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+    }
+    .quota-tip-refresh{
+      border:1px solid var(--ag-btn-border,var(--ag-border-subcard));
+      background:var(--ag-btn-bg,var(--ag-bg-subcard));
+      color:var(--ag-text-secondary);
+      border-radius:5px;padding:2px 7px;font-size:10.5px;font-weight:600;
+      cursor:pointer;flex-shrink:0;line-height:1.3;
+      transition:background-color .12s ease,color .12s ease;
+    }
+    .quota-tip-refresh:hover,.quota-tip-refresh:focus-visible{
+      background:var(--ag-btn-hover,var(--ag-toolbar-bg-hover));
+      color:var(--ag-text-primary);
+    }
+    .quota-tip-pct{
+      font-size:13px;line-height:1.38;font-weight:600;
+      color:var(--ag-text-primary);
+    }
+    .quota-tip-detail{
+      font-size:11.5px;line-height:1.38;font-weight:500;
+      color:var(--ag-text-secondary);
+      margin-top:2px;
+    }
+    .quota-tip-dual{
+      display:grid;grid-template-columns:1fr 1fr;gap:6px;
+      margin-top:8px;
+    }
+    .quota-dual-card{
+      display:flex;flex-direction:column;gap:3px;
+      padding:6px 8px;border-radius:7px;
+      background:var(--ag-bg-subcard);
+      border:1px solid var(--ag-border-subcard);
+      min-width:0;
+    }
+    .quota-dual-head{
+      display:flex;align-items:center;justify-content:space-between;gap:4px;
+      font-size:10.5px;color:var(--ag-text-muted);font-weight:600;
+    }
+    .quota-dual-val{
+      font-size:14px;line-height:1.25;font-weight:700;color:var(--ag-quota-normal,#10b981);
+    }
+    .quota-dual-card[data-tone="warn"] .quota-dual-val{color:var(--ag-ring-warn,#f59e0b)}
+    .quota-dual-card[data-tone="danger"] .quota-dual-val{color:var(--ag-ring-danger,#ef4444)}
+    .quota-dual-card[data-tone="muted"] .quota-dual-val{color:var(--ag-text-muted);font-size:12px}
+    .quota-dual-sub{
+      font-size:10.5px;line-height:1.32;color:var(--ag-text-secondary);
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    }
+    .quota-tip-section{
+      margin-top:8px;padding-top:7px;
+      border-top:1px solid var(--ag-border-subtle);
+    }
+    .quota-tip-section-title{
+      font-size:10.5px;font-weight:600;letter-spacing:0.02em;
+      color:var(--ag-text-muted);margin-bottom:4px;
+    }
+    .quota-tip-pools{
+      display:flex;flex-direction:column;gap:5px;
+    }
+    .quota-weekly-empty{
+      font-size:11px;color:var(--ag-text-muted);
+      padding:4px 6px;border-radius:6px;background:var(--ag-bg-subcard);
+    }
+    .quota-pool-row{
+      display:flex;flex-direction:column;gap:3px;
+      padding:4px 6px;border-radius:6px;
+      background:transparent;
+    }
+    .quota-pool-row[data-active="true"]{
+      background:var(--ag-bg-subcard);
+      border:1px solid var(--ag-border-subcard);
+    }
+    .quota-pool-head{
+      display:flex;align-items:center;justify-content:space-between;gap:10px;
+      font-size:11.5px;line-height:1.3;
+    }
+    .quota-pool-name{
+      font-weight:500;color:var(--ag-text-secondary);
+      white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    }
+    .quota-pool-row[data-active="true"] .quota-pool-name{
+      color:var(--ag-text-primary);font-weight:600;
+    }
+    .quota-pool-meta{
+      font-weight:600;color:var(--ag-text-primary);white-space:nowrap;
+    }
+    .quota-pool-row[data-tone="warn"] .quota-pool-meta{color:var(--ag-ring-warn,#f59e0b)}
+    .quota-pool-row[data-tone="danger"] .quota-pool-meta{color:var(--ag-ring-danger,#ef4444)}
+    .quota-pool-bar{
+      height:3px;width:100%;border-radius:999px;
+      background:rgba(128,128,140,0.22);overflow:hidden;
+    }
+    .quota-pool-bar-fill{
+      height:100%;border-radius:999px;
+      background:var(--ag-quota-normal,#10b981);
+      transition:width .2s ease;
+    }
+    .quota-pool-row[data-window="weekly"] .quota-pool-bar-fill{background:#6366f1}
+    .quota-pool-row[data-tone="warn"] .quota-pool-bar-fill{background:var(--ag-ring-warn,#f59e0b)}
+    .quota-pool-row[data-tone="danger"] .quota-pool-bar-fill{background:var(--ag-ring-danger,#ef4444)}
+    .quota-tip-foot{
+      margin-top:7px;padding-top:5px;
+      border-top:1px solid var(--ag-border-subtle);
+      font-size:10.5px;color:var(--ag-text-muted);
+    }
+
     /* 窄屏溢出菜单浮层 */
     #overflow-menu{
+      box-sizing:border-box;
       position:fixed;top:36px;right:12px;z-index:2147483500;
       width:220px;padding:6px;border-radius:10px;
       border:1px solid var(--ag-float-border);
@@ -512,6 +755,7 @@
       box-shadow:var(--ag-float-shadow);
     }
     #overflow-menu[hidden]{display:none!important}
+    .overflow-item[hidden]{display:none!important}
     .overflow-item{
       width:100%;display:flex;align-items:center;justify-content:space-between;
       padding:7px 9px;border-radius:7px;font-size:12px;color:var(--ag-text-secondary);
@@ -561,6 +805,7 @@
 
     /* 自定义颜色选取器悬浮面板（参考样式：吸管 + 预设圆点 + SV主色区 + 色相条 + HEX/RGB/HSL三行） */
     #color-picker-popover{
+      box-sizing:border-box;
       position:fixed;z-index:2147483640;width:304px;max-height:calc(100vh - 48px);overflow-y:auto;
       background:var(--ag-bg-panel);color:var(--ag-text-primary);
       border:1px solid var(--ag-border-panel);border-radius:10px;
@@ -944,9 +1189,11 @@
       transform-origin:top right;
       transition:opacity .16s cubic-bezier(0.16,1,0.3,1),transform .16s cubic-bezier(0.16,1,0.3,1),visibility .16s ease;
       contain:layout paint;
+      will-change:transform,opacity;
+      backface-visibility:hidden;
     }
     #panel{width:472px;max-width:calc(100vw - 24px)}
-    #panel-tokens{width:730px;transition:width .22s cubic-bezier(0.16,1,0.3,1),left .22s cubic-bezier(0.16,1,0.3,1),max-width .22s cubic-bezier(0.16,1,0.3,1),opacity .16s cubic-bezier(0.16,1,0.3,1),transform .16s cubic-bezier(0.16,1,0.3,1)}
+    #panel-tokens{width:730px;transition:width .22s cubic-bezier(0.16,1,0.3,1),max-width .22s cubic-bezier(0.16,1,0.3,1),opacity .16s cubic-bezier(0.16,1,0.3,1),transform .16s cubic-bezier(0.16,1,0.3,1)}
     #panel-tokens.cost-compact-view{width:400px!important;max-width:calc(100vw - 24px)}
     .ag-panel[hidden]{display:block!important;opacity:0;transform:translateY(-6px);visibility:hidden;pointer-events:none}
 
@@ -1195,6 +1442,7 @@
       background:#ef4444;box-shadow:0 0 0 1.5px var(--ag-bg-panel);
     }
     .update-popover{
+      box-sizing:border-box;
       position:fixed;top:80px;right:24px;width:290px;max-width:calc(100vw - 28px);
       background:var(--ag-unified-bg,#1e1e24);border:1px solid var(--ag-float-border,rgba(255,255,255,0.18));
       border-radius:8px;box-shadow:0 12px 32px rgba(0,0,0,0.55),0 2px 8px rgba(0,0,0,0.3);
@@ -1581,7 +1829,17 @@
     }
   </style>
 
-  <!-- 顶部基本单元 1: 上下文小圆环 -->
+  <!-- 顶部基本单元 1: 当前模型剩余配额圆环（位于上下文圆环左侧） -->
+  <button id="badge-quota" class="ag-unit ag-unit-ring" type="button" aria-label="当前模型剩余配额" data-i18n-aria="badge.quota.aria" aria-describedby="quota-tooltip" aria-expanded="false">
+    <svg id="quota-ring-svg" class="ring-svg" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+      <circle id="quota-ring-track" class="ring-track" cx="9" cy="9" r="6.5" fill="none" stroke-width="2.1"></circle>
+      <circle id="quota-ring-fill" class="ring-fill quota-ring-fill" cx="9" cy="9" r="6.5" fill="none" stroke-width="2.1" stroke-linecap="round" transform="rotate(-90 9 9)" stroke-dasharray="3.2 4.97"></circle>
+    </svg>
+    <span id="quota-window-tag" class="quota-window-tag">5h</span>
+    <span id="quota-pct-val" class="quota-pct-val">--%</span>
+  </button>
+
+  <!-- 顶部基本单元 2: 上下文小圆环 -->
   <button id="badge" class="ag-unit ag-unit-ring" type="button" aria-label="会话与上下文统计" data-i18n-aria="badge.aria" aria-describedby="context-tooltip" aria-expanded="false">
     <svg id="ring-svg" class="ring-svg" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
       <circle id="ring-track" class="ring-track" cx="9" cy="9" r="6.5" fill="none" stroke-width="2.1"></circle>
@@ -1632,6 +1890,27 @@
     <div id="ctx-tip-detail" class="ctx-tip-detail" data-i18n="tip.detail.loading">正在读取当前会话上下文用量…</div>
   </div>
 
+  <!-- 模型剩余配额悬停/点击展开菜单 -->
+  <div id="quota-tooltip" role="tooltip" data-visible="false" data-pinned="false" data-view="hover" data-placement="bottom">
+    <div class="quota-tip-header">
+      <div id="quota-tip-title" class="quota-tip-title" data-i18n="quota.tipTitleDefault">当前模型配额：</div>
+      <button id="quota-tip-refresh" class="quota-tip-refresh" type="button" title="立即刷新配额" data-i18n-title="quota.refreshTitle" aria-label="刷新配额" data-i18n-aria="quota.refreshAria" data-i18n="quota.refresh">刷新</button>
+    </div>
+    <div id="quota-tip-pct" class="quota-tip-pct" data-i18n="quota.loading">正在读取模型配额…</div>
+    <div id="quota-tip-detail" class="quota-tip-detail" data-i18n="quota.hoverHint">悬停查看当前模型周额度，点击查看详情</div>
+    <div id="quota-tip-dual" class="quota-tip-dual" style="display:none"></div>
+    <div id="quota-tip-pools-wrap" class="quota-tip-section" style="display:none">
+      <div class="quota-tip-section-title" data-i18n="quota.section5h">5 小时周期额度 (5h)</div>
+      <div id="quota-tip-pools" class="quota-tip-pools"></div>
+    </div>
+    <div id="quota-tip-weekly-wrap" class="quota-tip-section" style="display:none">
+      <div class="quota-tip-section-title" data-i18n="quota.sectionWeekly">每周总额度 (Weekly)</div>
+      <div id="quota-tip-weekly" class="quota-tip-pools quota-tip-weekly"></div>
+      <div id="quota-weekly-empty" class="quota-weekly-empty" style="display:none" data-i18n="quota.weeklyEmpty">当前语言服务未返回独立周额度数据</div>
+    </div>
+    <div id="quota-tip-foot" class="quota-tip-foot" data-i18n="quota.footHint">点击圆环可固定展开或刷新配额</div>
+  </div>
+
   <!-- 窄屏溢出菜单 -->
   <div id="overflow-menu" hidden aria-label="更多统计快捷菜单" data-i18n-aria="overflow.aria">
     <button id="overflow-speed-btn" class="overflow-item" type="button">
@@ -1641,6 +1920,10 @@
     <button id="overflow-tokens-btn" class="overflow-item" type="button">
       <span class="overflow-item-label"><span class="token-fire-dot"></span><span data-i18n="overflow.tokens">Token 用量一览</span></span>
       <span id="overflow-tokens-val" class="overflow-item-val">--</span>
+    </button>
+    <button id="overflow-quota-btn" class="overflow-item" type="button">
+      <span class="overflow-item-label"><span>📊</span><span data-i18n="overflow.quota">模型剩余配额</span></span>
+      <span id="overflow-quota-val" class="overflow-item-val">--%</span>
     </button>
     <button id="overflow-cli-btn" class="overflow-item" type="button">
       <span class="overflow-item-label"><span class="cli-icon">&gt;_</span><span data-i18n="overflow.cli">启动 CLI 终端</span></span>
@@ -2373,6 +2656,17 @@
               </div>
               <div id="proxy-test-result" style="font-size:11px;margin-top:6px;display:none;color:var(--ag-text-secondary);"></div>
             </div>
+          </div>
+        </div>
+
+        <!-- 5.5 顶栏模型配额圆环显示开关 -->
+        <div class="tech-drawer" id="quota-badge-drawer">
+          <div class="drawer-trigger" style="cursor:default;">
+            <span class="drawer-trigger-left">
+              <span data-i18n="settings.quotaBadge.title">📊 顶栏模型配额圆环</span>
+              <span id="quota-switch-pill" class="key-pill pill-ok" style="margin-left:6px;font-size:10.5px;" data-i18n="settings.quotaBadge.on">已开启</span>
+            </span>
+            <button id="btn-toggle-quota-badge" class="unlock-btn unlock-btn-secondary" type="button" style="padding:3px 10px;font-size:11px;min-height:24px;" data-i18n="settings.quotaBadge.turnOff">关闭显示</button>
           </div>
         </div>
 
@@ -3212,6 +3506,7 @@
 
   const PANEL_I18N = {
     // 顶部入口单元与气泡
+    'badge.quota.aria': { 'zh-CN': '当前模型剩余配额', 'zh-TW': '目前模型剩餘配額', en: 'Current model remaining quota' },
     'badge.aria': { 'zh-CN': '会话与上下文统计', 'zh-TW': '工作階段與上下文統計', en: 'Session and context statistics' },
     'badge.reading': { 'zh-CN': '读取中…', 'zh-TW': '讀取中…', en: 'Loading…' },
     'badge.speed.aria': { 'zh-CN': '模型输出速度与耗时统计', 'zh-TW': '模型輸出速度與耗時統計', en: 'Model output speed and latency' },
@@ -3225,7 +3520,18 @@
     'overflow.aria': { 'zh-CN': '更多统计快捷菜单', 'zh-TW': '更多統計快捷選單', en: 'More metrics menu' },
     'overflow.speed': { 'zh-CN': '输出速度', 'zh-TW': '輸出速度', en: 'Output speed' },
     'overflow.tokens': { 'zh-CN': 'Token 用量一览', 'zh-TW': 'Token 用量一覽', en: 'Token usage' },
+    'overflow.quota': { 'zh-CN': '模型剩余配额', 'zh-TW': '模型剩餘配額', en: 'Model quota' },
     'overflow.cli': { 'zh-CN': '启动 CLI 终端', 'zh-TW': '啟動 CLI 終端機', en: 'Launch CLI' },
+    'quota.tipTitleDefault': { 'zh-CN': '当前模型配额：', 'zh-TW': '目前模型配額：', en: 'Current model quota:' },
+    'quota.refreshTitle': { 'zh-CN': '立即刷新配额', 'zh-TW': '立即重新整理配額', en: 'Refresh quota now' },
+    'quota.refreshAria': { 'zh-CN': '刷新配额', 'zh-TW': '重新整理配額', en: 'Refresh quota' },
+    'quota.refresh': { 'zh-CN': '刷新', 'zh-TW': '重新整理', en: 'Refresh' },
+    'quota.loading': { 'zh-CN': '正在读取模型配额…', 'zh-TW': '正在讀取模型配額…', en: 'Loading model quota…' },
+    'quota.hoverHint': { 'zh-CN': '悬停查看当前模型周额度，点击查看详情', 'zh-TW': '懸停檢視目前模型每週額度，點擊檢視詳情', en: 'Hover for weekly quota, click for details' },
+    'quota.section5h': { 'zh-CN': '5 小时周期额度 (5h)', 'zh-TW': '5 小時週期額度 (5h)', en: '5-Hour Window Quota (5h)' },
+    'quota.sectionWeekly': { 'zh-CN': '每周总额度 (Weekly)', 'zh-TW': '每週總額度 (Weekly)', en: 'Weekly Quota Pool (Weekly)' },
+    'quota.weeklyEmpty': { 'zh-CN': '当前语言服务未返回独立周额度数据', 'zh-TW': '目前語言服務未回傳獨立每週額度資料', en: 'No separate weekly quota returned by language server' },
+    'quota.footHint': { 'zh-CN': '点击圆环可固定展开或刷新配额', 'zh-TW': '點擊圓環可固定展開或重新整理配額', en: 'Click ring to pin details or refresh quota' },
     'cli.launching': { 'zh-CN': '正在打开 Antigravity CLI…', 'zh-TW': '正在開啟 Antigravity CLI…', en: 'Opening Antigravity CLI…' },
     'cli.launched': { 'zh-CN': '已启动 CLI：{path}', 'zh-TW': '已啟動 CLI：{path}', en: 'CLI launched: {path}' },
     'cli.error': { 'zh-CN': '启动 CLI 失败：{err}', 'zh-TW': '啟動 CLI 失敗：{err}', en: 'Failed to launch CLI: {err}' },
@@ -3495,6 +3801,9 @@
     'settings.proxy.urlLabel': { 'zh-CN': '本地代理地址 (例如 http://127.0.0.1:7897 或 socks5://...)：', 'zh-TW': '本機代理位址 (例如 http://127.0.0.1:7897 或 socks5://...)：', en: 'Local proxy URL (e.g. http://127.0.0.1:7897 or socks5://...):' },
     'settings.proxy.bypassLabel': { 'zh-CN': '绕过代理列表 (NO_PROXY)：', 'zh-TW': '略過代理清單 (NO_PROXY)：', en: 'Bypass list (NO_PROXY):' },
     'settings.proxy.testBtn': { 'zh-CN': '🔍 测试代理连通性', 'zh-TW': '🔍 測試代理連通性', en: '🔍 Test Proxy' },
+    'settings.quotaBadge.title': { 'zh-CN': '📊 顶栏模型配额圆环', 'zh-TW': '📊 頂欄模型配額圓環', en: '📊 Top-Bar Model Quota Ring' },
+    'settings.quotaBadge.on': { 'zh-CN': '已开启', 'zh-TW': '已開啟', en: 'Enabled' },
+    'settings.quotaBadge.turnOff': { 'zh-CN': '关闭显示', 'zh-TW': '關閉顯示', en: 'Hide Ring' },
     'settings.colors.title': { 'zh-CN': '🎨 指标与背景颜色自定义（默认跟随主题）', 'zh-TW': '🎨 指標與背景顏色自訂（預設跟隨主題）', en: '🎨 Metric & Background Colors (Follow Theme)' },
     'settings.colors.panelBg': { 'zh-CN': '面板与菜单统一背景色（0级跟随 / 自定义）', 'zh-TW': '面板與選單統一背景色（0 級跟隨 / 自訂）', en: 'Panel & menu background (Auto / Custom)' },
     'settings.colors.ringUsed': { 'zh-CN': '圆环已用部分', 'zh-TW': '圓環已用部分', en: 'Ring used' },
@@ -3741,6 +4050,72 @@
       'cli.notFound': { 'zh-CN': '未检测到可用的 Antigravity CLI (agy)，请检查安装路径', 'zh-TW': '未偵測到可用的 Antigravity CLI (agy)，請檢查安裝路徑', en: 'Antigravity CLI (agy) was not found. Check your installation path.' },
       'cli.failed': { 'zh-CN': '✖ 启动 CLI 失败：{err}', 'zh-TW': '✖ 啟動 CLI 失敗：{err}', en: '✖ Failed to launch CLI: {err}' },
       'cli.exception': { 'zh-CN': '启动 CLI 发生异常', 'zh-TW': '啟動 CLI 發生異常', en: 'Unexpected error launching CLI' },
+
+      // 模型配额圆环 & 开关
+      'settings.quotaBadge.on': { 'zh-CN': '已开启', 'zh-TW': '已開啟', en: 'Enabled' },
+      'settings.quotaBadge.off': { 'zh-CN': '已关闭', 'zh-TW': '已關閉', en: 'Hidden' },
+      'settings.quotaBadge.turnOff': { 'zh-CN': '关闭显示', 'zh-TW': '關閉顯示', en: 'Hide Ring' },
+      'settings.quotaBadge.turnOn': { 'zh-CN': '开启显示', 'zh-TW': '開啟顯示', en: 'Show Ring' },
+      'quota.refresh': { 'zh-CN': '刷新', 'zh-TW': '重新整理', en: 'Refresh' },
+      'quota.refreshing': { 'zh-CN': '刷新中…', 'zh-TW': '更新中…', en: 'Refreshing…' },
+      'quota.approxTokens': { 'zh-CN': '约 {tok} tok', 'zh-TW': '約 {tok} tok', en: '~{tok} tok' },
+      'quota.approxTokensCompact': { 'zh-CN': '约{tok} tok', 'zh-TW': '約{tok} tok', en: '~{tok} tok' },
+      'quota.approx0': { 'zh-CN': '约 0 tok', 'zh-TW': '約 0 tok', en: '~0 tok' },
+      'quota.approx0Compact': { 'zh-CN': '约0 tok', 'zh-TW': '約0 tok', en: '~0 tok' },
+      'quota.exhausted': { 'zh-CN': '已耗尽', 'zh-TW': '已耗盡', en: 'Exhausted' },
+      'quota.poolSelf': { 'zh-CN': '模型池', 'zh-TW': '模型池', en: 'Pool' },
+      'quota.prefix.weekly': { 'zh-CN': '每周剩余', 'zh-TW': '每週剩餘', en: 'Weekly rem.' },
+      'quota.prefix.5h': { 'zh-CN': '5h 剩余', 'zh-TW': '5h 剩餘', en: '5h rem.' },
+      'quota.prefix.generic': { 'zh-CN': '剩余额度', 'zh-TW': '剩餘額度', en: 'Remaining' },
+      'quota.headWithEstExhausted': { 'zh-CN': '{prefix} 0% · {tokStr}（{pool} · {status}）', 'zh-TW': '{prefix} 0% · {tokStr}（{pool} · {status}）', en: '{prefix} 0% · {tokStr} ({pool} · {status})' },
+      'quota.headExhausted': { 'zh-CN': '{prefix} 0%（{pool} · {status}）', 'zh-TW': '{prefix} 0%（{pool} · {status}）', en: '{prefix} 0% ({pool} · {status})' },
+      'quota.headWithEst': { 'zh-CN': '{prefix} {pct}% · {tokStr}（{pool}）', 'zh-TW': '{prefix} {pct}% · {tokStr}（{pool}）', en: '{prefix} {pct}% · {tokStr} ({pool})' },
+      'quota.headSimple': { 'zh-CN': '{prefix} {pct}%（{pool}）', 'zh-TW': '{prefix} {pct}%（{pool}）', en: '{prefix} {pct}% ({pool})' },
+      'quota.resetAt': { 'zh-CN': '预计 {time} 重置{inPart}', 'zh-TW': '預計 {time} 重置{inPart}', en: 'Resets at {time}{inPart}' },
+      'quota.resetInParen': { 'zh-CN': '（{inStr}）', 'zh-TW': '（{inStr}）', en: ' ({inStr})' },
+      'quota.fullCap': { 'zh-CN': '当前配额满格（100% 可用）', 'zh-TW': '目前配額滿格（100% 可用）', en: 'Full quota (100% available)' },
+      'quota.weeklyFullCap': { 'zh-CN': '当前周额度满格（100% 可用）', 'zh-TW': '目前每週額度滿格（100% 可用）', en: 'Full weekly quota (100% available)' },
+      'quota.lastSync': { 'zh-CN': '上次同步 {time}', 'zh-TW': '上次同步 {time}', en: 'Last synced {time}' },
+      'quota.fetchedLatest': { 'zh-CN': '已获取最新模型配额', 'zh-TW': '已取得最新模型配額', en: 'Latest model quota synced' },
+      'quota.weeklyLatest': { 'zh-CN': '当前模型每周剩余额度', 'zh-TW': '目前模型每週剩餘額度', en: 'Current model weekly quota' },
+      'quota.titleCurrent': { 'zh-CN': '当前模型：{model}', 'zh-TW': '目前模型：{model}', en: 'Model: {model}' },
+      'quota.titleDefaultPool': { 'zh-CN': '模型配额（默认 · {pool}）：', 'zh-TW': '模型配額（預設 · {pool}）：', en: 'Model quota (default · {pool}):' },
+      'quota.titleWeeklyDefault': { 'zh-CN': '每周配额（默认 · {pool}）：', 'zh-TW': '每週配額（預設 · {pool}）：', en: 'Weekly quota (default · {pool}):' },
+      'quota.titleReadFailed': { 'zh-CN': '当前模型配额（读取失败）：', 'zh-TW': '目前模型配額（讀取失敗）：', en: 'Model quota (read failed):' },
+      'quota.titleDefault': { 'zh-CN': '当前模型配额：', 'zh-TW': '目前模型配額：', en: 'Model quota:' },
+      'quota.unavailable': { 'zh-CN': '配额暂不可用', 'zh-TW': '配額暫時無法使用', en: 'Quota unavailable' },
+      'quota.waitingSync': { 'zh-CN': '等待同步模型配额', 'zh-TW': '等待同步模型配額', en: 'Waiting to sync quota' },
+      'quota.loading': { 'zh-CN': '正在读取模型配额…', 'zh-TW': '正在讀取模型配額…', en: 'Loading model quota…' },
+      'quota.clickRefreshHint': { 'zh-CN': '点击右上角“刷新”可立即同步配额', 'zh-TW': '點擊右上角「重新整理」可立即同步配額', en: 'Click Refresh to sync quota now' },
+      'quota.hoverClickHint': { 'zh-CN': '悬停查看当前模型周额度，点击圆环展开详情', 'zh-TW': '懸停檢視目前模型每週額度，點擊圓環展開詳情', en: 'Hover for weekly quota, click ring for details' },
+      'quota.weeklyDetailInline': { 'zh-CN': ' · 周剩余 {pct}%{est}', 'zh-TW': ' · 週剩餘 {pct}%{est}', en: ' · Weekly {pct}%{est}' },
+      'quota.weeklyDetailEst': { 'zh-CN': '（{tokStr}）', 'zh-TW': '（{tokStr}）', en: ' ({tokStr})' },
+      'quota.footHover': { 'zh-CN': '点击圆环查看 5 小时与全部模型详情', 'zh-TW': '點擊圓環檢視 5 小時與全部模型詳情', en: 'Click ring for 5h & all-model details' },
+      'quota.footCalibrated': { 'zh-CN': '按实耗推算{win}总量约 {cap} tok · 再次点击圆环收起', 'zh-TW': '依實耗推算{win}總量約 {cap} tok · 再次點擊圓環收起', en: 'Est. {win} cap ~{cap} tok · click ring to close' },
+      'quota.footCycleUsed': { 'zh-CN': '本周期已用 {used} tok，待配额波动后校准 · 点击收起', 'zh-TW': '本週期已用 {used} tok，待配額波動後校準 · 點擊收起', en: 'Used {used} tok this cycle; awaiting drop to calibrate' },
+      'quota.footMerged': { 'zh-CN': '同模型各档位已合并 · 再次点击圆环或按 Esc 收起', 'zh-TW': '同模型各檔位已合併 · 再次點擊圓環或按 Esc 收起', en: 'Tiers merged · click ring or Esc to close' },
+      'quota.footClose': { 'zh-CN': '再次点击圆环或按 Esc 收起', 'zh-TW': '再次點擊圓環或按 Esc 收起', en: 'Click ring or press Esc to close' },
+      'quota.dual.5hTitle': { 'zh-CN': '5 小时额度', 'zh-TW': '5 小時額度', en: '5-Hour Quota' },
+      'quota.dual.weeklyTitle': { 'zh-CN': '每周额度', 'zh-TW': '每週額度', en: 'Weekly Quota' },
+      'quota.dual.fallbackText': { 'zh-CN': '5小时: {shortPct} | 每周: {weeklyPct}', 'zh-TW': '5小時: {shortPct} | 每週: {weeklyPct}', en: '5h: {shortPct} | Weekly: {weeklyPct}' },
+      'quota.dual.noData': { 'zh-CN': '暂无数据', 'zh-TW': '暫無資料', en: 'No data' },
+      'quota.dual.pendingWeekly': { 'zh-CN': '暂无', 'zh-TW': '暫無', en: 'N/A' },
+      'quota.dual.no5hLimit': { 'zh-CN': '无独立 5h 限制', 'zh-TW': '無獨立 5h 限制', en: 'No 5h cap' },
+      'quota.dual.pending': { 'zh-CN': '待获取', 'zh-TW': '待取得', en: 'Pending' },
+      'quota.dual.noWeekly': { 'zh-CN': '未返回周额度', 'zh-TW': '未回傳週額度', en: 'No weekly data' },
+      'quota.dual.fullAvail': { 'zh-CN': '满格可用', 'zh-TW': '滿格可用', en: 'Full' },
+      'quota.dual.avail': { 'zh-CN': '可用', 'zh-TW': '可用', en: 'Available' },
+      'quota.dual.win5hShort': { 'zh-CN': '5h', 'zh-TW': '5h', en: '5h' },
+      'quota.dual.winWeeklyShort': { 'zh-CN': '周', 'zh-TW': '週', en: 'weekly' },
+      'quota.aria.summary': { 'zh-CN': '当前模型 {model} {win}剩余配额 {pct}%{est}{weekly}', 'zh-TW': '目前模型 {model} {win}剩餘配額 {pct}%{est}{weekly}', en: '{model} {win} quota remaining {pct}%{est}{weekly}' },
+      'quota.aria.default': { 'zh-CN': '当前模型剩余配额', 'zh-TW': '目前模型剩餘配額', en: 'Current model remaining quota' },
+      'quota.aria.win5h': { 'zh-CN': '5小时', 'zh-TW': '5小時', en: '5h' },
+      'quota.aria.win7d': { 'zh-CN': '周', 'zh-TW': '週', en: 'weekly' },
+      'quota.aria.est': { 'zh-CN': '（约 {tok} tokens）', 'zh-TW': '（約 {tok} tokens）', en: ' (~{tok} tokens)' },
+      'quota.aria.weekly': { 'zh-CN': '；周额度 {pct}%', 'zh-TW': '；週額度 {pct}%', en: '; weekly {pct}%' },
+      'quota.err.timeout': { 'zh-CN': '读取超时', 'zh-TW': '讀取逾時', en: 'Request timed out' },
+      'quota.err.failed': { 'zh-CN': '读取配额失败', 'zh-TW': '讀取配額失敗', en: 'Failed to load quota' },
+      'quota.unknownModel': { 'zh-CN': '未知模型', 'zh-TW': '未知模型', en: 'Unknown model' },
 
       // 折叠抽屉开关
       'drawer.colors.expand': { 'zh-CN': '▼ 展开设置', 'zh-TW': '▼ 展開設定', en: '▼ Expand' },
@@ -6594,7 +6969,9 @@
     requestBusy: false, requestNext: 0, scanBusy: false, scanNext: 0,
     scanError: '', scan: null, generation: 0, controllers: new Set(),
     disposed: false, layoutMode: 'wide', tooltipOpen: false,
-    reportedFinalCallIds: new Set(), reportedFinalCallOutputs: new Map()
+    callsHydrated: false, syncedFinalMap: new Map(), pendingFinalCalls: new Map(),
+    quarantinedOversizeMap: new Map(), flushFinalsBusy: false, pendingFlushForceSync: false,
+    nextFlushRetryAt: 0, nextOversizeRetryAt: 0
   };
   const route = () => location.pathname.match(/^\/c\/([a-f\d-]{36})(?:\/|$)/i)?.[1] || null;
   let activeHeatView = 'daily';
@@ -6736,12 +7113,17 @@
   function normalizeHex(input) {
     if (!input || typeof input !== 'string') return null;
     const s = input.trim();
+    if (!s || s.toLowerCase() === 'transparent') return null;
     const direct = hexToRgb(s);
     if (direct) return rgbToHex(direct.r, direct.g, direct.b);
-    const mRgb = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
-    if (mRgb) return rgbToHex(Number(mRgb[1]), Number(mRgb[2]), Number(mRgb[3]));
-    const mHsl = s.match(/hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%?\s*,\s*([\d.]+)%?/i);
+    const mRgb = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*[,/]\s*([\d.]+))?\s*\)/i);
+    if (mRgb) {
+      if (mRgb[4] !== undefined && Number(mRgb[4]) <= 0) return null;
+      return rgbToHex(Number(mRgb[1]), Number(mRgb[2]), Number(mRgb[3]));
+    }
+    const mHsl = s.match(/hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%?\s*,\s*([\d.]+)%?(?:\s*[,/]\s*([\d.]+))?\s*\)/i);
     if (mHsl) {
+      if (mHsl[4] !== undefined && Number(mHsl[4]) <= 0) return null;
       const rgb = hslToRgb(Number(mHsl[1]), Number(mHsl[2]), Number(mHsl[3]));
       return rgbToHex(rgb.r, rgb.g, rgb.b);
     }
@@ -6823,18 +7205,30 @@
   }
 
   function getHostZeroLevelBg(isLight) {
+    const fallback = isLight ? '#ffffff' : '#181818';
     try {
       if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
         const rootEl = document.body || document.documentElement;
         if (rootEl) {
           const cs = window.getComputedStyle(rootEl);
-          const raw = cs.getPropertyValue('--background')?.trim() || cs.backgroundColor?.trim();
-          const norm = normalizeHex(raw);
-          if (norm) return norm;
+          const candidates = [
+            cs.getPropertyValue('--background')?.trim(),
+            cs.backgroundColor?.trim()
+          ].filter(Boolean);
+          for (const raw of candidates) {
+            const norm = normalizeHex(raw);
+            if (!norm) continue;
+            const lum = parseRgbLuminance(norm);
+            if (lum == null) continue;
+            // 当宿主 0 级背景明度与当前选定的浅/深色主题冲突时，干净回退至标准默认背景色 (#ffffff / #181818)
+            if (isLight && lum <= 0.55) return fallback;
+            if (!isLight && lum > 0.55) return fallback;
+            return norm;
+          }
         }
       }
     } catch {}
-    return isLight ? '#ffffff' : '#181818';
+    return fallback;
   }
 
   function getSystemTheme() {
@@ -8032,6 +8426,9 @@
     return 0;
   }
 
+  let activeContextAnchor = null;
+  let activeTokensAnchor = null;
+
   function positionFloatingPanels() {
     if (!host.getBoundingClientRect) return;
     try {
@@ -8065,8 +8462,8 @@
         panelEl.style.transformOrigin = 'top right';
       };
 
-      placePanel(el('panel'), 472, el('badge'));
-      placePanel(el('panel-tokens'), 730, el('badge-tokens'));
+      placePanel(el('panel'), 472, activeContextAnchor || el('badge'));
+      placePanel(el('panel-tokens'), 730, activeTokensAnchor || el('badge-tokens'));
       placePanel(el('overflow-menu'), 220, el('badge-overflow'));
       positionColorPickerPopover();
     } catch {}
@@ -8134,7 +8531,7 @@
     return !el('panel').hidden || !el('panel-tokens').hidden;
   }
 
-  function showPanel(target) {
+  function showPanel(target, anchor = null) {
     const pContext = el('panel');
     const pTokens = el('panel-tokens');
     const pOverflow = el('overflow-menu');
@@ -8148,28 +8545,33 @@
     bOverflow?.setAttribute('aria-expanded', 'false');
 
     if (target === 'tokens') {
+      if (anchor) activeTokensAnchor = anchor;
       hideContextTooltip();
+      hideQuotaTooltip();
       closeColorPicker();
+      syncHostStackingElevation(true);
+      positionFloatingPanels();
       pContext.hidden = true;
       pTokens.hidden = false;
       bContext.setAttribute('aria-expanded', 'false');
       bSpeed?.setAttribute('aria-expanded', 'false');
       bTokens.setAttribute('aria-expanded', 'true');
-      syncHostStackingElevation(true);
-      positionFloatingPanels();
-      void syncTokenHistoryFromHost(false);
+      void syncTokenHistoryFromHost(true);
       renderActiveHeatView(true);
     } else if (target === 'context') {
+      if (anchor) activeContextAnchor = anchor;
       hideContextTooltip();
+      hideQuotaTooltip();
       closeColorPicker();
       setPlanDetailExpanded(false, { skipReposition: true });
-      pTokens.hidden = true;
-      pContext.hidden = false;
-      bContext.setAttribute('aria-expanded', 'true');
-      bSpeed?.setAttribute('aria-expanded', 'true');
-      bTokens.setAttribute('aria-expanded', 'false');
       syncHostStackingElevation(true);
       positionFloatingPanels();
+      pTokens.hidden = true;
+      pContext.hidden = false;
+      const ctxAnchor = activeContextAnchor || bContext;
+      bContext.setAttribute('aria-expanded', ctxAnchor === bContext ? 'true' : 'false');
+      bSpeed?.setAttribute('aria-expanded', ctxAnchor === bSpeed ? 'true' : 'false');
+      bTokens.setAttribute('aria-expanded', 'false');
       applyContextViewVisibility?.();
       if (activeContextTab === 'models' && !isContextSettingsView) {
         void refreshUnlockStatus();
@@ -8187,27 +8589,38 @@
       bSpeed?.setAttribute('aria-expanded', 'false');
       bTokens.setAttribute('aria-expanded', 'false');
       closeColorPicker();
+      hideQuotaTooltip();
       hidePopover();
       syncHostStackingElevation(false);
     }
   }
 
-  function toggle(open, tab = 'context') {
+  function toggle(open, tab = 'context', anchor = null) {
     if (!open) {
       showPanel('none');
     } else {
-      showPanel(tab === 'tokens' ? 'tokens' : 'context');
+      showPanel(tab === 'tokens' ? 'tokens' : 'context', anchor);
     }
   }
 
-  function toggleContext() {
-    if (!el('panel').hidden) showPanel('none');
-    else showPanel('context');
+  function toggleContext(anchor = el('badge')) {
+    const p = el('panel');
+    const curAnchor = activeContextAnchor || el('badge');
+    if (!p.hidden && curAnchor === anchor) {
+      showPanel('none');
+    } else {
+      showPanel('context', anchor);
+    }
   }
 
-  function toggleTokens() {
-    if (!el('panel-tokens').hidden) showPanel('none');
-    else showPanel('tokens');
+  function toggleTokens(anchor = el('badge-tokens')) {
+    const p = el('panel-tokens');
+    const curAnchor = activeTokensAnchor || el('badge-tokens');
+    if (!p.hidden && curAnchor === anchor) {
+      showPanel('none');
+    } else {
+      showPanel('tokens', anchor);
+    }
   }
 
   function toggleOverflowMenu() {
@@ -8216,6 +8629,7 @@
     const willOpen = pOverflow.hidden;
     showPanel('none');
     hideContextTooltip();
+    hideQuotaTooltip();
     pOverflow.hidden = !willOpen;
     el('badge-overflow')?.setAttribute('aria-expanded', String(willOpen));
     syncHostStackingElevation(willOpen);
@@ -10113,7 +10527,7 @@ function closeAllDropdowns(exceptWrap = null) {
   let cliToastTimer = null;
   let lastCliLaunchResult = null;
 
-  function showCliToast(message, isError = false) {
+  function showCliToast(message, isError = false, durationMs = null) {
     const toast = el('cli-launch-toast');
     if (!toast) return;
     if (cliToastTimer) {
@@ -10123,10 +10537,11 @@ function closeAllDropdowns(exceptWrap = null) {
     toast.hidden = false;
     toast.setAttribute('data-tone', isError ? 'error' : 'info');
     toast.textContent = message;
+    const stayMs = Number.isFinite(durationMs) && durationMs > 0 ? durationMs : (isError ? 5200 : 3200);
     cliToastTimer = setTimeout(() => {
       toast.hidden = true;
       cliToastTimer = null;
-    }, isError ? 5200 : 3200);
+    }, stayMs);
   }
 
   async function triggerLaunchCli(customOpts = {}) {
@@ -10181,8 +10596,9 @@ function closeAllDropdowns(exceptWrap = null) {
         showCliToast(t('cli.launched', { cwd: res.cwd || t('cli.defaultCwd') }), false);
         return res;
       } else {
+        const isNotFound = res?.code === 'CLI_NOT_FOUND';
         const errMsg = res?.error ? translateBackendText(res.error) : t('cli.notFound');
-        showCliToast(t('cli.failed', { err: errMsg }), true);
+        showCliToast(t('cli.failed', { err: errMsg }), true, isNotFound ? 9500 : 5200);
         return res || { ok: false, error: errMsg };
       }
     } catch (err) {
@@ -10217,12 +10633,21 @@ function closeAllDropdowns(exceptWrap = null) {
   }
   el('overflow-cli-btn')?.addEventListener('click', () => { void triggerLaunchCli(); });
 
-  el('badge').addEventListener('click', toggleContext);
-  el('badge-speed')?.addEventListener('click', toggleContext);
-  el('badge-tokens').addEventListener('click', toggleTokens);
+  el('badge').addEventListener('click', () => toggleContext(el('badge')));
+  el('badge-speed')?.addEventListener('click', () => toggleContext(el('badge-speed')));
+  el('badge-tokens').addEventListener('click', () => toggleTokens(el('badge-tokens')));
   el('badge-overflow')?.addEventListener('click', toggleOverflowMenu);
-  el('overflow-speed-btn')?.addEventListener('click', () => showPanel('context'));
-  el('overflow-tokens-btn')?.addEventListener('click', () => showPanel('tokens'));
+  el('overflow-speed-btn')?.addEventListener('click', () => showPanel('context', el('badge-overflow')));
+  el('overflow-tokens-btn')?.addEventListener('click', () => showPanel('tokens', el('badge-overflow')));
+  el('overflow-quota-btn')?.addEventListener('click', e => {
+    e?.stopPropagation?.();
+    if (!showQuotaBadge) return;
+    showPanel('none');
+    renderQuotaRing(true);
+    showQuotaTooltip(true);
+    void refreshQuota({ force: true });
+  });
+  el('btn-toggle-quota-badge')?.addEventListener('click', () => setQuotaBadgeEnabled(!showQuotaBadge));
   el('close').addEventListener('click', () => showPanel('none'));
   el('close-tokens')?.addEventListener('click', () => showPanel('none'));
 
@@ -10242,11 +10667,69 @@ function closeAllDropdowns(exceptWrap = null) {
     hideContextTooltip();
   });
 
+  // 模型剩余配额圆环悬停、聚焦、点击展开菜单与刷新交互
+  el('badge-quota')?.addEventListener('click', e => {
+    e?.stopPropagation?.();
+    if (!showQuotaBadge || isAnyPanelOpen()) return;
+    if (quotaTooltipOpen && quotaTooltipPinned) {
+      hideQuotaTooltip(true);
+      return;
+    }
+    renderQuotaRing(true);
+    showQuotaTooltip(true);
+    void refreshQuota({ force: true });
+  });
+  el('badge-quota')?.addEventListener('mouseenter', () => {
+    if (showQuotaBadge && !isAnyPanelOpen()) {
+      renderQuotaRing();
+      showQuotaTooltip(quotaTooltipPinned);
+      if (!quotaAt && typeof window !== 'undefined' && (window.__APP_CONFIG__?.csrfToken || typeof window.contextMeterAPI?.getQuota === 'function')) {
+        void refreshQuota({ force: false });
+      }
+    }
+  });
+  el('badge-quota')?.addEventListener('mouseleave', () => {
+    hideQuotaTooltip(false);
+  });
+  el('badge-quota')?.addEventListener('focus', () => {
+    if (showQuotaBadge && !isAnyPanelOpen()) {
+      renderQuotaRing();
+      showQuotaTooltip(quotaTooltipPinned);
+    }
+  });
+  el('badge-quota')?.addEventListener('blur', () => {
+    hideQuotaTooltip(false);
+  });
+  el('quota-tip-refresh')?.addEventListener('click', e => {
+    e?.stopPropagation?.();
+    void refreshQuota({ force: true });
+  });
+  function onQuotaOutsideClick(e) {
+    if (!quotaTooltipOpen || !quotaTooltipPinned) return;
+    const path = typeof e?.composedPath === 'function' ? e.composedPath() : [];
+    const qBtn = el('badge-quota');
+    const qTip = el('quota-tooltip');
+    if ((qBtn && (path.includes(qBtn) || e?.target === qBtn)) || (qTip && (path.includes(qTip) || qTip.contains?.(e?.target)))) {
+      return;
+    }
+    hideQuotaTooltip(true);
+  }
+  function onQuotaEscapeKey(e) {
+    if (e?.key === 'Escape' && quotaTooltipOpen) {
+      hideQuotaTooltip(true);
+    }
+  }
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('click', onQuotaOutsideClick);
+    document.addEventListener('keydown', onQuotaEscapeKey);
+  }
+
   el('theme-toggle')?.addEventListener('click', cycleTheme);
   el('theme-toggle-tokens')?.addEventListener('click', cycleTheme);
   el('badge').addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
   el('badge-tokens').addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
   el('badge-speed')?.addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
+  el('badge-quota')?.addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
 
   // =========================================================================
   // 模块 3: 上下文面板分页、设置视图、模型产品偏好、重启验证与速度对比
@@ -14059,6 +14542,7 @@ function closeAllDropdowns(exceptWrap = null) {
       }
     } catch {}
     try { if (typeof applyTheme === 'function') applyTheme(); } catch {}
+    try { renderQuotaBadgeToggleUI(); renderQuotaRing(false); } catch {}
     try { render(); } catch {}
     try { renderSessionCost(); } catch {}
     try { renderHeaderModelDropdown(); } catch {}
@@ -15577,6 +16061,7 @@ function closeAllDropdowns(exceptWrap = null) {
       closeColorPicker(true);
       toggle(false);
       hideContextTooltip();
+      hideQuotaTooltip();
       const om = el('overflow-menu');
       if (om) om.hidden = true;
       syncHostStackingElevation(false);
@@ -15615,6 +16100,7 @@ function closeAllDropdowns(exceptWrap = null) {
       }
       toggle(false);
       hideContextTooltip();
+      hideQuotaTooltip();
       const om = el('overflow-menu');
       if (om) om.hidden = true;
       syncHostStackingElevation(false);
@@ -15822,7 +16308,8 @@ function closeAllDropdowns(exceptWrap = null) {
     const incomingKeys = Object.keys(payload.dailyMap || {});
     const incomingTotal = Number(payload.summary?.grandTotalTokens) || incomingKeys.reduce((acc, k) => acc + (Number(payload.dailyMap[k]?.total) || 0), 0);
     const hasIncomingRefCost = Boolean(payload.referenceCost?.currentMonth?.totalCostUSD || payload.referenceCost?.all?.totalCostUSD);
-    const hasIncomingPayloadContent = incomingKeys.length > 0 || incomingTotal > 0 || hasIncomingRefCost;
+    const hasIncomingPoolUsage = Array.isArray(payload.recentModelUsage) && payload.recentModelUsage.length > 0;
+    const hasIncomingPayloadContent = incomingKeys.length > 0 || incomingTotal > 0 || hasIncomingRefCost || hasIncomingPoolUsage;
     if (hasExistingData && !hasIncomingPayloadContent && !payload.isAccountSwitched && !payload.forceReset) {
       return false;
     }
@@ -15841,6 +16328,7 @@ function closeAllDropdowns(exceptWrap = null) {
       ANTIGRAVITY_TOKEN_DATA.summary = normalized.summary;
       ANTIGRAVITY_TOKEN_DATA.referenceCost = normalized.referenceCost;
       ANTIGRAVITY_TOKEN_DATA.currentPeriod = normalized.currentPeriod;
+      if (Array.isArray(payload.recentModelUsage)) ANTIGRAVITY_TOKEN_DATA.recentModelUsage = normalized.recentModelUsage;
       if (normalized.firstUseDate) ANTIGRAVITY_TOKEN_DATA.firstUseDate = normalized.firstUseDate;
       if (normalized.updatedAt) ANTIGRAVITY_TOKEN_DATA.updatedAt = normalized.updatedAt;
     } else {
@@ -15859,6 +16347,7 @@ function closeAllDropdowns(exceptWrap = null) {
       }
       ANTIGRAVITY_TOKEN_DATA.dailyMap = newMap;
       if (payload.dailyMapBySource) ANTIGRAVITY_TOKEN_DATA.dailyMapBySource = payload.dailyMapBySource;
+      if (Array.isArray(payload.recentModelUsage)) ANTIGRAVITY_TOKEN_DATA.recentModelUsage = payload.recentModelUsage;
       if (payload.firstUseDate) ANTIGRAVITY_TOKEN_DATA.firstUseDate = payload.firstUseDate;
       if (payload.updatedAt) ANTIGRAVITY_TOKEN_DATA.updatedAt = payload.updatedAt;
       if (payload.currentPeriod) ANTIGRAVITY_TOKEN_DATA.currentPeriod = payload.currentPeriod;
@@ -15933,6 +16422,32 @@ function closeAllDropdowns(exceptWrap = null) {
       ANTIGRAVITY_TOKEN_DATA.planStatus = mergedPlan;
       ANTIGRAVITY_TOKEN_DATA.rawPlanStatus = payload.rawPlanStatus || payload.planStatus || mergedPlan;
       renderPlanDetail(mergedPlan);
+    }
+
+    const incomingQuotaConfigs = Array.isArray(payload.cascadeModelConfigs) && payload.cascadeModelConfigs.length
+      ? payload.cascadeModelConfigs
+      : (Array.isArray(payload.rawPlanStatus?.cascadeModelConfigs) && payload.rawPlanStatus.cascadeModelConfigs.length
+        ? payload.rawPlanStatus.cascadeModelConfigs
+        : (Array.isArray(payload.planStatus?.cascadeModelConfigs) && payload.planStatus.cascadeModelConfigs.length
+          ? payload.planStatus.cascadeModelConfigs
+          : null));
+    const incomingQuotaSummary = payload.quotaSummary ||
+      payload.rawPlanStatus?.quotaSummary ||
+      payload.planStatus?.quotaSummary ||
+      null;
+    const hasIncomingQuotaSummary = Boolean(incomingQuotaSummary && typeof incomingQuotaSummary === 'object');
+    if (hasIncomingQuotaSummary) {
+      quotaSummaryPayload = incomingQuotaSummary;
+      quotaAt = Date.now();
+      quotaError = '';
+    }
+    if (incomingQuotaConfigs) {
+      cascadeModelConfigs = incomingQuotaConfigs;
+      quotaAt = Date.now();
+      quotaError = '';
+      renderQuotaRing();
+    } else if (hasIncomingQuotaSummary || (hasIncomingPoolUsage && ((Array.isArray(cascadeModelConfigs) && cascadeModelConfigs.length) || quotaSummaryPayload))) {
+      renderQuotaRing();
     }
 
     if (payload.costEstimate) {
@@ -16041,17 +16556,14 @@ function closeAllDropdowns(exceptWrap = null) {
 
 
   async function recordModelCallsRemote(calls) {
-    if (!calls || !calls.length) return;
-    let changed = false;
-    const hasFinalCall = calls.some(c => c?.status === 'final');
+    if (!calls || !calls.length) return { ok: false, changed: false };
     try {
       if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.recordCalls === 'function') {
         const res = await window.contextMeterAPI.recordCalls(calls);
         if (res && res.ok === false) {
           console.warn('Context Meter: 记录调用入账失败', res.error);
-        } else if (res?.changed) {
-          changed = true;
         }
+        return res || { ok: false, changed: false };
       } else if (typeof window !== 'undefined' && window.__AGContextMeterLive?.port) {
         const live = window.__AGContextMeterLive;
         const resp = await fetch(`http://127.0.0.1:${live.port}/record-calls`, {
@@ -16060,22 +16572,29 @@ function closeAllDropdowns(exceptWrap = null) {
           body: JSON.stringify({ calls })
         });
         if (!resp.ok) {
+          const errBody = typeof resp.json === 'function' ? await resp.json().catch(() => null) : null;
           console.warn(`Context Meter: 实时通道 record-calls 响应异常 HTTP ${resp.status}`);
+          return {
+            ok: false,
+            changed: false,
+            status: resp.status,
+            ...(errBody?.error ? { error: errBody.error } : {}),
+            ...(errBody?.phase ? { phase: errBody.phase } : {}),
+            ...(errBody?.code ? { code: errBody.code } : {})
+          };
         } else {
           const res = await resp.json().catch(() => null);
           if (res && res.ok === false) {
             console.warn('Context Meter: 实时通道 record-calls 失败', res.error);
-          } else if (res?.changed) {
-            changed = true;
           }
+          return res || { ok: false, changed: false, status: resp.status };
         }
-      }
-      if (changed || hasFinalCall) {
-        void syncTokenHistoryFromHost(false);
       }
     } catch (err) {
       console.warn('Context Meter: 调用入账发生异常', err);
+      return { ok: false, changed: false, error: err?.message || String(err || '') };
     }
+    return { ok: false, changed: false };
   }
 
   async function restoreSettingsFromHost() {
@@ -16189,27 +16708,45 @@ function closeAllDropdowns(exceptWrap = null) {
     } catch {}
   }
 
+  let lastHistorySync = 0;
   let historySyncBusy = false;
-  let pendingHistoryForce = false;
+  let historySyncPending = false;
+  let historySyncPendingForce = false;
+  const AUTOMATIC_HISTORY_SYNC_INTERVAL_MS = 5000;
+  let automaticHistorySyncPending = false;
+  let lastAutomaticHistorySync = null;
+  let hasScheduledInitialUpdateCheck = false;
+
+  function syncPendingAutomaticHistory() {
+    if (!automaticHistorySyncPending || historySyncBusy || state.disposed) return;
+    const now = Date.now();
+    if (lastAutomaticHistorySync !== null && now - lastAutomaticHistorySync < AUTOMATIC_HISTORY_SYNC_INTERVAL_MS) return;
+    lastAutomaticHistorySync = now;
+    void syncTokenHistoryFromHost(true);
+  }
+
   async function syncTokenHistoryFromHost(force = false) {
     if (state.disposed) return;
     if (historySyncBusy) {
-      if (force) {
-        pendingHistoryForce = true;
-      }
+      historySyncPending = true;
+      if (force) historySyncPendingForce = true;
       return;
     }
+    const forceFlag = Boolean(force);
+    if (forceFlag) automaticHistorySyncPending = false;
     historySyncBusy = true;
+    lastHistorySync = Date.now();
     try {
       await restoreSettingsFromHost();
+      if (state.disposed) return;
       if (typeof window !== 'undefined' && window.__AGContextMeterHistory) {
         if (!ANTIGRAVITY_TOKEN_DATA.updatedAt && !ANTIGRAVITY_TOKEN_DATA.summary?.grandTotalTokens) {
           applyTokenHistoryPayload(window.__AGContextMeterHistory);
         }
       }
       if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.getTokenHistory === 'function') {
-        const res = await window.contextMeterAPI.getTokenHistory(Boolean(force));
-        if (res?.ok && res.data) {
+        const res = await window.contextMeterAPI.getTokenHistory(forceFlag);
+        if (!state.disposed && res?.ok && res.data) {
           if (typeof window !== 'undefined') window.__AGContextMeterHistory = res.data;
           applyTokenHistoryPayload(res.data);
         }
@@ -16218,9 +16755,9 @@ function closeAllDropdowns(exceptWrap = null) {
         const r = await fetch(`http://127.0.0.1:${live.port}/token-history`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-AG-Context-Token': live.token },
-          body: JSON.stringify({ force: Boolean(force) })
+          body: JSON.stringify({ force: forceFlag })
         });
-        if (r.ok) {
+        if (!state.disposed && r.ok) {
           const j = await r.json();
           if (j?.ok && j.data) {
             if (typeof window !== 'undefined') window.__AGContextMeterHistory = j.data;
@@ -16231,12 +16768,18 @@ function closeAllDropdowns(exceptWrap = null) {
     } catch {}
     finally {
       historySyncBusy = false;
-      if (pendingHistoryForce) {
-        pendingHistoryForce = false;
-        void syncTokenHistoryFromHost(true);
+      lastHistorySync = Date.now();
+      if (!hasScheduledInitialUpdateCheck && autoCheckUpdate && !state.disposed) {
+        hasScheduledInitialUpdateCheck = true;
+        setTimeout(() => { if (!state.disposed) void checkAppUpdate(false); }, 1200);
       }
-      if (autoCheckUpdate) {
-        setTimeout(() => { void checkAppUpdate(false); }, 1200);
+      if (historySyncPending && !state.disposed) {
+        const nextForce = historySyncPendingForce;
+        historySyncPending = false;
+        historySyncPendingForce = false;
+        void syncTokenHistoryFromHost(nextForce);
+      } else {
+        syncPendingAutomaticHistory();
       }
     }
   }
@@ -16492,6 +17035,775 @@ function closeAllDropdowns(exceptWrap = null) {
       window.contextMeterAPI.saveSettings({ autoCheckUpdate });
     }
   });
+
+  function renderQuotaBadgeToggleUI() {
+    const qBtn = el('badge-quota');
+    const ovBtn = el('overflow-quota-btn');
+    const pill = el('quota-switch-pill');
+    const btn = el('btn-toggle-quota-badge');
+    if (qBtn) qBtn.hidden = !showQuotaBadge;
+    if (ovBtn) ovBtn.hidden = !showQuotaBadge;
+    if (pill) {
+      pill.textContent = showQuotaBadge ? t('settings.quotaBadge.on') : t('settings.quotaBadge.off');
+      pill.className = showQuotaBadge ? 'key-pill pill-ok' : 'key-pill pill-muted';
+    }
+    if (btn) {
+      btn.textContent = showQuotaBadge ? t('settings.quotaBadge.turnOff') : t('settings.quotaBadge.turnOn');
+      btn.setAttribute('aria-pressed', String(showQuotaBadge));
+    }
+  }
+
+  function setQuotaBadgeEnabled(enabled) {
+    showQuotaBadge = Boolean(enabled);
+    try {
+      if (typeof localStorage !== 'undefined' && typeof localStorage.setItem === 'function') {
+        localStorage.setItem(QUOTA_BADGE_STORAGE_KEY, showQuotaBadge ? 'true' : 'false');
+      }
+    } catch {}
+    if (!showQuotaBadge) hideQuotaTooltip(true);
+    renderQuotaBadgeToggleUI();
+    renderQuotaRing(true);
+    if (showQuotaBadge && !state.disposed) void refreshQuota({ force: true });
+    return showQuotaBadge;
+  }
+
+  function detectActiveModelFromDom(configs, forceCheck = false) {
+    if (!Array.isArray(configs) || !configs.length) return '';
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return '';
+    const now = Date.now();
+    if (!forceCheck && now - lastDomModelCheckAt < 1200) return cachedDomModel;
+    lastDomModelCheckAt = now;
+    try {
+      const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
+      const candidates = document.querySelectorAll('button, [role="combobox"], [role="button"]');
+      let bestLabel = '';
+      let bestScore = -1;
+      for (let i = 0; i < candidates.length; i++) {
+        const node = candidates[i];
+        if (!node || host.contains?.(node)) continue;
+        if (node.closest?.('[role="listbox"], [role="menu"]')) continue;
+        const txt = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!txt || txt.length > 64) continue;
+        const lowTxt = txt.toLowerCase();
+        for (const cfg of configs) {
+          const lbl = String(cfg?.label || '').trim();
+          if (!lbl) continue;
+          const lowLbl = lbl.toLowerCase();
+          const baseLbl = lbl.replace(/\s*\([^)]*\)\s*/g, '').trim().toLowerCase();
+          let score = 0;
+          if (lowTxt === lowLbl || lowTxt.includes(lowLbl)) score = 3;
+          else if (baseLbl && baseLbl.length >= 4 && (lowTxt === baseLbl || lowTxt.includes(baseLbl))) score = 2;
+          if (score > 0) {
+            const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+            if (rect && (rect.width <= 0 || rect.height <= 0)) continue;
+            const bonus = rect && rect.top >= vh * 0.45 ? 10 : 0;
+            const totalScore = score + bonus - (txt.length / 100);
+            if (totalScore > bestScore) {
+              bestScore = totalScore;
+              bestLabel = lbl;
+            }
+          }
+        }
+      }
+      cachedDomModel = bestLabel;
+      return bestLabel;
+    } catch {
+      return cachedDomModel || '';
+    }
+  }
+
+  function getActiveModelCandidate(forceDomCheck = false) {
+    if (quotaExplicitModel) return quotaExplicitModel;
+    const domModel = detectActiveModelFromDom(cascadeModelConfigs, forceDomCheck);
+    if (domModel) return domModel;
+    if (state.latest?.model) return state.latest.model;
+    if (state.scan?.latest?.model) return state.scan.latest.model;
+    if (Array.isArray(state.sessionCalls) && state.sessionCalls.length) {
+      const last = state.sessionCalls[state.sessionCalls.length - 1];
+      if (last?.model) return last.model;
+    }
+    return '';
+  }
+
+  function positionQuotaTooltip() {
+    const tip = el('quota-tooltip');
+    const anchor = el('badge-quota');
+    if (!tip || !anchor) return;
+    try {
+      const vw = (typeof window !== 'undefined' && window.innerWidth) || 1280;
+      const vh = (typeof window !== 'undefined' && window.innerHeight) || 800;
+      const bRect = anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+      const ovBtn = el('badge-overflow');
+      const ovRect = ovBtn && ovBtn.getBoundingClientRect ? ovBtn.getBoundingClientRect() : null;
+      const hRect = host.getBoundingClientRect ? host.getBoundingClientRect() : null;
+      const refRect = (bRect && bRect.width > 0)
+        ? bRect
+        : ((ovRect && ovRect.width > 0) ? ovRect : (hRect || { left: vw - 220, right: vw - 16, top: 6, bottom: 34 }));
+      const tipRect = tip.getBoundingClientRect ? tip.getBoundingClientRect() : null;
+      const tipW = (tipRect && tipRect.width > 0) ? tipRect.width : 296;
+      const tipH = (tipRect && tipRect.height > 0) ? tipRect.height : 180;
+      let left = Math.round(refRect.right - tipW);
+      left = Math.max(12, Math.min(vw - tipW - 12, left));
+      let top = Math.round((refRect.bottom || 34) + 6);
+      let placement = 'bottom';
+      if (top + tipH > vh - 12 && refRect.top - tipH - 6 > 12) {
+        top = Math.round(refRect.top - tipH - 6);
+        placement = 'top';
+      }
+      tip.style.left = `${left}px`;
+      tip.style.top = `${top}px`;
+      tip.setAttribute('data-placement', placement);
+    } catch {}
+  }
+
+  function showQuotaTooltip(pinned = false) {
+    const tip = el('quota-tooltip');
+    const anchor = el('badge-quota');
+    if (!tip) return;
+    hideContextTooltip();
+    quotaTooltipOpen = true;
+    quotaTooltipPinned = Boolean(pinned);
+    tip.setAttribute('data-visible', 'true');
+    tip.setAttribute('data-pinned', quotaTooltipPinned ? 'true' : 'false');
+    tip.setAttribute('data-view', quotaTooltipPinned ? 'detail' : 'hover');
+    anchor?.setAttribute('aria-expanded', 'true');
+    if (typeof renderQuotaTooltipSummary === 'function') renderQuotaTooltipSummary();
+    positionQuotaTooltip();
+  }
+
+  function hideQuotaTooltip(force = true) {
+    if (!force && quotaTooltipPinned) return;
+    quotaTooltipOpen = false;
+    quotaTooltipPinned = false;
+    const tip = el('quota-tooltip');
+    const anchor = el('badge-quota');
+    if (tip) {
+      tip.setAttribute('data-visible', 'false');
+      tip.setAttribute('data-pinned', 'false');
+      tip.setAttribute('data-view', 'hover');
+    }
+    anchor?.setAttribute('aria-expanded', 'false');
+    if (typeof renderQuotaTooltipSummary === 'function') renderQuotaTooltipSummary();
+  }
+
+  const QUOTA_CALIB_STORAGE_KEY = 'ag_quota_calib_v1';
+
+  function getQuotaAccountKey() {
+    const email = ANTIGRAVITY_TOKEN_DATA.planStatus?.email || ANTIGRAVITY_TOKEN_DATA.rawPlanStatus?.email || 'default';
+    return String(email || 'default').trim().toLowerCase() || 'default';
+  }
+
+  function loadQuotaCalibrationForAccount(accountKey) {
+    if (!quotaCalibrationStore || typeof quotaCalibrationStore !== 'object') {
+      quotaCalibrationStore = {};
+      try {
+        const raw = typeof localStorage !== 'undefined' && localStorage.getItem(QUOTA_CALIB_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && typeof parsed === 'object') quotaCalibrationStore = parsed;
+        }
+      } catch {}
+    }
+    const bucket = quotaCalibrationStore[accountKey];
+    return (bucket && typeof bucket === 'object') ? bucket : {};
+  }
+
+  function saveQuotaCalibrationForAccount(accountKey, nextMap) {
+    if (!quotaCalibrationStore || typeof quotaCalibrationStore !== 'object') quotaCalibrationStore = {};
+    quotaCalibrationStore[accountKey] = (nextMap && typeof nextMap === 'object') ? nextMap : {};
+    try {
+      if (typeof localStorage !== 'undefined' && typeof localStorage.setItem === 'function') {
+        localStorage.setItem(QUOTA_CALIB_STORAGE_KEY, JSON.stringify(quotaCalibrationStore));
+      }
+    } catch {}
+  }
+
+  function collectQuotaUsageEvents() {
+    const resolveKey = typeof getModelPoolKey === 'function'
+      ? (m => getModelPoolKey(m))
+      : (m => String(m || 'unknown').trim().toLowerCase() || 'unknown');
+    const dedup = new Map();
+    const bucketEvents = [];
+    const pushItem = (item, preferLatest) => {
+      if (!item || typeof item !== 'object') return;
+      const ts = Number(item.ts ?? item.timestamp);
+      const tok = Number(
+        item.tok ??
+        item.totalTokens ??
+        ((Number(item.inputTokens) || 0) + (Number(item.cacheTokens ?? item.cacheReadTokens) || 0) + (Number(item.outputTokens) || 0))
+      );
+      const rawPoolKey = item.poolKey ? String(item.poolKey) : '';
+      const poolKey = rawPoolKey && rawPoolKey !== 'unknown'
+        ? rawPoolKey
+        : resolveKey(item.model || item.modelKey || '');
+      if (!poolKey || poolKey === 'unknown' || !Number.isFinite(ts) || !Number.isFinite(tok) || tok <= 0) return;
+      const id = item.id || item.callId || null;
+      const norm = { id: id ? String(id) : null, poolKey, ts, tok };
+      if (norm.id) {
+        const prev = dedup.get(norm.id);
+        if (!prev || (preferLatest ? norm.tok >= prev.tok : norm.tok > prev.tok)) {
+          dedup.set(norm.id, norm);
+        }
+      } else {
+        bucketEvents.push(norm);
+      }
+    };
+
+    if (Array.isArray(ANTIGRAVITY_TOKEN_DATA.recentModelUsage)) {
+      for (const item of ANTIGRAVITY_TOKEN_DATA.recentModelUsage) pushItem(item, false);
+    }
+    if (Array.isArray(state.sessionCalls)) {
+      for (const call of state.sessionCalls) pushItem(call, true);
+    }
+    if (Array.isArray(quotaTestUsageEvents)) {
+      for (const item of quotaTestUsageEvents) pushItem(item, true);
+    }
+    return [...dedup.values(), ...bucketEvents];
+  }
+
+  function getQuotaTone(pct) {
+    if (pct == null) return 'unknown';
+    if (pct <= 10) return 'danger';
+    if (pct <= 30) return 'warn';
+    return 'normal';
+  }
+
+  function clearDomChildren(node) {
+    if (!node) return;
+    if (typeof node.replaceChildren === 'function') {
+      node.replaceChildren();
+    } else {
+      while (node.firstChild) node.removeChild(node.firstChild);
+    }
+  }
+
+  function renderQuotaPoolRows(containerEl, list, activeKey, windowType = '5h') {
+    if (!containerEl) return;
+    const pools = Array.isArray(list) ? list : [];
+    clearDomChildren(containerEl);
+    if (!pools.length) {
+      containerEl.style.display = 'none';
+      return;
+    }
+    containerEl.style.display = 'flex';
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+      containerEl.textContent = pools.map(p => {
+        const pStr = p.remainingPct != null ? `${p.remainingPct}%` : '--%';
+        const tStr = p.estRemainingZh != null ? ` ${t('quota.approxTokensCompact', { tok: p.estRemainingZh })}` : '';
+        return `${p.poolName}: ${pStr}${tStr}`;
+      }).join(' | ');
+      return;
+    }
+    const rows = [];
+    for (const pool of pools) {
+      const isActive = Boolean(activeKey && pool.poolKey === activeKey);
+      const row = document.createElement('div');
+      row.className = 'quota-pool-row';
+      row.setAttribute?.('data-active', String(isActive));
+      const pct = pool.remainingPct;
+      row.setAttribute?.('data-tone', getQuotaTone(pct));
+      row.setAttribute?.('data-window', windowType);
+
+      const head = document.createElement('div');
+      head.className = 'quota-pool-head';
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'quota-pool-name';
+      nameSpan.textContent = `${isActive ? '● ' : '○ '}${pool.poolName || pool.label || pool.poolKey}`;
+      const metaSpan = document.createElement('span');
+      metaSpan.className = 'quota-pool-meta';
+      const pctText = pct != null ? `${pct}%` : '--%';
+      const estText = pool.estRemainingZh != null
+        ? (pct === 0 ? t('quota.approx0Compact') : t('quota.approxTokensCompact', { tok: pool.estRemainingZh }))
+        : '';
+      const resetHint = pool.resetInZh || pool.resetTimeZh || '';
+      metaSpan.textContent = [pctText, estText, resetHint].filter(Boolean).join(' · ');
+      head.appendChild(nameSpan);
+      head.appendChild(metaSpan);
+
+      const bar = document.createElement('div');
+      bar.className = 'quota-pool-bar';
+      const barFill = document.createElement('div');
+      barFill.className = 'quota-pool-bar-fill';
+      barFill.style.width = `${pct != null ? Math.max(0, Math.min(100, pct)) : 0}%`;
+      bar.appendChild(barFill);
+
+      row.appendChild(head);
+      row.appendChild(bar);
+      rows.push(row);
+    }
+    for (const r of rows) containerEl.appendChild(r);
+  }
+
+  function renderQuotaDualCards(summary) {
+    const dualEl = el('quota-tip-dual');
+    if (!dualEl) return;
+    clearDomChildren(dualEl);
+    if (!summary?.hasData) {
+      dualEl.style.display = 'none';
+      return;
+    }
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') {
+      const sPct = summary.active?.remainingPct != null ? `${summary.active.remainingPct}%` : '--%';
+      const wPct = summary.activeWeekly?.remainingPct != null ? `${summary.activeWeekly.remainingPct}%` : t('quota.dual.pendingWeekly');
+      dualEl.style.display = 'grid';
+      dualEl.textContent = t('quota.dual.fallbackText', { shortPct: sPct, weeklyPct: wPct });
+      return;
+    }
+
+    const buildCard = (title, pool, windowKey, fallbackSub) => {
+      const card = document.createElement('div');
+      card.className = 'quota-dual-card';
+      card.setAttribute?.('data-window', windowKey);
+      const pct = pool?.remainingPct;
+      card.setAttribute?.('data-tone', pct != null ? getQuotaTone(pct) : 'muted');
+
+      const head = document.createElement('div');
+      head.className = 'quota-dual-head';
+      const titleSpan = document.createElement('span');
+      titleSpan.textContent = title;
+      const poolTag = document.createElement('span');
+      poolTag.textContent = pool?.poolName || '';
+      head.appendChild(titleSpan);
+      if (pool?.poolName) head.appendChild(poolTag);
+
+      const val = document.createElement('div');
+      val.className = 'quota-dual-val';
+      val.textContent = pct != null ? `${pct}%` : t('quota.dual.noData');
+
+      const sub = document.createElement('div');
+      sub.className = 'quota-dual-sub';
+      if (pool && pct != null) {
+        const estStr = pool.estRemainingZh != null
+          ? (pct === 0 ? t('quota.approx0Compact') : t('quota.approxTokensCompact', { tok: pool.estRemainingZh }))
+          : null;
+        const resetStr = pool.resetInZh || pool.resetTimeZh || (pct >= 100 ? t('quota.dual.fullAvail') : null);
+        sub.textContent = [estStr, resetStr].filter(Boolean).join(' · ') || t('quota.dual.avail');
+      } else {
+        sub.textContent = fallbackSub;
+      }
+
+      card.appendChild(head);
+      card.appendChild(val);
+      card.appendChild(sub);
+      return card;
+    };
+
+    const shortActive = (summary.active && summary.active.windowType !== 'weekly') ? summary.active : null;
+    dualEl.style.display = 'grid';
+    dualEl.appendChild(buildCard(t('quota.dual.5hTitle'), shortActive, '5h', summary.hasWeeklyData ? t('quota.dual.no5hLimit') : t('quota.dual.pending')));
+    dualEl.appendChild(buildCard(t('quota.dual.weeklyTitle'), summary.activeWeekly, 'weekly', t('quota.dual.noWeekly')));
+  }
+
+  function renderQuotaTooltipPools(summary) {
+    renderQuotaDualCards(summary);
+
+    const poolsWrap = el('quota-tip-pools-wrap');
+    const poolsEl = el('quota-tip-pools');
+    const pools = Array.isArray(summary?.pools) ? summary.pools : [];
+    const displayShortPools = pools.filter(p => !(summary?.hasWeeklyData && p.windowType === 'weekly'));
+    renderQuotaPoolRows(poolsEl, displayShortPools, summary?.active?.poolKey || '', '5h');
+    if (poolsWrap) poolsWrap.style.display = displayShortPools.length ? 'block' : 'none';
+
+    const weeklyWrap = el('quota-tip-weekly-wrap');
+    const weeklyEl = el('quota-tip-weekly');
+    const weeklyEmptyEl = el('quota-weekly-empty');
+    const weeklyPools = Array.isArray(summary?.weeklyPools) ? summary.weeklyPools : [];
+    if (weeklyPools.length > 0) {
+      if (weeklyWrap) weeklyWrap.style.display = 'block';
+      renderQuotaPoolRows(weeklyEl, weeklyPools, summary?.activeWeekly?.poolKey || '', 'weekly');
+      if (weeklyEmptyEl) weeklyEmptyEl.style.display = 'none';
+    } else if (displayShortPools.length > 0) {
+      if (weeklyWrap) weeklyWrap.style.display = 'block';
+      clearDomChildren(weeklyEl);
+      if (weeklyEl) weeklyEl.style.display = 'none';
+      if (weeklyEmptyEl) weeklyEmptyEl.style.display = 'block';
+    } else {
+      if (weeklyWrap) weeklyWrap.style.display = 'none';
+      clearDomChildren(weeklyEl);
+      if (weeklyEl) weeklyEl.style.display = 'none';
+      if (weeklyEmptyEl) weeklyEmptyEl.style.display = 'none';
+    }
+  }
+
+  function formatQuotaHeadline(prefix, pool) {
+    if (!pool || pool.remainingPct == null) return '';
+    const pct = pool.remainingPct;
+    const poolName = pool.poolName || t('quota.poolSelf');
+    if (pct <= 0) {
+      if (pool.estRemainingZh != null) {
+        return t('quota.headWithEstExhausted', {
+          prefix,
+          tokStr: t('quota.approx0'),
+          pool: poolName,
+          status: t('quota.exhausted')
+        });
+      }
+      return t('quota.headExhausted', { prefix, pool: poolName, status: t('quota.exhausted') });
+    }
+    if (pool.estRemainingZh != null) {
+      return t('quota.headWithEst', {
+        prefix,
+        pct,
+        tokStr: t('quota.approxTokens', { tok: pool.estRemainingZh }),
+        pool: poolName
+      });
+    }
+    return t('quota.headSimple', { prefix, pct, pool: poolName });
+  }
+
+  function formatQuotaResetLine(pool, fullMsg, fallbackStr) {
+    if (pool?.resetTimeZh) {
+      const inPart = pool.resetInZh ? t('quota.resetInParen', { inStr: pool.resetInZh }) : '';
+      return t('quota.resetAt', { time: pool.resetTimeZh, inPart });
+    }
+    if (pool && pool.remainingPct >= 100) return fullMsg;
+    return fallbackStr;
+  }
+
+  function renderQuotaTooltipSummary(summaryArg = quotaSummary) {
+    const qTip = el('quota-tooltip');
+    const qTitle = el('quota-tip-title');
+    const qPct = el('quota-tip-pct');
+    const qDetail = el('quota-tip-detail');
+    const qFoot = el('quota-tip-foot');
+    const summary = summaryArg || {};
+    const isDetailView = Boolean(quotaTooltipPinned);
+    qTip?.setAttribute('data-view', isDetailView ? 'detail' : 'hover');
+
+    const shortActive = (summary.active && summary.active.windowType !== 'weekly') ? summary.active : null;
+    const weeklyActive = summary.activeWeekly || ((summary.active && summary.active.windowType === 'weekly') ? summary.active : null);
+    const primaryActive = shortActive || weeklyActive || summary.active || null;
+    const activeModel = summary.currentModel || getActiveModelCandidate(false);
+    const displayModelName = shortActive?.activeLabel || shortActive?.label || shortActive?.poolName ||
+      summary.currentModel || weeklyActive?.poolName || primaryActive?.poolName || t('quota.unknownModel');
+
+    if (qTitle && qPct && qDetail) {
+      if (isDetailView) {
+        if (primaryActive && primaryActive.remainingPct != null) {
+          const isMatched = primaryActive.windowType === 'weekly' ? summary.weeklyMatchedByModel : summary.matchedByModel;
+          qTitle.textContent = isMatched
+            ? t('quota.titleCurrent', { model: displayModelName })
+            : t('quota.titleDefaultPool', { pool: primaryActive.poolName });
+          const headPrefix = primaryActive.windowType === 'weekly' ? t('quota.prefix.weekly') : t('quota.prefix.5h');
+          qPct.textContent = formatQuotaHeadline(headPrefix, primaryActive);
+          const resetLine = formatQuotaResetLine(
+            primaryActive,
+            t('quota.fullCap'),
+            quotaAt ? t('quota.lastSync', { time: new Date(quotaAt).toLocaleTimeString() }) : t('quota.fetchedLatest')
+          );
+          const weeklyEst = weeklyActive?.estRemainingZh != null
+            ? t('quota.weeklyDetailEst', { tokStr: t('quota.approxTokens', { tok: weeklyActive.estRemainingZh }) })
+            : '';
+          const weeklyDetail = (weeklyActive && weeklyActive.remainingPct != null && primaryActive.windowType !== 'weekly')
+            ? t('quota.weeklyDetailInline', { pct: weeklyActive.remainingPct, est: weeklyEst })
+            : '';
+          qDetail.textContent = `${resetLine}${weeklyDetail}`;
+        } else if (quotaError) {
+          qTitle.textContent = t('quota.titleReadFailed');
+          qPct.textContent = t('quota.unavailable');
+          qDetail.textContent = quotaError;
+        } else {
+          qTitle.textContent = activeModel ? t('quota.titleCurrent', { model: activeModel }) : t('quota.titleDefault');
+          qPct.textContent = quotaBusy ? t('quota.loading') : t('quota.waitingSync');
+          qDetail.textContent = t('quota.clickRefreshHint');
+        }
+      } else {
+        if (weeklyActive && weeklyActive.remainingPct != null) {
+          const matchedWeekly = Boolean(summary.weeklyMatchedByModel || summary.matchedByModel);
+          qTitle.textContent = matchedWeekly
+            ? t('quota.titleCurrent', { model: displayModelName })
+            : t('quota.titleWeeklyDefault', { pool: weeklyActive.poolName });
+          qPct.textContent = formatQuotaHeadline(t('quota.prefix.weekly'), weeklyActive);
+          qDetail.textContent = formatQuotaResetLine(
+            weeklyActive,
+            t('quota.weeklyFullCap'),
+            quotaAt ? t('quota.lastSync', { time: new Date(quotaAt).toLocaleTimeString() }) : t('quota.weeklyLatest')
+          );
+        } else if (primaryActive && primaryActive.remainingPct != null) {
+          qTitle.textContent = summary.matchedByModel
+            ? t('quota.titleCurrent', { model: displayModelName })
+            : t('quota.titleDefaultPool', { pool: primaryActive.poolName });
+          qPct.textContent = formatQuotaHeadline(t('quota.prefix.generic'), primaryActive);
+          qDetail.textContent = formatQuotaResetLine(
+            primaryActive,
+            t('quota.fullCap'),
+            quotaAt ? t('quota.lastSync', { time: new Date(quotaAt).toLocaleTimeString() }) : t('quota.fetchedLatest')
+          );
+        } else if (quotaError) {
+          qTitle.textContent = t('quota.titleReadFailed');
+          qPct.textContent = t('quota.unavailable');
+          qDetail.textContent = quotaError;
+        } else {
+          qTitle.textContent = activeModel ? t('quota.titleCurrent', { model: activeModel }) : t('quota.titleDefault');
+          qPct.textContent = quotaBusy ? t('quota.loading') : t('quota.waitingSync');
+          qDetail.textContent = t('quota.hoverClickHint');
+        }
+      }
+    }
+
+    if (qFoot) {
+      if (!isDetailView) {
+        qFoot.textContent = t('quota.footHover');
+      } else if (primaryActive && primaryActive.remainingPct != null) {
+        const capPool = (primaryActive.estRemainingZh != null && primaryActive.estTotalTokens)
+          ? primaryActive
+          : ((weeklyActive?.estRemainingZh != null && weeklyActive?.estTotalTokens) ? weeklyActive : null);
+        if (capPool) {
+          const capZh = typeof formatApproxTokensZh === 'function'
+            ? formatApproxTokensZh(capPool.estTotalTokens)
+            : String(capPool.estTotalTokens);
+          const capWin = capPool.windowType === 'weekly' ? t('quota.dual.winWeeklyShort') : t('quota.dual.win5hShort');
+          qFoot.textContent = t('quota.footCalibrated', { win: capWin, cap: capZh });
+        } else if (primaryActive.cycleTokensUsed > 0) {
+          const usedZh = typeof formatApproxTokensZh === 'function'
+            ? formatApproxTokensZh(primaryActive.cycleTokensUsed)
+            : String(primaryActive.cycleTokensUsed);
+          qFoot.textContent = t('quota.footCycleUsed', { used: usedZh });
+        } else {
+          qFoot.textContent = t('quota.footMerged');
+        }
+      } else {
+        qFoot.textContent = t('quota.footClose');
+      }
+    }
+  }
+
+  function renderQuotaRing(forceDomCheck = false) {
+    renderQuotaBadgeToggleUI();
+    const qBtn = el('badge-quota');
+    const qFill = el('quota-ring-fill');
+    const qWinTag = el('quota-window-tag');
+    const qPctVal = el('quota-pct-val');
+    const qOvVal = el('overflow-quota-val');
+    const qRefresh = el('quota-tip-refresh');
+
+    const activeModel = getActiveModelCandidate(forceDomCheck);
+    const configs = Array.isArray(cascadeModelConfigs) ? cascadeModelConfigs : [];
+    const accountKey = getQuotaAccountKey();
+    const calibrationMap = loadQuotaCalibrationForAccount(accountKey);
+    const usageEvents = collectQuotaUsageEvents();
+    const summary = typeof summarizeModelQuotaPools === 'function'
+      ? summarizeModelQuotaPools(configs, activeModel, Date.now(), {
+        quotaSummary: quotaSummaryPayload,
+        usageEvents,
+        calibrationMap
+      })
+      : {
+        hasData: false,
+        hasShortData: false,
+        hasWeeklyData: false,
+        matchedByModel: false,
+        weeklyMatchedByModel: false,
+        currentModel: activeModel || null,
+        active: null,
+        activeWeekly: null,
+        pools: [],
+        weeklyPools: []
+      };
+    quotaSummary = summary;
+    if (summary?.hasData && summary.nextCalibration) {
+      saveQuotaCalibrationForAccount(accountKey, summary.nextCalibration);
+    }
+
+    const active = (summary.active && summary.active.remainingPct != null)
+      ? summary.active
+      : (summary.activeWeekly && summary.activeWeekly.remainingPct != null
+        ? summary.activeWeekly
+        : (summary.active || summary.activeWeekly || null));
+    const activeWeekly = summary.activeWeekly || null;
+    const primaryWindowTag = (active && active.windowType === 'weekly') ? '7d' : '5h';
+    const remPct = (summary.hasData && active && active.remainingPct != null) ? active.remainingPct : null;
+
+    let qState = 'unknown';
+    if (remPct != null) {
+      if (remPct <= 10) qState = 'danger';
+      else if (remPct <= 30) qState = 'warn';
+      else qState = 'normal';
+    }
+    host.setAttribute('data-quota-state', qState);
+    if (qBtn) {
+      qBtn.setAttribute('data-busy', quotaBusy ? 'true' : 'false');
+    }
+    if (qRefresh) {
+      qRefresh.disabled = Boolean(quotaBusy);
+      qRefresh.textContent = quotaBusy ? t('quota.refreshing') : t('quota.refresh');
+    }
+
+    if (qFill) {
+      if (remPct != null) {
+        if (remPct <= 0) {
+          qFill.setAttribute('data-ring-state', 'exhausted');
+          qFill.setAttribute('stroke-dasharray', `0 ${RING_CIRCUMFERENCE.toFixed(2)}`);
+          qFill.style.opacity = '0';
+        } else {
+          qFill.setAttribute('data-ring-state', 'determinate');
+          const arcLen = Math.max(1.8, (Math.min(100, remPct) / 100) * RING_CIRCUMFERENCE);
+          qFill.setAttribute('stroke-dasharray', `${arcLen.toFixed(2)} ${RING_CIRCUMFERENCE.toFixed(2)}`);
+          qFill.style.opacity = '1';
+        }
+      } else {
+        qFill.setAttribute('data-ring-state', 'unknown');
+        qFill.setAttribute('stroke-dasharray', '3.2 4.97');
+        qFill.style.opacity = '0.55';
+      }
+    }
+
+    if (qWinTag) {
+      qWinTag.textContent = primaryWindowTag;
+    }
+    const pctText = remPct != null ? `${remPct}%` : (quotaBusy ? '…' : '--%');
+    if (qPctVal) {
+      qPctVal.textContent = pctText;
+    }
+    if (qOvVal) {
+      qOvVal.textContent = pctText;
+    }
+    if (qBtn) {
+      const weeklyLabel = activeWeekly && activeWeekly.remainingPct != null
+        ? t('quota.aria.weekly', { pct: activeWeekly.remainingPct })
+        : '';
+      const estPart = active?.estRemainingZh != null
+        ? t('quota.aria.est', { tok: active.estRemainingZh })
+        : '';
+      qBtn.setAttribute('aria-label', active && remPct != null
+        ? t('quota.aria.summary', {
+          model: active.activeLabel || active.poolName,
+          win: primaryWindowTag === '7d' ? t('quota.aria.win7d') : t('quota.aria.win5h'),
+          pct: remPct,
+          est: estPart,
+          weekly: weeklyLabel
+        })
+        : t('quota.aria.default'));
+    }
+
+    renderQuotaTooltipSummary(summary);
+    renderQuotaTooltipPools(summary);
+    if (quotaTooltipOpen) positionQuotaTooltip();
+  }
+
+  async function refreshQuota({ force = false } = {}) {
+    if (state.disposed || quotaBusy) return null;
+    if (!force && quotaAt && Date.now() - quotaAt < 10000) return quotaSummary;
+    const reqSeq = ++quotaReqSeq;
+    quotaBusy = true;
+    const qBtn = el('badge-quota');
+    qBtn?.setAttribute('data-busy', 'true');
+    const qRefresh = el('quota-tip-refresh');
+    if (qRefresh) {
+      qRefresh.disabled = true;
+      qRefresh.textContent = t('quota.refreshing');
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const summaryController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    if (controller) state.controllers.add(controller);
+    if (summaryController) state.controllers.add(summaryController);
+    const timeout = controller ? setTimeout(() => controller.abort(), 10000) : null;
+    const summaryTimeout = summaryController ? setTimeout(() => summaryController.abort(), 10000) : null;
+    timeout?.unref?.();
+    summaryTimeout?.unref?.();
+    const clearSummaryHandle = () => {
+      if (summaryTimeout) clearTimeout(summaryTimeout);
+      if (summaryController) state.controllers.delete(summaryController);
+    };
+    summaryController?.signal?.addEventListener?.('abort', clearSummaryHandle, { once: true });
+
+    let statusErr = null;
+    try {
+      let configs = null;
+      let nextSummaryPayload = null;
+      let summaryResolvedInThisCall = false;
+      if (typeof window !== 'undefined' && typeof window.contextMeterAPI?.getQuota === 'function') {
+        const res = await window.contextMeterAPI.getQuota({ force: Boolean(force) });
+        if (res?.ok) {
+          if (Array.isArray(res.cascadeModelConfigs) && res.cascadeModelConfigs.length) {
+            configs = res.cascadeModelConfigs;
+          }
+          if (res.quotaSummary && typeof res.quotaSummary === 'object') {
+            nextSummaryPayload = res.quotaSummary;
+            summaryResolvedInThisCall = true;
+          }
+        }
+      }
+      if (!configs && typeof window !== 'undefined' && window.__APP_CONFIG__?.csrfToken) {
+        const headers = {
+          'Content-Type': 'application/json',
+          'Connect-Protocol-Version': '1',
+          'x-codeium-csrf-token': window.__APP_CONFIG__.csrfToken
+        };
+        const statusPromise = fetch('/exa.language_server_pb.LanguageServerService/GetUserStatus', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({}),
+          signal: controller ? controller.signal : undefined
+        }).then(async response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        });
+
+        let summaryPromise = null;
+        if (!nextSummaryPayload) {
+          summaryPromise = fetch('/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({}),
+            signal: summaryController ? summaryController.signal : undefined
+          })
+            .then(async response => (response.ok ? response.json() : null))
+            .catch(() => null)
+            .then(val => {
+              clearSummaryHandle();
+              if (!state.disposed && reqSeq === quotaReqSeq && val && typeof val === 'object') {
+                summaryResolvedInThisCall = true;
+                const changed = quotaSummaryPayload !== val;
+                quotaSummaryPayload = val;
+                quotaAt = Date.now();
+                quotaError = '';
+                if (changed && !quotaBusy) renderQuotaRing(true);
+              }
+              return val;
+            });
+        }
+
+        try {
+          const payload = await statusPromise;
+          const clientConfigs = payload?.userStatus?.cascadeModelConfigData?.clientModelConfigs;
+          if (Array.isArray(clientConfigs)) configs = clientConfigs;
+        } catch (err) {
+          statusErr = err;
+        }
+
+        if (summaryPromise) {
+          await Promise.resolve();
+          await Promise.resolve();
+        }
+      }
+      if (state.disposed || reqSeq !== quotaReqSeq) return null;
+      if (nextSummaryPayload && typeof nextSummaryPayload === 'object') {
+        quotaSummaryPayload = nextSummaryPayload;
+      }
+      if (Array.isArray(configs)) {
+        cascadeModelConfigs = configs;
+        quotaAt = Date.now();
+        quotaError = '';
+      } else if (statusErr && !summaryResolvedInThisCall) {
+        throw statusErr;
+      } else if (summaryResolvedInThisCall) {
+        quotaAt = Date.now();
+        quotaError = '';
+      }
+    } catch (e) {
+      if (!state.disposed && reqSeq === quotaReqSeq) {
+        quotaError = e?.name === 'AbortError' ? t('quota.err.timeout') : (e?.message || t('quota.err.failed'));
+      }
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (controller) state.controllers.delete(controller);
+      quotaBusy = false;
+      quotaNext = Date.now() + ((typeof document !== 'undefined' && document.hidden) ? 60000 : 25000);
+      if (!state.disposed) renderQuotaRing(true);
+    }
+    return quotaSummary;
+  }
 
 function renderHeatmapGrid(forceRebuild = false) {
     const colsBox = el('h-grid-cols');
@@ -17389,6 +18701,7 @@ function renderHeatmapGrid(forceRebuild = false) {
     host.hidden = false;
     host.setAttribute('data-has-session', state.route ? 'true' : 'false');
     ensureHostDocked();
+    renderQuotaRing();
     if (!state.route) {
       hideContextTooltip();
       const barFill = el('bar-fill');
@@ -17645,6 +18958,397 @@ function renderHeatmapGrid(forceRebuild = false) {
     el('refresh').disabled = state.scanBusy;
   }
 
+  const MAX_FLUSH_BATCH_CALLS = 500;
+  const MAX_FLUSH_BATCH_BYTES = 900 * 1024;
+  const MAX_LIVE_RECORD_BODY_BYTES = 1024 * 1024;
+  const utf8Encoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
+
+  function getUtf8ByteLength(str) {
+    const s = String(str ?? '');
+    if (utf8Encoder) return utf8Encoder.encode(s).length;
+    if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') return Buffer.byteLength(s, 'utf8');
+    let bytes = 0;
+    for (let i = 0; i < s.length; i++) {
+      const code = s.charCodeAt(i);
+      if (code < 0x80) bytes += 1;
+      else if (code < 0x800) bytes += 2;
+      else if (code >= 0xd800 && code <= 0xdbff && i + 1 < s.length) {
+        const next = s.charCodeAt(i + 1);
+        if (next >= 0xdc00 && next <= 0xdfff) { bytes += 4; i++; }
+        else bytes += 3;
+      } else bytes += 3;
+    }
+    return bytes;
+  }
+
+  const getSingleCallBodyBytes = call => 12 + getUtf8ByteLength(JSON.stringify(call));
+
+  const getModelRank = (model, modelKey) => {
+    const s = String(model || '').trim();
+    if (!s) return 0;
+    if (/^model_placeholder_/i.test(s)) return modelKey ? 2 : 1;
+    return modelKey ? 3 : 2;
+  };
+
+  const getDateRank = call => {
+    if (!call) return 0;
+    const hasDate = Boolean(call.date && /^\d{4}-\d{2}-\d{2}/.test(String(call.date)));
+    const isProv = call.dateIsProvisional === true || call.dateSource === 'provisional';
+    if (isProv) return hasDate ? 1 : 0;
+    let hasValidCreatedAt = false;
+    if (call.created_at) {
+      const dt = new Date(call.created_at);
+      hasValidCreatedAt = !Number.isNaN(dt.getTime());
+    }
+    if (call.dateSource === 'transcript' && (hasDate || hasValidCreatedAt)) return 4;
+    if (hasValidCreatedAt) return 3;
+    if (hasDate) return 2;
+    return 0;
+  };
+
+  const resolveWatermarkDate = call => {
+    if (!call) return '';
+    const isProv = call.dateIsProvisional === true || call.dateSource === 'provisional';
+    if (!isProv && call.created_at) {
+      const dt = new Date(call.created_at);
+      if (!Number.isNaN(dt.getTime())) return formatLocalYmd(dt);
+    }
+    return (call.date && /^\d{4}-\d{2}-\d{2}/.test(String(call.date))) ? String(call.date).slice(0, 10) : '';
+  };
+
+  function rawRevIsPresent(val) {
+    return val !== null && val !== '';
+  }
+
+  const extractSourceRevision = row => {
+    if (!row || typeof row !== 'object') return null;
+    const raw = row.sourceRevision ?? row.revision ?? row.metadataRevision;
+    if (raw !== undefined && rawRevIsPresent(raw)) {
+      const num = Number(raw);
+      if (Number.isFinite(num)) return num;
+    }
+    const rawUpdated = row.updated_at ?? row.sourceUpdatedAt;
+    if (rawUpdated !== undefined && rawRevIsPresent(rawUpdated)) {
+      const ts = typeof rawUpdated === 'number' ? rawUpdated : Date.parse(String(rawUpdated));
+      if (Number.isFinite(ts)) return ts;
+    }
+    return null;
+  };
+
+  const compareSourceRevision = (incRev, baseRev) => {
+    const a = typeof incRev === 'number' && Number.isFinite(incRev) ? incRev : null;
+    const b = typeof baseRev === 'number' && Number.isFinite(baseRev) ? baseRev : null;
+    if (a === null && b === null) return 0;
+    if (a !== null && b === null) return 1;
+    if (a === null && b !== null) return -1;
+    if (a === b) return 0;
+    return a > b ? 1 : -1;
+  };
+
+  const compareWatermarkUsage = (a, b) => {
+    const totDiff = (a?.tot || 0) - (b?.tot || 0);
+    if (totDiff !== 0) return totDiff;
+    return (a?.out || 0) - (b?.out || 0);
+  };
+
+  const canAdoptNextDate = (nextWm, prevWm) => {
+    if (!prevWm) return Boolean(nextWm?.date);
+    const nextDateRank = nextWm?.dateRank || 0;
+    const prevDateRank = prevWm?.dateRank || 0;
+    if (nextDateRank > prevDateRank) return Boolean(nextWm?.date);
+    if (nextDateRank < prevDateRank) return false;
+    if (!nextWm?.date) return false;
+    if (!prevWm?.date) return true;
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    if (nextDateRank >= 2) {
+      if (revCmp > 0 && usageCmp >= 0) return true;
+      if (usageCmp > 0 && revCmp >= 0) return true;
+      return nextWm.date === prevWm.date && (nextWm.createdAt || '') === (prevWm.createdAt || '') && revCmp >= 0 && usageCmp >= 0;
+    }
+    return nextWm.date < prevWm.date;
+  };
+
+  const getFinalCallWatermark = call => ({
+    inp: call?.inputTokens || 0,
+    cap: call?.cacheTokens || 0,
+    tot: (call?.inputTokens || 0) + (call?.cacheTokens || 0) + (call?.outputTokens || 0),
+    out: call?.outputTokens || 0,
+    model: String(call?.model || '').trim(),
+    modelKey: String(call?.modelKey || '').trim(),
+    isPriced: Boolean(call?.isPriced),
+    costUSD: Number(call?.costUSD || 0),
+    date: resolveWatermarkDate(call),
+    createdAt: call?.created_at ? String(call.created_at) : '',
+    dateSource: call?.dateSource ? String(call.dateSource) : '',
+    dateRank: getDateRank(call),
+    sourceRevision: extractSourceRevision(call)
+  });
+
+  function hasWatermarkProgressed(nextWm, prevWm) {
+    if (!prevWm) return true;
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    if (usageCmp > 0) return true;
+    if (getModelRank(nextWm.model, nextWm.modelKey) > getModelRank(prevWm.model, prevWm.modelKey)) return true;
+    if (!prevWm.modelKey && Boolean(nextWm.modelKey)) return true;
+    if (!prevWm.isPriced && Boolean(nextWm.isPriced)) return true;
+    const nextDateRank = nextWm.dateRank || 0;
+    const prevDateRank = prevWm.dateRank || 0;
+    if (nextDateRank > prevDateRank) return true;
+    const usageRegressed = usageCmp < 0;
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    if (!usageRegressed && revCmp > 0) return true;
+    const takeNextDate = canAdoptNextDate(nextWm, prevWm);
+    if (
+      takeNextDate &&
+      nextDateRank >= 2 &&
+      nextDateRank === prevDateRank &&
+      Boolean(nextWm.date) &&
+      (
+        nextWm.date !== prevWm.date ||
+        (nextDateRank >= 3 && Boolean(nextWm.createdAt) && nextWm.createdAt !== (prevWm.createdAt || ''))
+      )
+    ) {
+      return true;
+    }
+    const hasUnacceptedDate = Boolean(prevWm.date) && Boolean(nextWm.date) && nextWm.date !== prevWm.date && !takeNextDate;
+    if (!usageRegressed && revCmp >= 0 && !hasUnacceptedDate && nextWm.isPriced && !(prevWm.costUSD > 0) && nextWm.costUSD > 0) return true;
+    return false;
+  }
+
+  function mergeWatermarks(prevWm, nextWm) {
+    if (!prevWm) return { ...nextWm };
+    const nextRank = getModelRank(nextWm.model, nextWm.modelKey);
+    const prevRank = getModelRank(prevWm.model, prevWm.modelKey);
+    const nextDateRank = nextWm.dateRank || 0;
+    const prevDateRank = prevWm.dateRank || 0;
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    const usageRegressed = usageCmp < 0;
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    const takeNextUsage = usageCmp > 0 || (usageCmp === 0 && revCmp >= 0);
+    const takeNextDate = canAdoptNextDate(nextWm, prevWm);
+    const mergedSourceRevision = revCmp >= 0
+      ? (nextWm.sourceRevision ?? prevWm.sourceRevision ?? null)
+      : (prevWm.sourceRevision ?? null);
+    let mergedCost = Math.max(prevWm.isPriced ? (prevWm.costUSD || 0) : 0, nextWm.isPriced ? (nextWm.costUSD || 0) : 0);
+    if (!usageRegressed && revCmp >= 0 && nextWm.isPriced && (takeNextDate || nextWm.date === prevWm.date || !prevWm.date)) {
+      mergedCost = nextWm.costUSD || 0;
+    }
+    return {
+      inp: takeNextUsage ? (nextWm.inp ?? 0) : (prevWm.inp ?? 0),
+      cap: takeNextUsage ? (nextWm.cap ?? 0) : (prevWm.cap ?? 0),
+      tot: takeNextUsage ? nextWm.tot : prevWm.tot,
+      out: takeNextUsage ? nextWm.out : prevWm.out,
+      model: nextRank >= prevRank && nextWm.model ? nextWm.model : prevWm.model,
+      modelKey: nextWm.modelKey || prevWm.modelKey || '',
+      isPriced: Boolean(prevWm.isPriced || nextWm.isPriced),
+      costUSD: mergedCost,
+      date: takeNextDate ? nextWm.date : (prevWm.date || nextWm.date || ''),
+      createdAt: takeNextDate ? (nextWm.createdAt || '') : (prevWm.createdAt || ''),
+      dateSource: takeNextDate ? (nextWm.dateSource || '') : (prevWm.dateSource || ''),
+      dateRank: Math.max(prevDateRank, nextDateRank),
+      sourceRevision: mergedSourceRevision
+    };
+  }
+
+  function mergePendingCallData(prevCall, nextCall) {
+    if (!prevCall) return nextCall;
+    const prevWm = getFinalCallWatermark(prevCall);
+    const nextWm = getFinalCallWatermark(nextCall);
+    const merged = { ...nextCall };
+    const usageCmp = compareWatermarkUsage(nextWm, prevWm);
+    const revCmp = compareSourceRevision(nextWm.sourceRevision, prevWm.sourceRevision);
+    const takePrevUsage = usageCmp < 0 || (usageCmp === 0 && revCmp < 0);
+    if (takePrevUsage) {
+      merged.inputTokens = prevCall.inputTokens;
+      merged.cacheTokens = prevCall.cacheTokens;
+      merged.cacheReadTokens = prevCall.cacheReadTokens;
+      merged.outputTokens = prevCall.outputTokens;
+      merged.thinkingTokens = prevCall.thinkingTokens;
+      merged.responseTokens = prevCall.responseTokens;
+      merged.totalTokens = prevCall.totalTokens;
+    }
+    const takeNextDate = canAdoptNextDate(nextWm, prevWm);
+    const takePrevDate = !takeNextDate && Boolean(prevWm.date || (prevWm.dateRank || 0) > (nextWm.dateRank || 0));
+    if (takePrevDate) {
+      merged.date = prevCall.date;
+      merged.created_at = prevCall.created_at;
+      if (prevCall.dateSource !== undefined) merged.dateSource = prevCall.dateSource;
+      else delete merged.dateSource;
+      merged.dateIsProvisional = prevCall.dateIsProvisional;
+      if (prevCall.timestamp !== undefined) merged.timestamp = prevCall.timestamp;
+    }
+    if (revCmp < 0 && prevWm.sourceRevision !== null) {
+      merged.sourceRevision = prevWm.sourceRevision;
+    } else if (nextWm.sourceRevision !== null) {
+      merged.sourceRevision = nextWm.sourceRevision;
+    } else {
+      delete merged.sourceRevision;
+    }
+    if (getModelRank(prevWm.model, prevWm.modelKey) > getModelRank(nextWm.model, nextWm.modelKey)) {
+      merged.model = prevCall.model;
+    }
+    if (!nextWm.modelKey && prevWm.modelKey) {
+      merged.modelKey = prevCall.modelKey;
+    }
+    if (typeof calculateRequestApiCost === 'function' && (merged.model || merged.modelKey)) {
+      const recalc = calculateRequestApiCost(merged);
+      if (recalc.isPriced) {
+        merged.modelKey = recalc.modelKey;
+        merged.isPriced = true;
+        merged.costUSD = recalc.costUSD ?? 0;
+      }
+    } else if (!nextWm.isPriced && prevWm.isPriced) {
+      merged.isPriced = prevCall.isPriced;
+      merged.costUSD = prevCall.costUSD;
+    } else if (nextWm.isPriced && prevWm.isPriced && (takePrevUsage || takePrevDate) && (prevWm.costUSD || 0) > (nextWm.costUSD || 0)) {
+      merged.costUSD = prevCall.costUSD;
+    }
+    return merged;
+  }
+
+  function takeNextPendingBatch(pendingMap) {
+    const chunk = [];
+    const snap = [];
+    let totalBytes = 12; // '{"calls":[]}'
+    for (const call of pendingMap.values()) {
+      if (chunk.length >= MAX_FLUSH_BATCH_CALLS) break;
+      const itemBytes = getUtf8ByteLength(JSON.stringify(call));
+      if (12 + itemBytes > MAX_FLUSH_BATCH_BYTES) continue;
+      const addedBytes = (chunk.length > 0 ? 1 : 0) + itemBytes;
+      if (chunk.length > 0 && totalBytes + addedBytes > MAX_FLUSH_BATCH_BYTES) break;
+      chunk.push(call);
+      snap.push({ callId: call.callId, wm: getFinalCallWatermark(call) });
+      totalBytes += addedBytes;
+    }
+    return { chunk, snap };
+  }
+
+  function commitConfirmedEntries(entries) {
+    for (const entry of entries) {
+      state.quarantinedOversizeMap?.delete(entry.callId);
+      const curSynced = state.syncedFinalMap.get(entry.callId);
+      const nextSynced = mergeWatermarks(curSynced, entry.wm);
+      state.syncedFinalMap.set(entry.callId, nextSynced);
+      const curPending = state.pendingFinalCalls.get(entry.callId);
+      if (curPending && !hasWatermarkProgressed(getFinalCallWatermark(curPending), nextSynced)) {
+        state.pendingFinalCalls.delete(entry.callId);
+      }
+    }
+  }
+
+  const EXPLICIT_OVERSIZE_RE = /\b413\b|payload\s+too\s+large|entity\s+too\s+large|body\s+too\s+large|(?:payload|body|size|record|message|batch|bytes?)\b.*(?:exceeds?|exceeded|over)\b|(?:exceeds?|exceeded|over)\b.*(?:\d+\s*(?:kib|mib|kb|mb|bytes?)|(?:size|payload|body)\s*(?:limit|max))|传输体积超限|体积超限|超出上限|超过.*上限/i;
+
+  function isExplicitOversizeError(recRes) {
+    if (!recRes || typeof recRes !== 'object') return false;
+    if (recRes.status === 413) return true;
+    if (recRes.code === 'PAYLOAD_TOO_LARGE' || recRes.code === 'OVERSIZE' || recRes.phase === 'oversize_guard') return true;
+    return EXPLICIT_OVERSIZE_RE.test(String(recRes.error || ''));
+  }
+
+  function quarantineOversizedEntry(callId, wm) {
+    if (!state.quarantinedOversizeMap) state.quarantinedOversizeMap = new Map();
+    const prevQuarantined = state.quarantinedOversizeMap.get(callId);
+    state.quarantinedOversizeMap.set(callId, mergeWatermarks(prevQuarantined, wm));
+    const curPending = state.pendingFinalCalls.get(callId);
+    if (curPending && !hasWatermarkProgressed(getFinalCallWatermark(curPending), wm) && getSingleCallBodyBytes(curPending) > MAX_FLUSH_BATCH_BYTES) {
+      state.pendingFinalCalls.delete(callId);
+    }
+  }
+
+  async function flushPendingFinalCalls(triggerSyncEvenIfUnchanged) {
+    if (triggerSyncEvenIfUnchanged && state.flushFinalsBusy) {
+      state.pendingFlushForceSync = true;
+    }
+    if (state.flushFinalsBusy || state.disposed || !state.pendingFinalCalls?.size) return;
+    if (Date.now() < (state.nextFlushRetryAt || 0)) return;
+    state.flushFinalsBusy = true;
+    let anySucceeded = false;
+    let anyChanged = false;
+    let failedDuringLoop = false;
+    try {
+      while (!state.disposed && state.pendingFinalCalls.size > 0) {
+        if (Date.now() < (state.nextFlushRetryAt || 0)) break;
+        const { chunk, snap } = takeNextPendingBatch(state.pendingFinalCalls);
+        if (!chunk.length) break;
+        const recRes = await recordModelCallsRemote(chunk);
+        if (state.disposed) break;
+        if (recRes?.ok === true) {
+          anySucceeded = true;
+          if (recRes.changed) anyChanged = true;
+          commitConfirmedEntries(snap);
+        } else {
+          failedDuringLoop = true;
+          state.nextFlushRetryAt = Date.now() + (document.hidden ? 15000 : 3000);
+          break;
+        }
+      }
+      if (!state.disposed && !failedDuringLoop && state.pendingFinalCalls.size > 0 && Date.now() >= (state.nextOversizeRetryAt || 0)) {
+        const oversizedItems = [];
+        for (const call of state.pendingFinalCalls.values()) {
+          const singleBytes = getSingleCallBodyBytes(call);
+          if (singleBytes > MAX_FLUSH_BATCH_BYTES) {
+            oversizedItems.push({ call, singleBytes, wm: getFinalCallWatermark(call) });
+          }
+        }
+        for (const item of oversizedItems) {
+          if (state.disposed) break;
+          if (!state.pendingFinalCalls.has(item.call.callId)) continue;
+          const isLiveHttpMode = !(typeof window !== 'undefined' && typeof window.contextMeterAPI?.recordCalls === 'function')
+            && Boolean(typeof window !== 'undefined' && window.__AGContextMeterLive?.port);
+          if (isLiveHttpMode && item.singleBytes > MAX_LIVE_RECORD_BODY_BYTES) {
+            quarantineOversizedEntry(item.call.callId, item.wm);
+            console.warn(`Context Meter: 单条调用记录超过实时通道 1MiB 上限 (${item.singleBytes} bytes)，已隔离跳过: ${item.call.callId}`);
+            continue;
+          }
+          const recRes = await recordModelCallsRemote([item.call]);
+          if (state.disposed) break;
+          if (recRes?.ok === true) {
+            anySucceeded = true;
+            if (recRes.changed) anyChanged = true;
+            state.nextOversizeRetryAt = 0;
+            commitConfirmedEntries([{ callId: item.call.callId, wm: item.wm }]);
+          } else if ((isLiveHttpMode && (item.singleBytes > MAX_LIVE_RECORD_BODY_BYTES || recRes?.status === 413)) || isExplicitOversizeError(recRes)) {
+            quarantineOversizedEntry(item.call.callId, item.wm);
+            console.warn(`Context Meter: 超大调用记录入账被拒绝，已隔离跳过: ${item.call.callId}`);
+          } else {
+            failedDuringLoop = true;
+            const retryAt = Date.now() + (document.hidden ? 15000 : 3000);
+            state.nextOversizeRetryAt = retryAt;
+            state.nextFlushRetryAt = retryAt;
+            break;
+          }
+        }
+      }
+      if (!state.disposed && !failedDuringLoop && state.pendingFinalCalls.size > 0 && (state.nextOversizeRetryAt || 0) > Date.now()) {
+        const { chunk: remainingNormal } = takeNextPendingBatch(state.pendingFinalCalls);
+        if (!remainingNormal.length) {
+          state.nextFlushRetryAt = state.nextOversizeRetryAt;
+        }
+      }
+      if (!state.disposed && anySucceeded) {
+        if (showQuotaBadge) {
+          const soon = Date.now() + 1800;
+          if (!quotaNext || quotaNext > soon) quotaNext = soon;
+        }
+        if (!failedDuringLoop && state.pendingFinalCalls.size === 0) {
+          state.nextFlushRetryAt = 0;
+          state.nextOversizeRetryAt = 0;
+        }
+        if (triggerSyncEvenIfUnchanged || state.pendingFlushForceSync || anyChanged) {
+          state.pendingFlushForceSync = false;
+          automaticHistorySyncPending = true;
+          syncPendingAutomaticHistory();
+        }
+      }
+    } finally {
+      state.flushFinalsBusy = false;
+      if (anySucceeded && !state.disposed && state.pendingFinalCalls.size > 0 && Date.now() >= (state.nextFlushRetryAt || 0)) {
+        void flushPendingFinalCalls(true);
+      }
+    }
+  }
+
   async function requestPoll(generation, id) {
     state.requestBusy = true;
     const controller = new AbortController(); state.controllers.add(controller);
@@ -17658,37 +19362,124 @@ function renderHeatmapGrid(forceRebuild = false) {
       const rows = data.generatorMetadata || [];
       state.count = rows.length ? offset + rows.length : 0;
       if (!state.sessionCallsMap) state.sessionCallsMap = new Map();
-      const parsedCalls = [];
-      const modelConfigsList = state.cascadeModelConfigs || state.scan?.cascadeModelConfigs || [];
+      if (!state.syncedFinalMap) state.syncedFinalMap = new Map();
+      if (!state.pendingFinalCalls) state.pendingFinalCalls = new Map();
+      if (!state.quarantinedOversizeMap) state.quarantinedOversizeMap = new Map();
+      const wasHydrated = Boolean(state.callsHydrated);
+      let hasNewOrProgressedPending = false;
+      const modelConfigsList = state.cascadeModelConfigs || state.scan?.cascadeModelConfigs || cascadeModelConfigs || [];
       for (let i = 0; i < rows.length; i++) {
         const call = parseGeneratorCall ? parseGeneratorCall(rows[i], id, 'desktop', { cascadeModelConfigs: modelConfigsList }) : null;
         if (call && call.callId) {
-          state.sessionCallsMap.set(call.callId, call);
-          parsedCalls.push(call);
-        }
-      }
-      state.sessionCalls = Array.from(state.sessionCallsMap.values());
-      state.sessionCostTotal = state.sessionCalls.reduce((sum, c) => sum + (c.isPriced ? (c.costUSD || 0) : 0), 0);
-      if (parsedCalls.length) {
-        if (!state.reportedFinalCallIds) state.reportedFinalCallIds = new Set();
-        if (!state.reportedFinalCallOutputs) state.reportedFinalCallOutputs = new Map();
-        const callsToReport = [];
-        for (const call of parsedCalls) {
-          if (call && call.status === 'final' && call.callId) {
-            const lastOutput = state.reportedFinalCallOutputs.get(call.callId);
-            const currentOutput = call.outputTokens || 0;
-            if (!state.reportedFinalCallIds.has(call.callId) || (lastOutput != null && currentOutput > lastOutput)) {
-              callsToReport.push(call);
+          const prevSessionCall = state.sessionCallsMap.get(call.callId);
+          const prevSynced = state.syncedFinalMap.get(call.callId);
+          const prevPending = state.pendingFinalCalls.get(call.callId);
+          const prevQuarantined = state.quarantinedOversizeMap.get(call.callId);
+          let effectiveCall = (prevSessionCall && call.status === 'final' && prevSessionCall.status === 'final')
+            ? mergePendingCallData(prevSessionCall, call)
+            : call;
+          if (prevPending && effectiveCall.status === 'final' && prevPending.status === 'final') {
+            effectiveCall = mergePendingCallData(prevPending, effectiveCall);
+          }
+          if (effectiveCall.status === 'final') {
+            if (prevSynced) {
+              const effWm0 = getFinalCallWatermark(effectiveCall);
+              const uCmp0 = compareWatermarkUsage(effWm0, prevSynced);
+              const rCmp0 = compareSourceRevision(effWm0.sourceRevision, prevSynced.sourceRevision);
+              const restoreSyncedUsage = (uCmp0 < 0 || (uCmp0 === 0 && rCmp0 < 0)) && prevSynced.inp !== undefined;
+              const restoreSyncedDate = (prevSynced.dateRank || 0) >= 2 && Boolean(prevSynced.date) && !canAdoptNextDate(effWm0, prevSynced);
+              const restoreSyncedRev = rCmp0 < 0 && prevSynced.sourceRevision !== null && prevSynced.sourceRevision !== undefined;
+              if (restoreSyncedUsage || restoreSyncedDate || restoreSyncedRev) {
+                effectiveCall = {
+                  ...effectiveCall,
+                  ...(restoreSyncedUsage ? {
+                    inputTokens: prevSynced.inp,
+                    cacheTokens: prevSynced.cap,
+                    cacheReadTokens: prevSynced.cap,
+                    outputTokens: prevSynced.out,
+                    totalTokens: prevSynced.tot
+                  } : {}),
+                  ...(restoreSyncedDate ? {
+                    date: prevSynced.date,
+                    created_at: prevSynced.createdAt || null,
+                    ...(prevSynced.dateSource ? { dateSource: prevSynced.dateSource } : {}),
+                    dateIsProvisional: false
+                  } : {}),
+                  ...(restoreSyncedRev ? { sourceRevision: prevSynced.sourceRevision } : {})
+                };
+                if (restoreSyncedDate && !prevSynced.dateSource) delete effectiveCall.dateSource;
+                if (typeof calculateRequestApiCost === 'function' && (effectiveCall.model || effectiveCall.modelKey)) {
+                  const recalc = calculateRequestApiCost(effectiveCall);
+                  if (recalc.isPriced) {
+                    effectiveCall.modelKey = recalc.modelKey;
+                    effectiveCall.isPriced = true;
+                    effectiveCall.costUSD = recalc.costUSD ?? 0;
+                  }
+                }
+              }
+            }
+            if (getDateRank(effectiveCall) === 1) {
+              let earliestProvDate = effectiveCall.date ? String(effectiveCall.date).slice(0, 10) : '';
+              for (const ref of [prevPending, prevSynced, prevQuarantined]) {
+                const refRank = ref ? (ref.dateRank !== undefined ? ref.dateRank : getDateRank(ref)) : 0;
+                const refDate = ref?.date ? String(ref.date).slice(0, 10) : '';
+                if (refRank === 1 && refDate && (!earliestProvDate || refDate < earliestProvDate)) {
+                  earliestProvDate = refDate;
+                }
+              }
+              if (earliestProvDate && earliestProvDate !== String(effectiveCall.date || '').slice(0, 10)) {
+                effectiveCall = { ...effectiveCall, date: earliestProvDate, created_at: null, dateSource: 'provisional', dateIsProvisional: true };
+                if (typeof calculateRequestApiCost === 'function' && (effectiveCall.model || effectiveCall.modelKey)) {
+                  const recalc = calculateRequestApiCost(effectiveCall);
+                  if (recalc.isPriced) {
+                    effectiveCall.modelKey = recalc.modelKey;
+                    effectiveCall.isPriced = true;
+                    effectiveCall.costUSD = recalc.costUSD ?? 0;
+                  }
+                }
+              }
+            }
+          }
+          state.sessionCallsMap.set(call.callId, effectiveCall);
+          if (effectiveCall.status === 'final') {
+            const wm = getFinalCallWatermark(effectiveCall);
+            if (hasWatermarkProgressed(wm, prevSynced)) {
+              if (prevQuarantined && !hasWatermarkProgressed(wm, prevQuarantined) && getSingleCallBodyBytes(effectiveCall) > MAX_FLUSH_BATCH_BYTES) {
+                continue;
+              }
+              const prevPendingWm = prevPending ? getFinalCallWatermark(prevPending) : null;
+              const progressedVsPending = hasWatermarkProgressed(wm, prevPendingWm);
+              if (progressedVsPending) {
+                hasNewOrProgressedPending = true;
+                if (getSingleCallBodyBytes(effectiveCall) > MAX_FLUSH_BATCH_BYTES) {
+                  state.nextOversizeRetryAt = 0;
+                }
+              }
+              const notRegressedVsPending = !prevPendingWm || (
+                compareWatermarkUsage(wm, prevPendingWm) >= 0 &&
+                compareSourceRevision(wm.sourceRevision, prevPendingWm.sourceRevision) >= 0 &&
+                canAdoptNextDate(wm, prevPendingWm) &&
+                getModelRank(wm.model, wm.modelKey) >= getModelRank(prevPendingWm.model, prevPendingWm.modelKey) &&
+                (wm.dateRank || 0) >= (prevPendingWm.dateRank || 0) &&
+                (!prevPendingWm.modelKey || Boolean(wm.modelKey)) &&
+                (!prevPendingWm.isPriced || Boolean(wm.isPriced))
+              );
+              if (progressedVsPending || notRegressedVsPending) {
+                const nextPendingCall = prevPending ? mergePendingCallData(prevPending, effectiveCall) : effectiveCall;
+                state.pendingFinalCalls.set(call.callId, nextPendingCall);
+              }
             }
           }
         }
-        if (callsToReport.length) {
-          for (const call of callsToReport) {
-            state.reportedFinalCallIds.add(call.callId);
-            state.reportedFinalCallOutputs.set(call.callId, call.outputTokens || 0);
-          }
-          void recordModelCallsRemote(callsToReport);
-        }
+      }
+      state.callsHydrated = true;
+      state.sessionCalls = Array.from(state.sessionCallsMap.values());
+      state.sessionCostTotal = state.sessionCalls.reduce((sum, c) => sum + (c.isPriced ? (c.costUSD || 0) : 0), 0);
+      if (hasNewOrProgressedPending) {
+        state.nextFlushRetryAt = 0;
+      }
+      if (state.pendingFinalCalls.size > 0) {
+        void flushPendingFinalCalls(wasHydrated);
       }
       for (let i = rows.length - 1; i >= 0; i--) {
         const value = summarize(rows[i], { cascadeModelConfigs: state.cascadeModelConfigs || state.scan?.cascadeModelConfigs || [] });
@@ -17746,7 +19537,6 @@ function renderHeatmapGrid(forceRebuild = false) {
     finally { if (generation === state.generation && !state.disposed) { state.scanBusy = false; state.scanNext = Date.now() + (document.hidden ? 60000 : 20000); render(); } }
   }
 
-  let lastHistorySync = 0;
   let lastAvailableModelsSync = 0;
   let availableModelsFetchInFlight = false;
   async function fetchAvailableModelsIfNeeded() {
@@ -17817,20 +19607,28 @@ function renderHeatmapGrid(forceRebuild = false) {
     if (id !== state.route) {
       for (const controller of state.controllers) controller.abort(); state.controllers.clear(); state.generation++;
       if (state.sessionCallsMap) state.sessionCallsMap.clear();
-      if (state.reportedFinalCallIds) state.reportedFinalCallIds.clear();
-      if (state.reportedFinalCallOutputs) state.reportedFinalCallOutputs.clear();
       Object.assign(state, {
         route: id, count: 0, latest: null, sessionCalls: [], sessionCostTotal: 0,
-        requestAt: 0, requestError: '', requestBusy: false, requestNext: 0,
-        scanBusy: false, scanNext: 0, scanError: '', scan: null,
-        reportedFinalCallIds: state.reportedFinalCallIds || new Set(),
-        reportedFinalCallOutputs: state.reportedFinalCallOutputs || new Map()
+        callsHydrated: false, requestAt: 0, requestError: '', requestBusy: false, requestNext: 0,
+        scanBusy: false, scanNext: 0, scanError: '', scan: null
       });
-      toggle(false); hideContextTooltip(); renderFiles(null); render();
-      void syncTokenHistoryFromHost(false);
+      toggle(false); hideContextTooltip(); hideQuotaTooltip(); renderFiles(null); render();
+      void syncTokenHistoryFromHost(true);
     }
     if (id && !state.requestBusy && Date.now() >= state.requestNext) void requestPoll(state.generation, id);
     if (id && !state.scanBusy && Date.now() >= state.scanNext) void scan(state.generation, id);
+    if (!state.disposed && state.pendingFinalCalls?.size && !state.flushFinalsBusy && Date.now() >= (state.nextFlushRetryAt || 0)) {
+      void flushPendingFinalCalls(true);
+    }
+    syncPendingAutomaticHistory();
+    if (showQuotaBadge && !state.disposed && !quotaBusy && Date.now() >= quotaNext) {
+      void refreshQuota({ force: false });
+    }
+    if (showQuotaBadge && Array.isArray(cascadeModelConfigs) && cascadeModelConfigs.length) {
+      const prevDom = cachedDomModel;
+      const nextDom = detectActiveModelFromDom(cascadeModelConfigs, false);
+      if (nextDom && nextDom !== prevDom) renderQuotaRing(false);
+    }
     if (Date.now() - lastHistorySync > 15000) {
       const isInitialSync = lastHistorySync === 0;
       lastHistorySync = Date.now();
@@ -17889,6 +19687,7 @@ function renderHeatmapGrid(forceRebuild = false) {
     setCountry: val => applyDirectCountrySelection(val),
     setCurrency: val => applyDirectCurrencySelection(val),
     restoreSettingsFromHost,
+    syncTokenHistoryFromHost,
     launchCli: opts => triggerLaunchCli(opts),
     getLastCliLaunchResult: () => lastCliLaunchResult,
     getTimelineWindow: () => {
@@ -17909,6 +19708,40 @@ function renderHeatmapGrid(forceRebuild = false) {
       applyLayoutMode(next);
       return state.layoutMode;
     },
+    getQuotaBadgeEnabled: () => showQuotaBadge,
+    setQuotaBadgeEnabled,
+    getModelQuotaState: () => ({
+      hasData: Boolean(quotaSummary?.hasData),
+      hasShortData: Boolean(quotaSummary?.hasShortData),
+      hasWeeklyData: Boolean(quotaSummary?.hasWeeklyData),
+      active: quotaSummary?.active || null,
+      activeWeekly: quotaSummary?.activeWeekly || null,
+      matchedByModel: Boolean(quotaSummary?.matchedByModel),
+      weeklyMatchedByModel: Boolean(quotaSummary?.weeklyMatchedByModel),
+      pools: Array.isArray(quotaSummary?.pools) ? quotaSummary.pools : [],
+      weeklyPools: Array.isArray(quotaSummary?.weeklyPools) ? quotaSummary.weeklyPools : [],
+      updatedAt: quotaAt || null,
+      error: quotaError || ''
+    }),
+    setModelQuotaForTest: (configs, modelName, opts = {}) => {
+      cascadeModelConfigs = Array.isArray(configs) ? configs : [];
+      if (opts && Object.prototype.hasOwnProperty.call(opts, 'quotaSummary')) {
+        quotaSummaryPayload = opts.quotaSummary || null;
+      }
+      quotaExplicitModel = modelName !== undefined ? String(modelName || '') : '';
+      if (opts && opts.resetCalibration) {
+        quotaCalibrationStore = {};
+        try { localStorage?.removeItem?.(QUOTA_CALIB_STORAGE_KEY); } catch {}
+      }
+      if (opts && Object.prototype.hasOwnProperty.call(opts, 'usageEvents')) {
+        quotaTestUsageEvents = Array.isArray(opts.usageEvents) ? opts.usageEvents : null;
+      }
+      quotaAt = Date.now();
+      quotaError = '';
+      renderQuotaRing(false);
+      return globalThis.__AGContextMeter.getModelQuotaState();
+    },
+    refreshQuota: opts => refreshQuota(opts),
     findTopRightClusterForTest: () => findTopRightCluster(),
     syncWindowControlsOverlayForTest: () => syncWindowControlsOverlay(),
     computeWindowControlsWidthForTest: el => computeWindowControlsWidth(el),
@@ -18004,6 +19837,8 @@ function renderHeatmapGrid(forceRebuild = false) {
       } catch {}
       document.removeEventListener('click', outside);
       document.removeEventListener('keydown', escape);
+      document.removeEventListener('click', onQuotaOutsideClick);
+      document.removeEventListener('keydown', onQuotaEscapeKey);
       try { document.getElementById('ag-wco-spacer')?.remove?.(); } catch {}
       try { document.getElementById('ag-topbar-host-fix')?.remove?.(); } catch {}
       host.remove();
@@ -18013,6 +19848,7 @@ function renderHeatmapGrid(forceRebuild = false) {
   applyStaticPanelTranslations(shadow);
   refreshRegionPresetSelectOptions();
   renderEnhanceSectionUI();
+  renderQuotaBadgeToggleUI();
   void restoreSettingsFromHost();
   installRequestInterceptor();
   render();
