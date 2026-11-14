@@ -10,15 +10,96 @@
     return Number.isFinite(num) && num >= 0 ? num : null;
   }
 
-  function getModelPoolKey(raw) {
-    if (!raw) return 'unknown';
-    const s = String(raw).toLowerCase();
-    if (s.includes('argon') || s.includes('gemini-4-argon')) return 'gemini-4-argon';
-    if (s.includes('flash') || s.includes('gemini-3.8-flash')) return 'gemini-3.8-flash';
-    if (s.includes('opus') || s.includes('claude-opus')) return 'claude-opus-5-5';
-    if (s.includes('sonnet') || s.includes('claude-sonnet')) return 'claude-sonnet-5-5';
-    if (s.includes('gpt-oss')) return 'gpt-oss-120b';
-    return s.replace(/[^a-z0-9_-]/g, '');
+  const MODEL_VARIANT_TAG_LIST = 'extra[\\s_-]?high|xhigh|high|medium|med|minimal|min|low|thinking|reasoning|extended|fast|turbo|standard|std|default|preview|experimental|exp|beta|alpha|recommended|new';
+  const MODEL_VARIANT_ONLY_RE = new RegExp(`^(?:${MODEL_VARIANT_TAG_LIST})$`, 'i');
+
+  function stripModelVariantTags(raw) {
+    if (!raw) return '';
+    let s = String(raw).replace(/\s+/g, ' ').trim();
+    if (!s || /^model_(?:placeholder|unspecified)_?/i.test(s)) return '';
+    let prev;
+    do {
+      prev = s;
+      s = s.replace(/\s*\([^)]*\b(?:xhigh|high|medium|med|minimal|min|low|thinking|reasoning|extended|fast|turbo|standard|std|default|preview|experimental|exp|beta|alpha|recommended|new)\b[^)]*\)/gi, '').trim();
+    } while (s !== prev);
+    do {
+      prev = s;
+      s = s.replace(/[\s_-]+(?:xhigh|high|medium|med|minimal|min|low|thinking|reasoning|fast|preview)$/gi, '').trim();
+    } while (s !== prev);
+    if (MODEL_VARIANT_ONLY_RE.test(s)) return '';
+    return s;
+  }
+
+  function pickPreferredModelText(raw, labelFallback = '') {
+    const cleanLbl = stripModelVariantTags(labelFallback);
+    if (cleanLbl) return cleanLbl;
+    const cleanRaw = stripModelVariantTags(raw);
+    if (cleanRaw) return cleanRaw;
+    const l = String(labelFallback || '').trim();
+    const r = String(raw || '').trim();
+    if (l && !/^model_(?:placeholder|unspecified)_?/i.test(l) && !MODEL_VARIANT_ONLY_RE.test(l)) return l;
+    if (r && !MODEL_VARIANT_ONLY_RE.test(r)) return r;
+    return (l && !MODEL_VARIANT_ONLY_RE.test(l)) ? l : '';
+  }
+
+  function getModelPoolKey(raw, labelFallback = '') {
+    const preferred = pickPreferredModelText(raw, labelFallback);
+    if (!preferred) return 'unknown';
+    const base = (stripModelVariantTags(preferred) || preferred).trim().toLowerCase();
+    if (!base || MODEL_VARIANT_ONLY_RE.test(base)) return 'unknown';
+    if (base.includes('hydrogen') || base.includes('4-hydrogen') || base.includes('4 hydrogen')) return 'gemini-4-hydrogen';
+    if (base.includes('argon') || base.includes('4-argon') || base.includes('4 argon')) return 'gemini-4-argon';
+    if (base.includes('carbon') || base.includes('4-carbon') || base.includes('4 carbon') || base === 'gemini-pro-orchestrator' || base === 'orchestrator (carbon)') {
+      return 'gemini-4-carbon';
+    }
+    if (base.includes('3.8-flash') || base.includes('3.8 flash') || base.includes('3-8-flash') || base.includes('flash-n') || base === 'flash') {
+      return 'gemini-3.8-flash';
+    }
+    if (/(?:opus[-_ ]5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])|5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])[-_ ]opus)/.test(base)) {
+      return 'claude-opus-5-5';
+    }
+    if (/(?:sonnet[-_ ]5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])|5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])[-_ ]sonnet)/.test(base)) {
+      return 'claude-sonnet-5-5';
+    }
+    if (base.includes('gpt-oss')) return 'gpt-oss-120b';
+    const slug = base
+      .replace(/(\d)-(\d)/g, '$1.$2')
+      .replace(/[^a-z0-9.]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    return slug || base.replace(/[^a-z0-9_.-]/g, '') || 'unknown';
+  }
+
+  function getPoolDisplayName(label, modelId, poolKey) {
+    const cleanLbl = stripModelVariantTags(label);
+    if (cleanLbl && !/^model_(?:placeholder|unspecified)_?/i.test(cleanLbl)) return cleanLbl;
+    const canonicalNames = {
+      'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
+      'gemini-4-carbon': 'Gemini 4 Carbon',
+      'gemini-4-argon': 'Gemini 4 Argon',
+      'gemini-3.8-flash': 'Gemini 3.8 Flash',
+      'claude-opus-5-5': 'Claude Opus 5.5',
+      'claude-sonnet-5-5': 'Claude Sonnet 5.5',
+      'gpt-oss-120b': 'GPT-OSS 120B'
+    };
+    if (poolKey && canonicalNames[poolKey]) return canonicalNames[poolKey];
+    const cleanId = stripModelVariantTags(modelId);
+    if (cleanId) return cleanId;
+    const rawLbl = String(label || '').trim();
+    if (rawLbl && !/^model_(?:placeholder|unspecified)_?/i.test(rawLbl) && !MODEL_VARIANT_ONLY_RE.test(rawLbl)) return rawLbl;
+    return poolKey && poolKey !== 'unknown' ? poolKey : '未知模型';
+  }
+
+  function formatLocalDateStr(dt) {
+    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+  }
+
+  function isQuotaSeriesMatch(a, b) {
+    if (!a || !b || a === 'unknown' || b === 'unknown') return false;
+    if (/^model[-_]placeholder/i.test(a) || /^model[-_]placeholder/i.test(b)) return false;
+    if (a === b) return true;
+    const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+    if (/\d$/.test(shorter)) return false;
+    return longer.startsWith(`${shorter}-`) || longer.startsWith(`${shorter}.`);
   }
 
   function formatResetTimeZh(isoStr) {
@@ -40,29 +121,50 @@
     if (!Array.isArray(cascadeModelConfigs) || !cascadeModelConfigs.length || !modelIdOrName) {
       return null;
     }
-    const poolKey = getModelPoolKey(modelIdOrName);
-    const targetStr = String(modelIdOrName).toLowerCase();
+    const targetPoolKey = getModelPoolKey(modelIdOrName);
+    const targetStr = String(modelIdOrName).toLowerCase().trim();
+    const readCfgId = c => String(c?.modelOrAlias?.model || c?.modelId || c?.model || '').trim();
 
-    // 1. 优先精准匹配 modelId 或 label
+    // 1. 优先精准匹配 modelId、modelOrAlias.model 或 label（逐字段独立比对，防止占位 modelId 遮蔽真实模型 ID）
     let matched = cascadeModelConfigs.find(c => {
-      const mId = String(c.modelId || '').toLowerCase();
-      const lbl = String(c.label || '').toLowerCase();
-      return mId === targetStr || lbl === targetStr;
+      if (!c || typeof c !== 'object') return false;
+      const candidates = [c.modelId, c.modelOrAlias?.model, c.model, c.label, c.displayName];
+      return candidates.some(cand => cand && String(cand).toLowerCase().trim() === targetStr);
     });
 
-    // 2. 匹配同一配额池
-    if (!matched && poolKey !== 'unknown') {
+    // 2. 匹配同一配额池（忽略 High / Low / XHigh / Thinking 及 placeholder ID 差异）
+    if (!matched && targetPoolKey !== 'unknown') {
       matched = cascadeModelConfigs.find(c => {
-        const cPool = getModelPoolKey(c.modelId || c.label);
-        return cPool === poolKey;
+        if (!c || typeof c !== 'object') return false;
+        if (getModelPoolKey(readCfgId(c), c?.label || c?.displayName) === targetPoolKey) return true;
+        const candidates = [c.label, c.displayName, c.modelId, c.modelOrAlias?.model, c.model];
+        return candidates.some(cand => cand && getModelPoolKey(cand) === targetPoolKey);
+      });
+    }
+
+    // 3. 受限系列前缀回退（如 claude-opus 匹配 Claude Opus 4.6；带数字边界保护防止 claude-opus-5 误匹配 5.5）
+    if (!matched && targetPoolKey !== 'unknown') {
+      matched = cascadeModelConfigs.find(c => {
+        if (!c || typeof c !== 'object') return false;
+        const cPool = getModelPoolKey(readCfgId(c), c?.label || c?.displayName);
+        if (isQuotaSeriesMatch(cPool, targetPoolKey)) return true;
+        const candidates = [c.modelOrAlias?.model, c.modelId, c.model, c.label, c.displayName];
+        return candidates.some(cand => cand && isQuotaSeriesMatch(getModelPoolKey(cand), targetPoolKey));
       });
     }
 
     if (!matched) return null;
 
-    const qi = matched.quotaInfo || {};
+    const matchedId = readCfgId(matched) || String(matched.modelId || matched.modelOrAlias?.model || '').trim();
+    const matchedLabel = String(matched.label || matched.displayName || matchedId || modelIdOrName).trim();
+    const poolKey = getModelPoolKey(matchedId, matchedLabel);
+    const displayBase = getPoolDisplayName(matchedLabel, matchedId, poolKey);
+    const qi = matched.quotaInfo || matched.quota_info || {};
+    const remainingFraction = readQuotaFraction(qi);
     const poolNames = {
-      'gemini-4-argon': 'Gemini 4 Argon 配额池（周限额）',
+      'gemini-4-hydrogen': 'Gemini 4 Hydrogen 配额池',
+      'gemini-4-carbon': 'Gemini 4 Carbon 配额池',
+      'gemini-4-argon': 'Gemini 4 Argon 配额池',
       'gemini-3.8-flash': 'Gemini 3.8 Flash 配额池',
       'claude-opus-5-5': 'Claude Opus 5.5 配额池',
       'claude-sonnet-5-5': 'Claude Sonnet 5.5 配额池',
@@ -70,12 +172,13 @@
     };
 
     return {
-      modelId: matched.modelId || '',
-      label: matched.label || modelIdOrName,
+      modelId: matchedId,
+      label: matchedLabel,
+      baseName: displayBase,
       poolKey,
-      poolName: poolNames[poolKey] || (matched.label ? `${matched.label} 配额池` : '专属模型配额池'),
-      remainingFraction: typeof qi.remainingFraction === 'number' ? qi.remainingFraction : null,
-      resetTime: qi.resetTime || null
+      poolName: poolNames[poolKey] || (displayBase ? `${displayBase} 配额池` : '专属模型配额池'),
+      remainingFraction,
+      resetTime: qi.resetTime || qi.reset_time || null
     };
   }
 
@@ -417,8 +520,10 @@
   }
 
   // 官方 Developer API Standard 公开费率表 (USD / 百万 Token)
-  // 来源: https://ai.google.dev/gemini-api/docs/pricing
-  // 核对日期: 2026-11-08
+  // 来源: https://ai.google.dev/gemini-api/docs/pricing , https://aistudio.google.com/docs/pricing
+  //       https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-hydrogen/
+  //       https://platform.claude.com/docs/en/about-claude/pricing
+  // 核对日期: 2026-11-13
   const GEMINI_PRICING_TABLE = {
     'gemini-3.8-flash': [
       {
@@ -432,6 +537,27 @@
         inputPerMillion: 1.50,
         outputPerMillion: 7.50,
         cacheReadPerMillion: 0.15
+      }
+    ],
+    'gemini-4-hydrogen': [
+      {
+        inputPerMillion: 1.50,
+        outputPerMillion: 7.50,
+        cacheReadPerMillion: 0.075
+      }
+    ],
+    'gemini-4-carbon': [
+      {
+        effectiveTo: '2026-11-30',
+        inputPerMillion: 2.00,
+        outputPerMillion: 10.00,
+        cacheReadPerMillion: 0.10
+      },
+      {
+        effectiveFrom: '2026-12-01',
+        inputPerMillion: 4.00,
+        outputPerMillion: 20.00,
+        cacheReadPerMillion: 0.20
       }
     ],
     'gemini-4-argon': [
@@ -482,6 +608,20 @@
         outputPerMillion: 15.00,
         cacheReadPerMillion: 0.25
       }
+    ],
+    'claude-opus-5-5': [
+      {
+        inputPerMillion: 4.00,
+        outputPerMillion: 20.00,
+        cacheReadPerMillion: 0.20
+      }
+    ],
+    'claude-sonnet-5-5': [
+      {
+        inputPerMillion: 2.00,
+        outputPerMillion: 10.00,
+        cacheReadPerMillion: 0.10
+      }
     ]
   };
 
@@ -496,10 +636,14 @@
     if (!raw || typeof raw !== 'string') return null;
     const str = raw.trim().toLowerCase();
     if (str.includes('3.8-flash') || str.includes('3.8 flash') || str.includes('flash-n')) return 'gemini-3.8-flash';
+    if (str.includes('4-hydrogen') || str.includes('4 hydrogen') || str.includes('hydrogen')) return 'gemini-4-hydrogen';
+    if (str.includes('4-carbon') || str.includes('4 carbon') || str.includes('carbon') || str === 'gemini-pro-orchestrator') return 'gemini-4-carbon';
     if (str.includes('4-argon') || str.includes('4 argon') || str.includes('argon')) return 'gemini-4-argon';
     if (str.includes('3.1-pro') || str.includes('3.1 pro')) return 'gemini-3.1-pro-preview';
     if (str.includes('3.5-flash-lite') || str.includes('3.5 flash-lite') || str.includes('flash-lite')) return 'gemini-3.5-flash-lite';
     if (str.includes('2.5-pro') || str.includes('2.5 pro')) return 'gemini-2.5-pro';
+    if (/(?:opus[-_ ]5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])|5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])[-_ ]opus)/.test(str)) return 'claude-opus-5-5';
+    if (/(?:sonnet[-_ ]5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])|5[._-]5(?![0-9]|\.[0-9]|[-_](?!20\d{6}(?![0-9]))[0-9])[-_ ]sonnet)/.test(str)) return 'claude-sonnet-5-5';
     return null;
   }
 
@@ -918,7 +1062,22 @@
     const thinking = Number(req.thinkingTokens ?? req.thinking_output_tokens ?? req.thinking ?? 0);
     const totalPrompt = input + cache;
 
-    const reqDate = req.date ? String(req.date).slice(0, 10) : req.created_at ? String(req.created_at).slice(0, 10) : '2026-11-08';
+    let reqDate = '2026-11-08';
+    const hasExplicitDate = req.date && /^\d{4}-\d{2}-\d{2}/.test(String(req.date));
+    const isProv = req.dateIsProvisional === true || req.dateSource === 'provisional';
+    if (!isProv && req.created_at && (!hasExplicitDate || !req.dateSource || req.dateSource === 'created_at')) {
+      const dt = new Date(req.created_at);
+      if (!Number.isNaN(dt.getTime())) {
+        reqDate = formatLocalDateStr(dt);
+      } else if (hasExplicitDate) {
+        reqDate = String(req.date).slice(0, 10);
+      }
+    } else if (hasExplicitDate) {
+      reqDate = String(req.date).slice(0, 10);
+    } else if (req.created_at) {
+      const dt = new Date(req.created_at);
+      reqDate = !Number.isNaN(dt.getTime()) ? formatLocalDateStr(dt) : String(req.created_at).slice(0, 10);
+    }
     const tierRules = GEMINI_PRICING_TABLE[modelKey];
     let matchedTier = null;
 
@@ -1002,26 +1161,29 @@
     }
 
     const totalRequests = pricedRequestsCount + unpricedRequestsCount;
+    const totalTok = pricedTokens + unpricedTokens;
     let coveragePercent = null;
     let tokenCoveragePercent = null;
     let requestCoveragePercent = null;
     let isPartialCoverage = false;
 
-    if (totalRequests > 0) {
-      requestCoveragePercent = Number(((pricedRequestsCount / totalRequests) * 100).toFixed(1));
-      const totalTok = pricedTokens + unpricedTokens;
+    if (totalRequests > 0 || unpricedTokens > 0) {
+      if (totalRequests > 0) {
+        requestCoveragePercent = Number(((pricedRequestsCount / totalRequests) * 100).toFixed(1));
+      }
       if (totalTok > 0) {
         tokenCoveragePercent = Number(((pricedTokens / totalTok) * 100).toFixed(1));
       }
       if (pricedRequestsCount === 0) {
         coveragePercent = 0;
-      } else if (unpricedRequestsCount > 0) {
+      } else if (unpricedRequestsCount > 0 || unpricedTokens > 0) {
         isPartialCoverage = true;
-        // 当存在未计价历史记录且未知 token 未计时，不能虚假呈现 100% 覆盖
+        // 当存在未计价历史记录或未知 token 未计时，不能虚假呈现 100% 覆盖
         if (unpricedTokens === 0) {
           coveragePercent = requestCoveragePercent;
         } else {
-          coveragePercent = Math.min(tokenCoveragePercent ?? requestCoveragePercent, requestCoveragePercent);
+          const baseReqCov = requestCoveragePercent ?? 100;
+          coveragePercent = Math.min(tokenCoveragePercent ?? baseReqCov, baseReqCov);
         }
         if (coveragePercent >= 100) coveragePercent = 99.9;
       } else {
@@ -1050,6 +1212,29 @@
     };
   }
 
+  function extractCallId(row, cascadeId = null, fallbackStepIndex = null) {
+    if (!row || typeof row !== 'object') return '';
+    const u = row.chatModel?.usage || row.usage || {};
+    const explicit =
+      u.responseId ||
+      u.response_id ||
+      row.response_id ||
+      row.responseId ||
+      u.messageId ||
+      u.message_id ||
+      row.message_id ||
+      row.messageId ||
+      row.callId ||
+      row.call_id ||
+      '';
+    if (explicit) return String(explicit);
+    const stepIdx = row.stepIndices?.[0] ?? row.stepIndex ?? row.step_index ?? fallbackStepIndex;
+    if (cascadeId && stepIdx !== null && stepIdx !== undefined) {
+      return `${cascadeId}#${stepIdx}`;
+    }
+    return '';
+  }
+
   function parseGeneratorCall(row, cascadeId = null, source = 'desktop', options = {}) {
     if (!row || typeof row !== 'object') return null;
     const cm = row.chatModel || {};
@@ -1070,8 +1255,13 @@
     const output = Number(u.outputTokens ?? row.outputTokens ?? row.output_tokens ?? 0);
     const thinking = Number(u.thinkingOutputTokens ?? row.thinkingTokens ?? row.thinking_output_tokens ?? 0);
     const responseTokens = Number(u.responseOutputTokens ?? row.responseTokens ?? (output - thinking > 0 ? output - thinking : output));
+    const totalTokens = input + cached + output;
 
-    const callId = String(u.responseId || u.messageId || row.callId || row.responseId || (cascadeId ? `${cascadeId}#${(row.stepIndices?.[0] ?? row.stepIndex ?? 0)}` : ''));
+    const rawStepIdx = row.stepIndices?.[0] ?? row.stepIndex ?? row.step_index;
+    const parsedStepIdx = rawStepIdx !== undefined && rawStepIdx !== null && rawStepIdx !== '' ? Number(rawStepIdx) : NaN;
+    const stepIndex = Number.isInteger(parsedStepIdx) && parsedStepIdx >= 0 ? parsedStepIdx : null;
+
+    const callId = extractCallId(row, cascadeId, stepIndex ?? 0);
     if (!callId) return null;
 
     // 完成状态管理：依据完成标记或耗时证据判定 final，流式中或只有部分文本时判定 streaming
@@ -1083,26 +1273,48 @@
       row.done === true ||
       (cm.streamingDuration != null && cm.timeToFirstToken != null)
     );
-    const hasUsage = (input + cached + output) > 0;
+    const hasUsage = totalTokens > 0;
     const status = hasExplicitFinish || (hasUsage && !row.isStreaming && row.status !== 'streaming') ? 'final' : 'streaming';
     const isEstimated = !hasUsage || output === 0;
 
-    // 日期与时间戳：严格提取真实创建时间，不默认将历史记录替换为今天
+    // 日期与时间戳：优先按真实创建时间转为本地日历日；RPC 缺失时间时显式标记 provisional 以便后续被权威时间校准覆盖
     let callDate = null;
     let callTimestamp = null;
+    let dateSource = null;
+    let dateIsProvisional = false;
     const rawCreatedAt = row.created_at || row.createdAt || row.timestamp;
     if (rawCreatedAt) {
       const dt = new Date(rawCreatedAt);
       if (!Number.isNaN(dt.getTime())) {
-        callDate = dt.toISOString().slice(0, 10);
+        callDate = formatLocalDateStr(dt);
         callTimestamp = dt.getTime();
+        dateSource = 'created_at';
       }
     } else if (row.date && /^\d{4}-\d{2}-\d{2}/.test(String(row.date))) {
       callDate = String(row.date).slice(0, 10);
       callTimestamp = new Date(callDate).getTime();
+      dateIsProvisional = Boolean(row.dateIsProvisional || row.dateSource === 'provisional');
+      dateSource = dateIsProvisional ? 'provisional' : (row.dateSource || 'explicit_date');
     } else if (source === 'desktop' && typeof window !== 'undefined') {
       callTimestamp = Date.now();
-      callDate = new Date(callTimestamp).toISOString().slice(0, 10);
+      callDate = formatLocalDateStr(new Date(callTimestamp));
+      dateSource = 'provisional';
+      dateIsProvisional = true;
+    } else {
+      dateIsProvisional = true;
+    }
+
+    let sourceRevision = null;
+    const rawRev = row.sourceRevision ?? row.revision ?? row.metadataRevision;
+    if (rawRev !== undefined && rawRev !== null && rawRev !== '') {
+      const revNum = Number(rawRev);
+      if (Number.isFinite(revNum)) sourceRevision = revNum;
+    } else {
+      const rawUpdated = row.updated_at ?? row.sourceUpdatedAt;
+      if (rawUpdated !== undefined && rawUpdated !== null && rawUpdated !== '') {
+        const updTs = typeof rawUpdated === 'number' ? rawUpdated : Date.parse(String(rawUpdated));
+        if (Number.isFinite(updTs)) sourceRevision = updTs;
+      }
     }
 
     const reqObj = {
@@ -1112,7 +1324,9 @@
       cacheReadTokens: cached,
       outputTokens: output,
       thinkingTokens: thinking,
-      date: callDate
+      date: callDate,
+      ...(dateSource ? { dateSource } : {}),
+      dateIsProvisional
     };
     const costCalc = calculateRequestApiCost(reqObj);
 
@@ -1143,6 +1357,7 @@
       callId,
       source,
       cascadeId,
+      stepIndex,
       model,
       modelKey,
       modelExactId: modelExactId || undefined,
@@ -1154,13 +1369,17 @@
       outputTokens: output,
       thinkingTokens: thinking,
       responseTokens,
+      totalTokens,
       status,
       isEstimated,
       isPriced: costCalc.isPriced,
       costUSD: costCalc.costUSD ?? 0,
       date: callDate,
-      created_at: rawCreatedAt ? String(rawCreatedAt) : (callTimestamp ? new Date(callTimestamp).toISOString() : null),
+      ...(dateSource ? { dateSource } : {}),
+      dateIsProvisional,
+      created_at: rawCreatedAt ? String(rawCreatedAt) : null,
       timestamp: callTimestamp,
+      ...(sourceRevision !== null ? { sourceRevision } : {}),
       ...speedFields
     };
     return callRecord;
@@ -1184,6 +1403,8 @@
         isPriceEstimated: true,
         promptCredits: null,
         flowCredits: null,
+        cascadeModelConfigs: [],
+        quotaSummary: null,
         pricingTableVerifiedDate: '2026-11-08',
         updatedAt: null
       };
@@ -1194,6 +1415,10 @@
     const planInfo = planStatus.planInfo || {};
     const email = us.email || null;
     const rawTierName = String(userTier.name || planInfo.planName || '').trim();
+    const cascadeModelConfigs = Array.isArray(us?.cascadeModelConfigData?.clientModelConfigs)
+      ? us.cascadeModelConfigData.clientModelConfigs
+      : (Array.isArray(raw?.cascadeModelConfigs) ? raw.cascadeModelConfigs : []);
+    const quotaSummary = us.quotaSummary || raw.quotaSummary || raw.userQuotaSummary || (Array.isArray(us.groups || raw.groups) ? { groups: us.groups || raw.groups } : null);
 
     // 只有具备明确权益证据时才识别套餐，避免空对象或缺省状态被当成 Free
     const hasTierEvidence = Boolean(
@@ -1220,6 +1445,8 @@
         isPriceEstimated: true,
         promptCredits: null,
         flowCredits: null,
+        cascadeModelConfigs,
+        quotaSummary,
         pricingTableVerifiedDate: '2026-11-08',
         updatedAt: null
       };
@@ -1286,6 +1513,8 @@
         available: planStatus.availableFlowCredits ?? null,
         monthly: planInfo.monthlyFlowCredits ?? null
       },
+      cascadeModelConfigs,
+      quotaSummary,
       pricingTableVerifiedDate: '2026-11-08',
       updatedAt: new Date().toISOString()
     };
@@ -1374,10 +1603,14 @@
 
     const modelNameMap = {
       'gemini-3.8-flash': 'Gemini 3.8 Flash Standard',
+      'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
+      'gemini-4-carbon': 'Gemini 4 Carbon',
       'gemini-4-argon': 'Gemini 4 Argon',
       'gemini-3.1-pro-preview': 'Gemini 3.1 Pro Preview',
       'gemini-3.5-flash-lite': 'Gemini 3.5 Flash-Lite',
-      'gemini-2.5-pro': 'Gemini 2.5 Pro'
+      'gemini-2.5-pro': 'Gemini 2.5 Pro',
+      'claude-opus-5-5': 'Claude Opus 5.5',
+      'claude-sonnet-5-5': 'Claude Sonnet 5.5'
     };
 
     return {
@@ -2089,6 +2322,7 @@
       costEstimate: payload.costEstimate || null,
       costEstimateCurrentMonth: payload.costEstimateCurrentMonth || null,
       costEstimateBySource: payload.costEstimateBySource || null,
+      recentModelUsage: Array.isArray(payload.recentModelUsage) ? payload.recentModelUsage : [],
       referenceCost,
       summary,
       dailyMap: normalizedMap,
@@ -2321,11 +2555,629 @@
     }
   }
 
+  /**
+   * 将重置时间戳格式化为可读倒计时（如「2小时15分后」）
+   */
+  function formatResetCountdownZh(isoStr, nowMs = Date.now()) {
+    if (!isoStr) return null;
+    try {
+      const target = new Date(isoStr).getTime();
+      if (!Number.isFinite(target)) return null;
+      const diffMs = target - Number(nowMs);
+      if (diffMs <= 0) return '即将刷新';
+      const totalMin = Math.ceil(diffMs / 60000);
+      const days = Math.floor(totalMin / 1440);
+      const hours = Math.floor((totalMin % 1440) / 60);
+      const mins = totalMin % 60;
+      if (days > 0) return `${days}天${hours > 0 ? `${hours}小时` : ''}后`;
+      if (hours > 0) return `${hours}小时${mins > 0 ? `${mins}分` : ''}后`;
+      return `${Math.max(1, mins)}分钟后`;
+    } catch {
+      return null;
+    }
+  }
+
+  function formatApproxTokensZh(value) {
+    if (value == null || !Number.isFinite(Number(value)) || Number(value) < 0) return null;
+    const n = Math.round(Number(value));
+    if (n === 0) return '0';
+    if (n >= 1e9) return `${parseFloat((n / 1e9).toFixed(2))}B`;
+    if (n >= 1e6) return `${parseFloat((n / 1e6).toFixed(n >= 10e6 ? 1 : 2))}M`;
+    if (n >= 1000) return `${n >= 100000 ? Math.round(n / 1000) : parseFloat((n / 1000).toFixed(1))}K`;
+    return String(n);
+  }
+
+  function inferQuotaCycleStartMs(resetTimeIso, nowMs = Date.now(), windowType = null) {
+    if (!resetTimeIso) return null;
+    const resetMs = new Date(resetTimeIso).getTime();
+    if (!Number.isFinite(resetMs) || resetMs <= nowMs) return null;
+    if (windowType === 'weekly') return resetMs - 7 * 86400000;
+    if (windowType === '5h') return resetMs - 5 * 3600000;
+    if (windowType === '24h') return resetMs - 24 * 3600000;
+    const remMs = resetMs - nowMs;
+    if (remMs <= 6 * 3600000) return resetMs - 5 * 3600000;
+    if (remMs <= 26 * 3600000) return resetMs - 24 * 3600000;
+    return resetMs - 7 * 86400000;
+  }
+
+  function readQuotaFraction(qi) {
+    if (!qi || typeof qi !== 'object') return null;
+    const rawFrac = qi.remainingFraction ?? qi.remaining_fraction ?? qi.fraction;
+    if (typeof rawFrac === 'number' && Number.isFinite(rawFrac)) {
+      return Math.max(0, Math.min(1, rawFrac));
+    }
+    if (rawFrac != null && rawFrac !== '' && Number.isFinite(Number(rawFrac))) {
+      return Math.max(0, Math.min(1, Number(rawFrac)));
+    }
+    const rawPct = qi.remainingPct ?? qi.remainingPercent ?? qi.remaining_percent;
+    if (rawPct != null && rawPct !== '' && Number.isFinite(Number(rawPct))) {
+      return Math.max(0, Math.min(1, Number(rawPct) / 100));
+    }
+    if (qi.disabled === true) return null;
+    const resetTime = qi.resetTime || qi.reset_time || null;
+    const remAmount = qi.remainingAmount ?? qi.remaining_amount;
+    if (resetTime || (remAmount != null && Number(remAmount) === 0)) {
+      return 0;
+    }
+    return null;
+  }
+
+  function classifyQuotaWindow(source, resetTimeIso, nowMs = Date.now()) {
+    const text = [
+      source?.window,
+      source?.windowType,
+      source?.window_type,
+      source?.cadence,
+      source?.duration,
+      source?.quotaWindow,
+      source?.bucketId,
+      source?.bucket_id,
+      source?.id,
+      source?.displayName,
+      source?.display_name,
+      source?.label
+    ]
+      .filter(Boolean)
+      .map(s => String(s).replace(/([a-z0-9])([A-Z])/g, '$1 $2'))
+      .join(' ')
+      .toLowerCase();
+    if (/(?:^|[^a-z0-9])(weekly|week|1w|7d|7\s*days?|seven[_\s-]?days?|one[_\s-]?week|10080m)(?:$|[^a-z0-9])/.test(text) || /周/.test(text)) {
+      return 'weekly';
+    }
+    if (/(?:^|[^a-z0-9])(5h|5\s*hours?|five[_\s-]?hours?|300m)(?:$|[^a-z0-9])/.test(text) || /5\s*小时/.test(text)) {
+      return '5h';
+    }
+    if (/(?:^|[^a-z0-9])(24h|daily|1d|1440m)(?:$|[^a-z0-9])/.test(text)) {
+      return '24h';
+    }
+    if (resetTimeIso) {
+      const resetMs = new Date(resetTimeIso).getTime();
+      if (Number.isFinite(resetMs) && resetMs - nowMs > 26 * 3600000) {
+        return 'weekly';
+      }
+    }
+    return '5h';
+  }
+
+  function classifyQuotaGroupKey(groupId = '', displayName = '', modelIds = []) {
+    const combined = [
+      groupId,
+      displayName,
+      ...(Array.isArray(modelIds) ? modelIds : [])
+    ].filter(Boolean).join(' ').toLowerCase();
+    if (combined.includes('argon')) return 'gemini-argon';
+    if (combined.includes('gemini')) return 'gemini';
+    if (/(3p|third[-_ ]?party|claude|gpt|opus|sonnet|haiku|openai|anthropic|oss)/.test(combined)) {
+      return 'third-party';
+    }
+    const slug = String(groupId || displayName || 'other')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+    return slug || 'other';
+  }
+
+  function getQuotaGroupDisplayName(groupKey, rawDisplayName = '') {
+    if (groupKey === 'gemini') return 'Gemini 模型';
+    if (groupKey === 'gemini-argon') return 'Gemini Argon';
+    if (groupKey === 'third-party') return 'Claude & GPT 模型';
+    return String(rawDisplayName || groupKey || '其他模型').trim();
+  }
+
+  function doesModelPoolBelongToGroup(poolKey = '', modelName = '', group = null) {
+    const pk = String(poolKey || '').toLowerCase();
+    const mn = String(modelName || '').toLowerCase();
+    const groupKey = typeof group === 'string' ? group : (group?.groupKey || '');
+    const modelIds = Array.isArray(group?.modelIds) ? group.modelIds : [];
+    if (modelIds.length && mn) {
+      for (const id of modelIds) {
+        const lowId = String(id || '').toLowerCase();
+        if (lowId && (lowId === mn || mn.includes(lowId) || lowId.includes(mn))) return true;
+      }
+    }
+    if (groupKey === 'gemini-argon') {
+      return pk.includes('argon') || mn.includes('argon');
+    }
+    if (groupKey === 'gemini') {
+      if (pk.includes('argon') || mn.includes('argon')) return false;
+      return pk.startsWith('gemini') || mn.includes('gemini');
+    }
+    if (groupKey === 'third-party') {
+      return pk.startsWith('claude') || pk.startsWith('gpt') ||
+        /(claude|opus|sonnet|haiku|gpt|openai|anthropic)/.test(`${pk} ${mn}`);
+    }
+    return Boolean(groupKey && (pk === groupKey || pk.includes(groupKey) || mn.includes(groupKey)));
+  }
+
+  function extractQuotaSummaryGroups(rawSummary) {
+    if (!rawSummary || typeof rawSummary !== 'object') return [];
+    if (Array.isArray(rawSummary)) return rawSummary;
+    const candidates = [
+      rawSummary.groups,
+      rawSummary.modelGroups,
+      rawSummary.model_groups,
+      rawSummary.response?.groups,
+      rawSummary.response?.modelGroups,
+      rawSummary.response?.quotaSummary?.groups,
+      rawSummary.quotaSummary?.groups,
+      rawSummary.quotaSummary?.response?.groups,
+      rawSummary.userQuotaSummary?.groups,
+      rawSummary.userQuotaSummary?.response?.groups,
+      rawSummary.userStatus?.quotaSummary?.groups,
+      rawSummary.summary?.groups,
+      rawSummary.data?.groups
+    ];
+    for (const arr of candidates) {
+      if (Array.isArray(arr)) return arr;
+    }
+    return [];
+  }
+
+  function computePoolTokenEstimate(pool, options = {}) {
+    const nowMs = Number(options.nowMs) || Date.now();
+    const events = Array.isArray(options.usageEvents) ? options.usageEvents : [];
+    const prev = options.calibrationEntry && typeof options.calibrationEntry === 'object' ? { ...options.calibrationEntry } : null;
+    const frac = pool?.remainingFraction;
+    const matchPoolKey = typeof options.matchPoolKey === 'function'
+      ? options.matchPoolKey
+      : (evPoolKey => evPoolKey === pool.poolKey);
+
+    let calibratedTotal = (prev && Number.isFinite(Number(prev.calibratedTotalTokens)) && Number(prev.calibratedTotalTokens) > 0)
+      ? Number(prev.calibratedTotalTokens)
+      : null;
+    let sampleCount = Number(prev?.sampleCount) || 0;
+    let calSource = prev?.source || null;
+    let resetObservedAt = Number(prev?.lastResetObservedAt) || 0;
+
+    const resetMs = pool?.resetTime ? new Date(pool.resetTime).getTime() : NaN;
+    const prevResetMs = prev?.lastResetTime ? new Date(prev.lastResetTime).getTime() : NaN;
+    const resetShiftedForward = Number.isFinite(resetMs) && Number.isFinite(prevResetMs) && (resetMs - prevResetMs) > 600000;
+    const jumpedUp = prev && typeof prev.lastFraction === 'number' && frac != null && (frac - prev.lastFraction) >= 0.05;
+    if (jumpedUp || resetShiftedForward) {
+      resetObservedAt = nowMs;
+    }
+
+    const cycleStartMs = inferQuotaCycleStartMs(pool?.resetTime, nowMs, pool?.windowType || null);
+    const defaultWindowMs = pool?.windowType === 'weekly' ? 7 * 86400000 : (pool?.windowType === '24h' ? 24 * 3600000 : 5 * 3600000);
+    const effectiveStartMs = cycleStartMs != null
+      ? Math.max(cycleStartMs, resetObservedAt ? resetObservedAt - 60000 : 0)
+      : (resetObservedAt ? resetObservedAt - 60000 : (nowMs - defaultWindowMs));
+
+    let cycleTokensUsed = 0;
+    for (const ev of events) {
+      if (!ev || !matchPoolKey(ev.poolKey)) continue;
+      const ts = Number(ev.ts ?? ev.timestamp);
+      const tok = Number(ev.tok ?? ev.totalTokens ?? 0);
+      if (!Number.isFinite(ts) || !Number.isFinite(tok) || tok <= 0) continue;
+      if (ts >= effectiveStartMs && ts <= nowMs + 60000) {
+        cycleTokensUsed += tok;
+      }
+    }
+
+    if (frac == null) {
+      return {
+        estRemainingTokens: null,
+        estRemainingZh: null,
+        estTotalTokens: calibratedTotal ? Math.round(calibratedTotal) : null,
+        estSource: calibratedTotal ? 'cached' : 'unknown',
+        cycleTokensUsed: Math.round(cycleTokensUsed),
+        nextCalibrationEntry: prev
+      };
+    }
+
+    let anchorFraction = (prev && typeof prev.anchorFraction === 'number' && !jumpedUp && !resetShiftedForward)
+      ? prev.anchorFraction
+      : frac;
+    let anchorCycleTokens = (prev && typeof prev.anchorCycleTokens === 'number' && !jumpedUp && !resetShiftedForward)
+      ? prev.anchorCycleTokens
+      : cycleTokensUsed;
+
+    if (frac > anchorFraction && (frac - anchorFraction) < 0.05 && !resetShiftedForward) {
+      anchorFraction = frac;
+      anchorCycleTokens = cycleTokensUsed;
+    }
+
+    const deltaF = anchorFraction - frac;
+    const deltaTok = cycleTokensUsed - anchorCycleTokens;
+    if (deltaF >= 0.02 && deltaTok >= 1000) {
+      const sampleTotal = deltaTok / deltaF;
+      if (calibratedTotal && sampleCount >= 1) {
+        const clamped = Math.max(calibratedTotal * 0.25, Math.min(calibratedTotal * 4, sampleTotal));
+        calibratedTotal = sampleCount >= 2 ? (calibratedTotal * 0.6 + clamped * 0.4) : (calibratedTotal * 0.4 + clamped * 0.6);
+      } else {
+        calibratedTotal = sampleTotal;
+      }
+      sampleCount += 1;
+      calSource = 'delta';
+      anchorFraction = frac;
+      anchorCycleTokens = cycleTokensUsed;
+    }
+
+    const usedFrac = 1 - frac;
+    if (usedFrac >= 0.02 && cycleTokensUsed >= 1000) {
+      const cycleTotal = cycleTokensUsed / usedFrac;
+      if (!calibratedTotal || calSource !== 'delta') {
+        calibratedTotal = calibratedTotal && calSource === 'cycle'
+          ? (calibratedTotal * 0.35 + cycleTotal * 0.65)
+          : cycleTotal;
+        calSource = 'cycle';
+      }
+    }
+
+    const estRemainingTokens = frac <= 0
+      ? 0
+      : (calibratedTotal && calibratedTotal > 0 ? Math.max(0, Math.round(calibratedTotal * frac)) : null);
+
+    const nextCalibrationEntry = {
+      calibratedTotalTokens: calibratedTotal ? Math.round(calibratedTotal) : null,
+      sampleCount,
+      source: calSource,
+      lastFraction: frac,
+      lastResetTime: pool.resetTime || null,
+      lastResetObservedAt: resetObservedAt || null,
+      anchorFraction,
+      anchorCycleTokens: Math.round(anchorCycleTokens),
+      updatedAt: nowMs
+    };
+
+    return {
+      estRemainingTokens,
+      estRemainingZh: estRemainingTokens != null ? formatApproxTokensZh(estRemainingTokens) : null,
+      estTotalTokens: calibratedTotal ? Math.round(calibratedTotal) : null,
+      estSource: frac <= 0 ? 'exhausted' : (estRemainingTokens != null ? (calSource || 'cached') : 'uncalibrated'),
+      cycleTokensUsed: Math.round(cycleTokensUsed),
+      nextCalibrationEntry
+    };
+  }
+
+  /**
+   * 汇总所有模型配额（同模型不同档位/分支合并，支持 5 小时 + 每周双周期），并结合近期消耗推算约剩 token
+   */
+  function summarizeModelQuotaPools(cascadeModelConfigs, currentModel = '', nowMs = Date.now(), options = {}) {
+    const list = Array.isArray(cascadeModelConfigs) ? cascadeModelConfigs : [];
+    const poolMap = new Map();
+    const pools = [];
+    const readCfgId = item => String(item?.modelOrAlias?.model || item?.modelId || item?.model || '').trim();
+
+    function upsertMergedPool(map, targetArr, entryInput) {
+      const {
+        poolKey,
+        groupKey,
+        windowType,
+        poolName,
+        modelId,
+        remainingFraction,
+        resetTime,
+        models,
+        modelIds
+      } = entryInput;
+      const remainingPct = remainingFraction != null ? Math.round(remainingFraction * 100) : null;
+
+      if (!map.has(poolKey)) {
+        const entry = {
+          poolKey,
+          ...(groupKey ? { groupKey } : {}),
+          windowType: windowType || '5h',
+          poolName,
+          modelId: modelId || null,
+          label: poolName,
+          remainingFraction,
+          remainingPct,
+          resetTime,
+          resetTimeZh: resetTime ? formatResetTimeZh(resetTime) : null,
+          resetInZh: resetTime ? formatResetCountdownZh(resetTime, nowMs) : null,
+          models: Array.isArray(models) ? [...models] : [],
+          ...(Array.isArray(modelIds) ? { modelIds: [...modelIds] } : {})
+        };
+        map.set(poolKey, entry);
+        targetArr.push(entry);
+        return entry;
+      }
+
+      const existing = map.get(poolKey);
+      if (Array.isArray(models)) {
+        for (const m of models) {
+          if (m && !existing.models.includes(m)) existing.models.push(m);
+        }
+      }
+      if (Array.isArray(modelIds)) {
+        if (!Array.isArray(existing.modelIds)) existing.modelIds = [];
+        for (const id of modelIds) {
+          if (id && !existing.modelIds.includes(id)) existing.modelIds.push(id);
+        }
+      }
+      if (existing.remainingFraction == null && remainingFraction != null) {
+        existing.remainingFraction = remainingFraction;
+        existing.remainingPct = remainingPct;
+        if (resetTime) {
+          existing.resetTime = resetTime;
+          existing.resetTimeZh = formatResetTimeZh(resetTime);
+          existing.resetInZh = formatResetCountdownZh(resetTime, nowMs);
+        }
+      } else if (existing.remainingFraction != null && remainingFraction != null && remainingFraction < existing.remainingFraction) {
+        // 同模型/同配额组存在多个额度档位时合并为同一条，取更紧余量避免高估
+        existing.remainingFraction = remainingFraction;
+        existing.remainingPct = remainingPct;
+        if (resetTime) {
+          existing.resetTime = resetTime;
+          existing.resetTimeZh = formatResetTimeZh(resetTime);
+          existing.resetInZh = formatResetCountdownZh(resetTime, nowMs);
+        }
+      }
+      if (!existing.resetTime && resetTime) {
+        existing.resetTime = resetTime;
+        existing.resetTimeZh = formatResetTimeZh(resetTime);
+        existing.resetInZh = formatResetCountdownZh(resetTime, nowMs);
+      }
+      return existing;
+    }
+
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const modelId = readCfgId(item);
+      const rawLabel = String(item.label || item.displayName || modelId || '').trim();
+      const qi = item.quotaInfo || item.quota_info || null;
+      const resetTime = qi?.resetTime || qi?.reset_time || null;
+      const remainingFraction = readQuotaFraction(qi);
+      const rawCfgModelId = String(item.modelId || '').trim();
+      if ((/disabled$/i.test(rawCfgModelId) || /disabled$/i.test(modelId) || qi?.disabled === true) && remainingFraction == null && !resetTime) continue;
+
+      const poolKey = getModelPoolKey(modelId, rawLabel);
+      const displayName = getPoolDisplayName(rawLabel, modelId, poolKey);
+      const windowType = classifyQuotaWindow({ ...item, ...(qi || {}) }, resetTime, nowMs);
+
+      upsertMergedPool(poolMap, pools, {
+        poolKey,
+        windowType,
+        poolName: displayName,
+        modelId,
+        remainingFraction,
+        resetTime,
+        models: rawLabel ? [rawLabel] : []
+      });
+    }
+
+    const rawQuotaSummary = options.quotaSummary || options.userStatus?.quotaSummary || options.userStatus?.userStatus?.quotaSummary || null;
+    const summaryGroups = extractQuotaSummaryGroups(rawQuotaSummary);
+    const weeklyPoolMap = new Map();
+    const weeklyPools = [];
+    const summaryShortMap = new Map();
+    const summaryShortPools = [];
+
+    for (const group of summaryGroups) {
+      if (!group || typeof group !== 'object') continue;
+      const groupId = String(group.id || group.groupId || group.group_id || group.groupKey || group.name || '').trim();
+      const rawGroupName = String(group.displayName || group.display_name || group.label || group.title || group.name || groupId || '').trim();
+      const rawModels = Array.isArray(group.modelIds)
+        ? group.modelIds
+        : (Array.isArray(group.model_ids) ? group.model_ids : (Array.isArray(group.models) ? group.models : []));
+      const modelIds = [];
+      const modelLabels = [];
+      for (const m of rawModels) {
+        if (typeof m === 'string') {
+          const clean = m.trim();
+          if (clean) {
+            modelIds.push(clean);
+            modelLabels.push(clean);
+          }
+        } else if (m && typeof m === 'object') {
+          const id = readCfgId(m) || String(m.id || '').trim();
+          const lbl = String(m.label || m.displayName || id || '').trim();
+          if (id) modelIds.push(id);
+          if (lbl) modelLabels.push(lbl);
+        }
+      }
+
+      const groupKey = classifyQuotaGroupKey(groupId, rawGroupName, modelIds);
+      const groupDisplayName = getQuotaGroupDisplayName(groupKey, rawGroupName);
+      const rawBuckets = Array.isArray(group.buckets)
+        ? group.buckets
+        : (Array.isArray(group.quotaBuckets)
+          ? group.quotaBuckets
+          : (Array.isArray(group.quota_buckets)
+            ? group.quota_buckets
+            : (Array.isArray(group.windows)
+              ? group.windows
+              : (Array.isArray(group.quotas) ? group.quotas : [group]))));
+
+      for (const bucket of rawBuckets) {
+        if (!bucket || typeof bucket !== 'object') continue;
+        const qi = bucket.quotaInfo || bucket.quota_info || null;
+        const bq = qi && typeof qi === 'object' ? { ...bucket, ...qi } : bucket;
+        const remainingFraction = readQuotaFraction(bq);
+        const resetTime = bq.resetTime || bq.reset_time || null;
+        if (remainingFraction == null && !resetTime) continue;
+
+        const win = classifyQuotaWindow({ ...group, ...bq }, resetTime, nowMs);
+        if (win === 'weekly') {
+          upsertMergedPool(weeklyPoolMap, weeklyPools, {
+            poolKey: `weekly:${groupKey}`,
+            groupKey,
+            windowType: 'weekly',
+            poolName: groupDisplayName,
+            modelId: modelIds[0] || groupId || null,
+            remainingFraction,
+            resetTime,
+            models: modelLabels,
+            modelIds
+          });
+        } else {
+          upsertMergedPool(summaryShortMap, summaryShortPools, {
+            poolKey: groupKey,
+            groupKey,
+            windowType: win,
+            poolName: groupDisplayName,
+            modelId: modelIds[0] || groupId || null,
+            remainingFraction,
+            resetTime,
+            models: modelLabels,
+            modelIds
+          });
+        }
+      }
+    }
+
+    if (!pools.some(p => p.remainingFraction != null || p.resetTime != null) && summaryShortPools.length > 0) {
+      for (const sp of summaryShortPools) {
+        upsertMergedPool(poolMap, pools, sp);
+      }
+    }
+
+    if (weeklyPools.length === 0) {
+      for (const p of pools) {
+        if (p.windowType !== 'weekly') continue;
+        const gk = classifyQuotaGroupKey(p.poolKey, p.poolName, [p.modelId, ...(p.models || [])]);
+        upsertMergedPool(weeklyPoolMap, weeklyPools, {
+          poolKey: `weekly:${gk}`,
+          groupKey: gk,
+          windowType: 'weekly',
+          poolName: getQuotaGroupDisplayName(gk, p.poolName),
+          modelId: p.modelId,
+          remainingFraction: p.remainingFraction,
+          resetTime: p.resetTime,
+          models: p.models,
+          modelIds: p.modelId ? [p.modelId] : []
+        });
+      }
+    }
+
+    const groupPriority = { gemini: 0, 'gemini-argon': 1, 'third-party': 2 };
+    weeklyPools.sort((a, b) => {
+      const pa = Object.prototype.hasOwnProperty.call(groupPriority, a.groupKey) ? groupPriority[a.groupKey] : 99;
+      const pb = Object.prototype.hasOwnProperty.call(groupPriority, b.groupKey) ? groupPriority[b.groupKey] : 99;
+      return pa - pb;
+    });
+
+    const usageEvents = Array.isArray(options.usageEvents) ? options.usageEvents : [];
+    const prevCalibration = options.calibrationMap && typeof options.calibrationMap === 'object' ? options.calibrationMap : {};
+    const nextCalibration = { ...prevCalibration };
+
+    for (const pool of pools) {
+      const est = computePoolTokenEstimate(pool, {
+        nowMs,
+        usageEvents,
+        calibrationEntry: prevCalibration[pool.poolKey] || null
+      });
+      pool.estRemainingTokens = est.estRemainingTokens;
+      pool.estRemainingZh = est.estRemainingZh;
+      pool.estTotalTokens = est.estTotalTokens;
+      pool.estSource = est.estSource;
+      pool.cycleTokensUsed = est.cycleTokensUsed;
+      if (est.nextCalibrationEntry) {
+        nextCalibration[pool.poolKey] = est.nextCalibrationEntry;
+      }
+    }
+
+    for (const wPool of weeklyPools) {
+      const est = computePoolTokenEstimate(wPool, {
+        nowMs,
+        usageEvents,
+        calibrationEntry: prevCalibration[wPool.poolKey] || null,
+        matchPoolKey: evPoolKey => doesModelPoolBelongToGroup(evPoolKey, '', wPool)
+      });
+      wPool.estRemainingTokens = est.estRemainingTokens;
+      wPool.estRemainingZh = est.estRemainingZh;
+      wPool.estTotalTokens = est.estTotalTokens;
+      wPool.estSource = est.estSource;
+      wPool.cycleTokensUsed = est.cycleTokensUsed;
+      if (est.nextCalibrationEntry) {
+        nextCalibration[wPool.poolKey] = est.nextCalibrationEntry;
+      }
+    }
+
+    const cleanModel = String(currentModel || '').trim();
+    let matchedPool = null;
+    let activeLabel = '';
+    if (cleanModel) {
+      const targetPoolKey = getModelPoolKey(cleanModel);
+      if (targetPoolKey !== 'unknown' && poolMap.has(targetPoolKey)) {
+        matchedPool = poolMap.get(targetPoolKey);
+      }
+      if (!matchedPool) {
+        const directMatch = resolveModelQuota(cleanModel, list);
+        if (directMatch) {
+          matchedPool = poolMap.get(directMatch.poolKey) || null;
+          activeLabel = directMatch.baseName || directMatch.label || '';
+        }
+      }
+      if (!matchedPool) {
+        const lowQuery = cleanModel.toLowerCase();
+        matchedPool = pools.find(p =>
+          (p.modelId && p.modelId.toLowerCase() === lowQuery) ||
+          (p.poolName && (p.poolName.toLowerCase().includes(lowQuery) || lowQuery.includes(p.poolName.toLowerCase()))) ||
+          p.models.some(m => m.toLowerCase().includes(lowQuery) || lowQuery.includes(m.toLowerCase()))
+        ) || null;
+      }
+      if (matchedPool && !activeLabel) {
+        activeLabel = matchedPool.poolName;
+      }
+    }
+
+    const matchedByModel = Boolean(matchedPool);
+    const active = matchedPool || pools.find(p => p.remainingFraction != null) || pools[0] || null;
+    const hasShortData = pools.some(p => p.remainingFraction != null || p.resetTime != null);
+
+    let matchedWeekly = null;
+    if (weeklyPools.length > 0 && cleanModel) {
+      const targetPoolKey = matchedPool?.poolKey || getModelPoolKey(cleanModel);
+      const effectivePoolKey = targetPoolKey === 'unknown' ? '' : targetPoolKey;
+      matchedWeekly = weeklyPools.find(wp =>
+        doesModelPoolBelongToGroup(effectivePoolKey, cleanModel || matchedPool?.modelId || '', wp)
+      ) || null;
+    }
+    const weeklyMatchedByModel = Boolean(matchedWeekly);
+    const activeWeekly = matchedWeekly || weeklyPools.find(w => w.remainingFraction != null) || weeklyPools[0] || null;
+    const hasWeeklyData = weeklyPools.some(w => w.remainingFraction != null || w.resetTime != null);
+    const hasData = hasShortData || hasWeeklyData;
+
+    return {
+      hasData,
+      hasShortData,
+      hasWeeklyData,
+      matchedByModel,
+      weeklyMatchedByModel,
+      currentModel: cleanModel || null,
+      active: active ? { ...active, activeLabel: activeLabel || active.poolName } : null,
+      activeWeekly: activeWeekly ? { ...activeWeekly } : null,
+      pools,
+      weeklyPools,
+      nextCalibration
+    };
+  }
+
   const api = {
     summarize,
     classifyRequestError,
     resolveModelQuota,
+    stripModelVariantTags,
+    getModelPoolKey,
     formatResetTimeZh,
+    formatResetCountdownZh,
+    formatApproxTokensZh,
+    inferQuotaCycleStartMs,
+    classifyQuotaWindow,
+    extractQuotaSummaryGroups,
+    summarizeModelQuotaPools,
     measure,
     add,
     empty,
@@ -2353,6 +3205,7 @@
     calculateReferenceModelCost,
     resolveEffectivePlanStatus,
     parseUserPlanStatus,
+    extractCallId,
     parseGeneratorCall,
     extractModelString,
     normalizeTokenHistoryPayload,
