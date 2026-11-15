@@ -189,8 +189,8 @@ async function startStrictOriginCdpServer(initialState = {}) {
             value = true;
           } else if (expr.startsWith('BIG_PAYLOAD_LEN:')) {
             value = expr.length;
-          } else if (expr.length > 50000) {
-            // 模拟 meter-core.js + meter-renderer.js 热注入包执行成功
+          } else if (expr.length > 50000 && !expr.startsWith('window.__AGContextMeter')) {
+            // 模拟 meter-core.js + meter-renderer.js 热注入包执行成功（排除大型 History/Settings 初始数据赋值）
             state.injectCalls++;
             state.meterActive = true;
             value = true;
@@ -509,6 +509,7 @@ process.on('SIGTERM', () => process.exit(0));
       modulesConfigPath: cfgPath,
       port: origDiscover,
       liveHostScript: mockLiveHostScript,
+      skipInitialData: true,
       liveBridgeWaitMs: 1500,
       startupTimeoutMs: 2000,
       startupPollMs: 25,
@@ -670,5 +671,174 @@ test('渲染层深浅色背景冲突兜底、沙盒 Preload 汉化防误触与�
     if (prevStateEnv !== undefined) process.env.AG_METER_STATE_DIR = prevStateEnv;
     else delete process.env.AG_METER_STATE_DIR;
     fs.rmSync(tmpInstallDir, { recursive: true, force: true });
+  }
+});
+
+test('watch --persistent 常驻自连生命周期：启动超时不退出、关闭窗口停桥接保常驻、重启换端口再次自动热挂载', async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-watch-persistent-'));
+  const prevStateEnv = process.env.AG_METER_STATE_DIR;
+  process.env.AG_METER_STATE_DIR = tmpState;
+
+  const mockLiveHostScript = path.join(tmpState, 'mock-live-host.js');
+  fs.writeFileSync(mockLiveHostScript, `'use strict';
+const fs = require('fs');
+const path = require('path');
+const stateDir = process.env.AG_METER_STATE_DIR;
+const cdpPort = String(process.env.AG_CDP_PORT || '');
+const origin = cdpPort === '58322' ? 'https://127.0.0.1:51002' : 'https://127.0.0.1:51001';
+fs.mkdirSync(stateDir, { recursive: true });
+fs.writeFileSync(path.join(stateDir, '.live-session.json'), JSON.stringify({
+  pid: process.pid,
+  origin,
+  port: cdpPort === '58322' ? 59992 : 59991
+}));
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => process.exit(0));
+`, 'utf8');
+
+  const mockCdp1 = await startStrictOriginCdpServer({
+    windowOpen: true,
+    meterActive: false,
+    hasIpcBridge: false
+  });
+  const mockCdp2 = await startStrictOriginCdpServer({
+    windowOpen: true,
+    meterActive: false,
+    hasIpcBridge: false
+  });
+
+  const waitUntil = async (pred, timeoutMs = 5000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pred()) return;
+      await new Promise(r => setTimeout(r, 10));
+    }
+    throw new Error('Timeout waiting for persistent watcher condition');
+  };
+
+  try {
+    let phase = 'init';
+    let initCycles = 0;
+    let closedCycles = 0;
+    let spawnCount = 0;
+    const spawnedChildren = [];
+    const cfgPath = path.join(tmpState, 'modules.json');
+    const ac = new AbortController();
+
+    const watchPromise = runWatchDaemon({
+      stateDir: tmpState,
+      modulesConfigPath: cfgPath,
+      persistent: true,
+      candidatePorts: [58321, 58322],
+      liveHostScript: mockLiveHostScript,
+      _spawnLiveHost: (...spawnArgs) => {
+        spawnCount++;
+        const child = spawn(...spawnArgs);
+        spawnedChildren.push(child);
+        return child;
+      },
+      skipInitialData: true,
+      liveBridgeWaitMs: 2000,
+      startupTimeoutMs: 5,
+      startupPollMs: 5,
+      idlePollMs: 5,
+      pollIntervalMs: 5,
+      maxConsecutiveMisses: 2,
+      silent: true,
+      handleSignals: false,
+      signal: ac.signal,
+      _httpGetJson: async url => {
+        if (url.includes(':58321/')) {
+          if (phase === 'init') {
+            initCycles++;
+            throw new Error('ECONNREFUSED');
+          }
+          if (phase === 'closed') {
+            closedCycles++;
+            throw new Error('ECONNREFUSED');
+          }
+          if (phase === 'open1') {
+            return [{
+              id: 'page-ag-1',
+              type: 'page',
+              title: 'Antigravity',
+              url: 'https://127.0.0.1:51001/workbench.html',
+              webSocketDebuggerUrl: mockCdp1.wsUrl
+            }];
+          }
+          throw new Error('ECONNREFUSED');
+        }
+        if (url.includes(':58322/')) {
+          if (phase === 'open2') {
+            return [{
+              id: 'page-ag-2',
+              type: 'page',
+              title: 'Antigravity',
+              url: 'https://127.0.0.1:51002/workbench.html',
+              webSocketDebuggerUrl: mockCdp2.wsUrl
+            }];
+          }
+          throw new Error('ECONNREFUSED');
+        }
+        throw new Error('ECONNREFUSED');
+      }
+    });
+
+    // 1. 初始超过 startupTimeoutMs (5ms) 且连续 4 轮无窗口 -> 绝不因 startup_timeout 退出
+    await waitUntil(() => initCycles >= 4);
+    assert.equal(fs.existsSync(getWatchPidPath(tmpState)), true, '初始等待期间 watch.pid 必须保持存活');
+    assert.equal(mockCdp1.state.injectCalls, 0);
+
+    // 2. 端口 58321 打开首个 Antigravity 窗口 -> 拉起 mock live-host 并完成首次热注入
+    phase = 'open1';
+    await waitUntil(() => (
+      mockCdp1.state.injectCalls === 1 &&
+      mockCdp1.state.meterActive === true &&
+      fs.existsSync(path.join(tmpState, '.live-session.json'))
+    ));
+    assert.equal(spawnCount, 1);
+    const live1 = JSON.parse(fs.readFileSync(path.join(tmpState, '.live-session.json'), 'utf8'));
+    assert.equal(live1.origin, 'https://127.0.0.1:51001');
+
+    // 3. 模拟客户端关闭 (>= 3 轮无窗口) -> 停止 live-host，但守护进程常驻不退出
+    phase = 'closed';
+    await waitUntil(() => (
+      closedCycles >= 3 &&
+      !fs.existsSync(path.join(tmpState, '.live-session.json'))
+    ));
+    assert.equal(fs.existsSync(getWatchPidPath(tmpState)), true, '窗口关闭后 persistent 模式绝不清理 watch.pid 退出');
+
+    // 4. 模拟客户端重新打开并换到新端口 58322 -> 拉起新 live-host 并完成第二次热注入
+    phase = 'open2';
+    await waitUntil(() => (
+      mockCdp2.state.injectCalls === 1 &&
+      mockCdp2.state.meterActive === true &&
+      fs.existsSync(path.join(tmpState, '.live-session.json'))
+    ));
+    assert.equal(spawnCount, 2);
+    const live2 = JSON.parse(fs.readFileSync(path.join(tmpState, '.live-session.json'), 'utf8'));
+    assert.equal(live2.origin, 'https://127.0.0.1:51002');
+    assert.notEqual(live2.pid, live1.pid);
+
+    // 5. 通过 AbortSignal 停止守护进程 -> 清理 watch.pid 与 .live-session.json 并正常返回
+    ac.abort();
+    const res = await watchPromise;
+    assert.equal(res.ok, true);
+    assert.equal(res.reason, 'stopped');
+    assert.equal(res.injectedCount, 2);
+    assert.equal(fs.existsSync(getWatchPidPath(tmpState)), false, '退出后必须清理 watch.pid');
+    assert.equal(fs.existsSync(path.join(tmpState, '.live-session.json')), false, '退出后必须清理 .live-session.json');
+
+    for (const child of spawnedChildren) {
+      if (child.exitCode === null) {
+        try { child.kill('SIGTERM'); } catch {}
+      }
+    }
+  } finally {
+    await mockCdp1.close();
+    await mockCdp2.close();
+    if (prevStateEnv !== undefined) process.env.AG_METER_STATE_DIR = prevStateEnv;
+    else delete process.env.AG_METER_STATE_DIR;
+    fs.rmSync(tmpState, { recursive: true, force: true });
   }
 });

@@ -229,6 +229,8 @@ async function runWatchDaemon(options = {}) {
   const startupTimeoutMs = options.startupTimeoutMs ?? Number(process.env.AG_WATCH_STARTUP_TIMEOUT_MS || 60000);
   const startupPollMs = options.startupPollMs ?? Number(process.env.AG_WATCH_STARTUP_POLL_MS || 1000);
   const pollIntervalMs = options.pollIntervalMs ?? Number(process.env.AG_WATCH_POLL_MS || 3000);
+  const persistent = options.persistent ?? (process.env.AG_WATCH_PERSISTENT === '1' || process.env.AG_WATCH_PERSISTENT === 'true');
+  const idlePollMs = options.idlePollMs ?? Number(process.env.AG_WATCH_IDLE_POLL_MS || 4000);
   const maxConsecutiveMisses = options.maxConsecutiveMisses ?? Number(process.env.AG_WATCH_MAX_MISSES || 3);
   const maxCycles = options.maxCycles ?? Infinity;
 
@@ -286,16 +288,23 @@ async function runWatchDaemon(options = {}) {
 
       if (!hasWindow) {
         if (!windowEverSeen) {
-          if (Date.now() - startedAt >= startupTimeoutMs) {
+          if (!persistent && Date.now() - startedAt >= startupTimeoutMs) {
             exitReason = 'startup_timeout';
             break;
           }
-          await sleep(startupPollMs);
+          await sleep(persistent ? idlePollMs : startupPollMs);
           continue;
         }
 
         consecutiveMisses++;
         if (consecutiveMisses >= maxConsecutiveMisses) {
+          if (persistent) {
+            await stopLiveBridge({ stateDir });
+            windowEverSeen = false;
+            consecutiveMisses = 0;
+            await sleep(idlePollMs);
+            continue;
+          }
           exitReason = 'window_closed';
           break;
         }
@@ -524,7 +533,7 @@ async function main() {
     if (!ok) throw new Error('未检测到运行中的 Antigravity 主窗口，请先打开 Antigravity 或使用 node cli.js watch。');
     console.log('✅ 已通过 CDP 热注入当前运行的 Antigravity 窗口！');
   } else if (cmd === 'watch') {
-    const res = await runWatchDaemon(cdpOptions);
+    const res = await runWatchDaemon({ ...cdpOptions, persistent: args.includes('--persistent') });
     if (!res.alreadyRunning) {
       console.log(`✅ [Watch] 守护进程已正常结束 (原因: ${res.reason}, 挂载次数: ${res.injectedCount})`);
     }
@@ -724,7 +733,7 @@ async function main() {
     await cmdCheck(customPath, cdpOptions);
   } else {
     console.log(`用法:
-  node cli.js watch [--port <port>]         免改盘后台守护模式（随客户端启动自动挂载顶栏，关闭后自动退出）
+  node cli.js watch [--port <port>] [--persistent]  免改盘后台守护模式（--persistent 可随客户端重启常驻自连）
   node cli.js stop-watch                    停止正在运行的 watch 守护进程与本地桥接服务
   node cli.js live [--port <port>]          免改盘单次 CDP 热挂载到当前运行窗口
   node cli.js install [--path <app.asar>]   一键持久化安装并热注入当前运行窗口
