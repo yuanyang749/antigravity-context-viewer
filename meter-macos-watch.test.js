@@ -71,7 +71,9 @@ async function startStrictOriginCdpServer(initialState = {}) {
     lastUpgradeHeaders: null,
     evaluatedExpressions: [],
     disposeCalls: 0,
-    injectCalls: 0
+    injectCalls: 0,
+    liveConfig: initialState.liveConfig ?? null,
+    liveSyncCalls: 0
   };
 
   const sockets = new Set();
@@ -181,8 +183,24 @@ async function startStrictOriginCdpServer(initialState = {}) {
           let value;
           if (expr === 'Boolean(window.__AGContextMeter)') {
             value = state.meterActive;
+          } else if (expr === 'window.__AGContextMeterLive || null') {
+            value = state.liveConfig;
+          } else if (expr.startsWith('window.__AGContextMeterLive=')) {
+            const jsonPart = expr.slice('window.__AGContextMeterLive='.length).split(';window.__AGContextMeter')[0];
+            try {
+              state.liveConfig = JSON.parse(jsonPart);
+              state.liveSyncCalls++;
+              value = true;
+            } catch {
+              value = false;
+            }
           } else if (expr.includes('hasIpcBridge: Boolean(window.contextMeterAPI?.scan)')) {
-            value = { active: state.meterActive, hasIpcBridge: state.hasIpcBridge };
+            value = {
+              active: state.meterActive,
+              hasIpcBridge: state.hasIpcBridge,
+              livePort: state.liveConfig?.port || null,
+              liveToken: state.liveConfig?.token || null
+            };
           } else if (expr.includes('window.__AGContextMeter?.dispose()')) {
             state.disposeCalls++;
             state.meterActive = false;
@@ -837,6 +855,110 @@ process.on('SIGTERM', () => process.exit(0));
   } finally {
     await mockCdp1.close();
     await mockCdp2.close();
+    if (prevStateEnv !== undefined) process.env.AG_METER_STATE_DIR = prevStateEnv;
+    else delete process.env.AG_METER_STATE_DIR;
+    fs.rmSync(tmpState, { recursive: true, force: true });
+  }
+});
+
+test('watch 守护热重连：窗口已挂载旧端口组件时，重启守护或换 live-host 端口自动热刷新 __AGContextMeterLive 且不重复注入渲染包', async () => {
+  const tmpState = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-watch-resync-'));
+  const prevStateEnv = process.env.AG_METER_STATE_DIR;
+  process.env.AG_METER_STATE_DIR = tmpState;
+
+  const mockLiveHostScript = path.join(tmpState, 'mock-live-host.js');
+  fs.writeFileSync(mockLiveHostScript, `'use strict';
+const fs = require('fs');
+const path = require('path');
+const stateDir = process.env.AG_METER_STATE_DIR;
+fs.mkdirSync(stateDir, { recursive: true });
+fs.writeFileSync(path.join(stateDir, '.live-session.json'), JSON.stringify({
+  pid: process.pid,
+  origin: 'https://127.0.0.1:54123',
+  port: 62923,
+  token: 'fresh-token-62923'
+}));
+setInterval(() => {}, 1000);
+process.on('SIGTERM', () => process.exit(0));
+`, 'utf8');
+
+  const mockCdp = await startStrictOriginCdpServer({
+    windowOpen: true,
+    meterActive: true,
+    hasIpcBridge: false,
+    liveConfig: { port: 61645, token: 'stale-token' }
+  });
+
+  const waitUntil = async (pred, timeoutMs = 4000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (pred()) return;
+      await new Promise(r => setTimeout(r, 10));
+    }
+    throw new Error('Timed out waiting for watch resync condition');
+  };
+
+  try {
+    let pollHits = 0;
+    const spawnedChildren = [];
+    const cfgPath = path.join(tmpState, 'modules.json');
+    const ac = new AbortController();
+
+    const watchPromise = runWatchDaemon({
+      stateDir: tmpState,
+      modulesConfigPath: cfgPath,
+      port: mockCdp.port,
+      liveHostScript: mockLiveHostScript,
+      _spawnLiveHost: (...spawnArgs) => {
+        const child = spawn(...spawnArgs);
+        spawnedChildren.push(child);
+        return child;
+      },
+      skipInitialData: true,
+      liveBridgeWaitMs: 2000,
+      startupTimeoutMs: 2000,
+      startupPollMs: 10,
+      pollIntervalMs: 15,
+      maxConsecutiveMisses: 2,
+      silent: true,
+      handleSignals: false,
+      signal: ac.signal,
+      _httpGetJson: async () => {
+        pollHits++;
+        return [{
+          id: 'page-ag-1',
+          type: 'page',
+          title: 'Antigravity',
+          url: 'https://127.0.0.1:54123/workbench.html',
+          webSocketDebuggerUrl: mockCdp.wsUrl
+        }];
+      }
+    });
+
+    await waitUntil(() => mockCdp.state.liveConfig?.port === 62923);
+    const hitsAfterSync = pollHits;
+    await waitUntil(() => pollHits >= hitsAfterSync + 3);
+
+    ac.abort();
+    const res = await watchPromise;
+    assert.equal(res.ok, true);
+    assert.equal(res.reason, 'stopped');
+    assert.deepEqual(mockCdp.state.liveConfig, { port: 62923, token: 'fresh-token-62923' });
+    assert.equal(mockCdp.state.liveSyncCalls, 1, '端口与 token 对齐后后续轮询不得重复热刷新');
+    assert.equal(mockCdp.state.injectCalls, 0, '已有组件实例存活时不得重复注入全量渲染包');
+    assert.equal(
+      mockCdp.state.evaluatedExpressions.some(e => e.includes('onLiveBridgeReconnected')),
+      true,
+      '热刷新端口后必须触发 onLiveBridgeReconnected 钩子恢复前端同步'
+    );
+
+    for (const child of spawnedChildren) {
+      if (child.exitCode === null) {
+        try { child.kill('SIGTERM'); } catch {}
+      }
+    }
+  } finally {
+    await mockCdp.close();
     if (prevStateEnv !== undefined) process.env.AG_METER_STATE_DIR = prevStateEnv;
     else delete process.env.AG_METER_STATE_DIR;
     fs.rmSync(tmpState, { recursive: true, force: true });

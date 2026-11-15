@@ -19648,6 +19648,18 @@ function renderHeatmapGrid(forceRebuild = false) {
       render();
       return true;
     },
+    onLiveBridgeReconnected: () => {
+      if (state.disposed) return false;
+      state.scanNext = 0;
+      state.nextFlushRetryAt = 0;
+      void restoreSettingsFromHost();
+      void syncTokenHistoryFromHost(false);
+      void refreshModulesDisplay();
+      if (currentUnlockStatus || (unlockDrawerBody && unlockDrawerBody.style.display === 'block')) {
+        void refreshUnlockStatus();
+      }
+      return true;
+    },
     theme: () => resolveTheme(),
     setTheme: mode => { currentThemeMode = mode; try { localStorage.setItem('ag_theme_mode', mode); } catch {}; applyTheme(); },
     getCustomColors: () => ({ ...customColors }),

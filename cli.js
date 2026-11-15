@@ -339,16 +339,20 @@ async function runWatchDaemon(options = {}) {
         // topbar (默认 Mode 1) 或 both (双模式)：按需启动 live-host 并在组件缺失时自动热挂载
         let needsBridge = false;
         let needsInject = false;
+        const targetStates = [];
         for (const target of discovered.targets) {
           let client = null;
           try {
             client = await createCdpClient(target.webSocketDebuggerUrl, options);
             const st = await client.evaluateValue(`(() => ({
               active: Boolean(window.__AGContextMeter),
-              hasIpcBridge: Boolean(window.contextMeterAPI?.scan)
+              hasIpcBridge: Boolean(window.contextMeterAPI?.scan),
+              livePort: window.__AGContextMeterLive?.port || null,
+              liveToken: window.__AGContextMeterLive?.token || null
             }))()`, { timeoutMs: 3500 });
             if (!st?.hasIpcBridge) needsBridge = true;
             if (!st?.active) needsInject = true;
+            targetStates.push({ target, st });
           } catch {} finally {
             if (client) { try { client.close(); } catch {} }
           }
@@ -366,11 +370,48 @@ async function runWatchDaemon(options = {}) {
               hasIpcBridge: false
             }
           });
+
+          const liveSessionPath = fs.existsSync(path.join(stateDir, '.live-session.json'))
+            ? path.join(stateDir, '.live-session.json')
+            : path.join(__dirname, '.live-session.json');
+          let liveInfo = null;
+          if (fs.existsSync(liveSessionPath)) {
+            try {
+              liveInfo = JSON.parse(fs.readFileSync(liveSessionPath, 'utf8'));
+            } catch {}
+          }
+
+          if (liveInfo && liveInfo.port) {
+            const expectedToken = liveInfo.token || null;
+            const livePayload = liveInfo.token
+              ? { port: liveInfo.port, token: liveInfo.token }
+              : { port: liveInfo.port };
+            for (const { target, st } of targetStates) {
+              if (!st?.active || st.hasIpcBridge) continue;
+              let targetOrigin = '';
+              try { targetOrigin = new URL(target.url).origin; } catch {}
+              if (liveInfo.origin && targetOrigin && liveInfo.origin !== targetOrigin) continue;
+              if (st.livePort !== liveInfo.port || st.liveToken !== expectedToken) {
+                let client = null;
+                try {
+                  client = await createCdpClient(target.webSocketDebuggerUrl, options);
+                  await client.evaluate(
+                    'window.__AGContextMeterLive=' + JSON.stringify(livePayload) +
+                    ';window.__AGContextMeter?.onLiveBridgeReconnected?.()',
+                    { timeoutMs: 4000 }
+                  );
+                } catch {} finally {
+                  if (client) { try { client.close(); } catch {} }
+                }
+              }
+            }
+          }
         }
 
         if (needsInject) {
           const injected = await tryHotInject({
             ...options,
+            stateDir,
             port: discovered.port,
             onlyIfAbsent: true
           });

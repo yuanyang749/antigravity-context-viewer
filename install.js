@@ -63,7 +63,7 @@ async function tryHotInject(options = {}) {
     if (!discovered.running || !discovered.targets || !discovered.targets.length) return false;
     const targets = discovered.targets;
 
-    const stateDir = getStateDir();
+    const stateDir = options.stateDir || getStateDir();
     const livePath = fs.existsSync(path.join(stateDir, '.live-session.json'))
       ? path.join(stateDir, '.live-session.json')
       : path.join(__dirname, '.live-session.json');
@@ -89,20 +89,29 @@ async function tryHotInject(options = {}) {
       let client = null;
       try {
         client = await createCdpClient(target.webSocketDebuggerUrl, options);
+        const livePayload = liveInfo && liveInfo.port
+          ? (liveInfo.token ? { port: liveInfo.port, token: liveInfo.token } : { port: liveInfo.port })
+          : null;
         if (options.onlyIfAbsent) {
           const alreadyActive = await client.evaluateValue('Boolean(window.__AGContextMeter)', { timeoutMs: 4000 });
           if (alreadyActive) {
-            if (liveInfo && liveInfo.origin === new URL(target.url).origin) {
-              const currentLivePort = await client.evaluateValue('window.__AGContextMeterLive?.port || null', { timeoutMs: 3000 });
-              if (currentLivePort !== liveInfo.port) {
-                await client.evaluate('window.__AGContextMeterLive=' + JSON.stringify({ port: liveInfo.port, token: liveInfo.token }), { timeoutMs: 4000 });
+            if (livePayload && liveInfo.origin === new URL(target.url).origin) {
+              const currentLive = await client.evaluateValue('window.__AGContextMeterLive || null', { timeoutMs: 3000 });
+              const expectedToken = liveInfo.token || null;
+              const currentToken = currentLive?.token || null;
+              if (!currentLive || currentLive.port !== liveInfo.port || currentToken !== expectedToken) {
+                await client.evaluate(
+                  'window.__AGContextMeterLive=' + JSON.stringify(livePayload) +
+                  ';window.__AGContextMeter?.onLiveBridgeReconnected?.()',
+                  { timeoutMs: 4000 }
+                );
               }
             }
             continue;
           }
         }
-        if (liveInfo && liveInfo.origin === new URL(target.url).origin) {
-          await client.evaluate('window.__AGContextMeterLive=' + JSON.stringify({ port: liveInfo.port, token: liveInfo.token }), { timeoutMs: 5000 });
+        if (livePayload && liveInfo.origin === new URL(target.url).origin) {
+          await client.evaluate('window.__AGContextMeterLive=' + JSON.stringify(livePayload), { timeoutMs: 5000 });
         }
         if (settingsSnap) {
           await client.evaluate('window.__AGContextMeterSettings=' + JSON.stringify(settingsSnap), { timeoutMs: 5000 });
