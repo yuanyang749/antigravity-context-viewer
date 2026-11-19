@@ -607,6 +607,8 @@ async function runWatchDaemon(options = {}) {
   const startupTimeoutMs = options.startupTimeoutMs ?? Number(process.env.AG_WATCH_STARTUP_TIMEOUT_MS || 60000);
   const startupPollMs = options.startupPollMs ?? Number(process.env.AG_WATCH_STARTUP_POLL_MS || 1000);
   const pollIntervalMs = options.pollIntervalMs ?? Number(process.env.AG_WATCH_POLL_MS || 3000);
+  const persistent = options.persistent ?? (process.env.AG_WATCH_PERSISTENT === '1' || process.env.AG_WATCH_PERSISTENT === 'true');
+  const idlePollMs = options.idlePollMs ?? Number(process.env.AG_WATCH_IDLE_POLL_MS || 4000);
   const maxConsecutiveMisses = options.maxConsecutiveMisses ?? Number(process.env.AG_WATCH_MAX_MISSES || 3);
   const maxCycles = options.maxCycles ?? Infinity;
 
@@ -685,8 +687,9 @@ async function runWatchDaemon(options = {}) {
 
       if (startupHostBuildId && currentHostBuildId && currentHostBuildId !== startupHostBuildId) {
         const isTestEnv = process.env.AG_METER_TEST_MODE === '1' || process.env.NODE_ENV === 'test';
+        const envSelfReloadDisabled = process.env.AG_WATCH_SELF_RELOAD === '0' || process.env.AG_WATCH_SELF_RELOAD === 'false';
         const shouldSelfReload = options.selfReloadOnHostChange === true ||
-          (!isTestEnv && options.selfReloadOnHostChange !== false && maxCycles === Infinity);
+          (!isTestEnv && !envSelfReloadDisabled && options.selfReloadOnHostChange !== false && maxCycles === Infinity);
         if (shouldSelfReload) {
           if (!options.silent) {
             console.log(`🔄 [Watch] 检测到核心宿主脚本已更新 (${startupHostBuildId} -> ${currentHostBuildId})，正在热重启守护进程...`);
@@ -695,6 +698,7 @@ async function runWatchDaemon(options = {}) {
           cleanupLockfile();
           const reloadArgs = [expectedScript, 'watch'];
           if (options.port) reloadArgs.push('--port', String(options.port));
+          if (persistent) reloadArgs.push('--persistent');
           const reloadSpawner = options._spawnSelfReload || spawn;
           const child = reloadSpawner(process.execPath, reloadArgs, {
             detached: true,
@@ -720,16 +724,23 @@ async function runWatchDaemon(options = {}) {
 
       if (!hasWindow) {
         if (!windowEverSeen) {
-          if (Date.now() - startedAt >= startupTimeoutMs) {
+          if (!persistent && Date.now() - startedAt >= startupTimeoutMs) {
             exitReason = 'startup_timeout';
             break;
           }
-          await sleep(startupPollMs);
+          await sleep(persistent ? idlePollMs : startupPollMs);
           continue;
         }
 
         consecutiveMisses++;
         if (consecutiveMisses >= maxConsecutiveMisses) {
+          if (persistent) {
+            await stopLiveBridge({ stateDir });
+            windowEverSeen = false;
+            consecutiveMisses = 0;
+            await sleep(idlePollMs);
+            continue;
+          }
           exitReason = 'window_closed';
           break;
         }
@@ -757,10 +768,12 @@ async function runWatchDaemon(options = {}) {
           ? live.origins
           : (live.origin ? [live.origin] : []);
         let coveredByLiveSession = false;
+        let liveSessionPort = null;
         try {
           const lp = path.join(stateDir, '.live-session.json');
           if (fs.existsSync(lp)) {
             const info = JSON.parse(fs.readFileSync(lp, 'utf8'));
+            liveSessionPort = Number(info?.port) || null;
             const covered = new Set([...(Array.isArray(info?.origins) ? info.origins : []), info?.origin].filter(Boolean));
             coveredByLiveSession = Boolean(
               info?.pid &&
@@ -771,9 +784,15 @@ async function runWatchDaemon(options = {}) {
           }
         } catch {}
 
+        const liveBridgePortMismatch = Boolean(
+          liveSessionPort &&
+          live.liveBridgeAttached &&
+          Number(live.liveBridgeAttached.port) > 0 &&
+          Number(live.liveBridgeAttached.port) !== liveSessionPort
+        );
         const needsBridge = Boolean(
           (!live.hasIpcBridge || live.ipcBackendVersion !== expectedVersion) &&
-          (!coveredByLiveSession || !live.liveBridgeAttached || live.liveBridgeAttached.version !== expectedVersion)
+          (!coveredByLiveSession || !live.liveBridgeAttached || live.liveBridgeAttached.version !== expectedVersion || liveBridgePortMismatch)
         );
         const needsInject = Boolean(
           !live.active ||
@@ -955,7 +974,7 @@ const CLI_VALUE_FLAGS = new Set([
 ]);
 
 const CLI_BOOLEAN_FLAGS = new Set([
-  '--force', '--all', '--no-cli-sync', '--no-sync', '--previous', '--in-place'
+  '--force', '--all', '--no-cli-sync', '--no-sync', '--previous', '--in-place', '--persistent'
 ]);
 
 const CLI_KNOWN_COMMANDS = new Set([
@@ -971,7 +990,7 @@ const CLI_POS_ARG_COMMANDS = new Set(['proxy:set', 'proxy:test']);
 
 function printUsage() {
   console.log(`用法:
-  node cli.js watch [--port <port>]         免改盘后台守护模式（随客户端启动自动挂载，关闭后自动退出）
+  node cli.js watch [--port <port>] [--persistent]  免改盘后台守护模式（--persistent 可随客户端重启常驻自连）
   node cli.js stop-watch                    停止正在运行的 watch 守护进程与本地桥接服务
   node cli.js live [--port <port>]          免改盘 CDP 热挂载到当前运行窗口
   node cli.js install [--path <app.asar>]   一键持久化安装并热注入当前运行窗口
@@ -1158,7 +1177,7 @@ async function main() {
     console.log(`✅ 已通过 CDP 热注入当前运行的 ${report.injectedCount}/${report.windowCount} 个 Antigravity 窗口！`);
   } else if (cmd === 'watch') {
     console.log('👀 [Antigravity 对话上下文查看器] 免改盘守护模式启动中（不修改 app.asar，保留官方原始签名）...');
-    const res = await runWatchDaemon(cdpOptions);
+    const res = await runWatchDaemon({ ...cdpOptions, persistent: args.includes('--persistent') });
     if (!res.alreadyRunning && !res.selfReloaded) {
       console.log(`👋 守护模式已停止 (${res.exitReason})，已清理临时桥接状态。`);
     }
