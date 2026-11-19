@@ -5,19 +5,29 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
+function getRawFs() {
+  if (typeof process !== 'undefined' && process.versions && process.versions.electron) {
+    try {
+      return require('original-fs');
+    } catch {}
+  }
+  return fs;
+}
+
 function readHeader(archivePath) {
-  const fd = fs.openSync(archivePath, 'r');
+  const rawFs = getRawFs();
+  const fd = rawFs.openSync(archivePath, 'r');
   try {
     const pre = Buffer.alloc(16);
-    fs.readSync(fd, pre, 0, 16, 0);
+    rawFs.readSync(fd, pre, 0, 16, 0);
     const jsonSize = pre.readUInt32LE(12);
     const padding = (4 - (jsonSize % 4)) % 4;
     const jsonBuf = Buffer.alloc(jsonSize);
-    fs.readSync(fd, jsonBuf, 0, jsonSize, 16);
+    rawFs.readSync(fd, jsonBuf, 0, jsonSize, 16);
     const header = JSON.parse(jsonBuf.toString('utf8'));
     return { header, baseOffset: 16 + jsonSize + padding };
   } finally {
-    fs.closeSync(fd);
+    rawFs.closeSync(fd);
   }
 }
 
@@ -35,18 +45,30 @@ function getNode(header, relPath) {
 
 const builtinAsar = {
   extractFile(archivePath, relPath) {
+    const rawFs = getRawFs();
     const { header, baseOffset } = readHeader(archivePath);
     const node = getNode(header, relPath);
     if (node.unpacked) {
-      return fs.readFileSync(path.join(archivePath + '.unpacked', relPath));
+      let unpackedSrc = path.join(archivePath + '.unpacked', relPath);
+      if (!rawFs.existsSync(unpackedSrc)) {
+        try {
+          const mainAsar = findAsarPath();
+          const candidate = path.join(mainAsar + '.unpacked', relPath);
+          if (rawFs.existsSync(candidate)) unpackedSrc = candidate;
+        } catch {}
+      }
+      if (rawFs.existsSync(unpackedSrc)) {
+        return rawFs.readFileSync(unpackedSrc);
+      }
+      return Buffer.alloc(node.size || 0);
     }
     const buf = Buffer.alloc(node.size);
-    const fd = fs.openSync(archivePath, 'r');
+    const fd = rawFs.openSync(archivePath, 'r');
     try {
-      fs.readSync(fd, buf, 0, node.size, baseOffset + Number(node.offset));
+      rawFs.readSync(fd, buf, 0, node.size, baseOffset + Number(node.offset));
       return buf;
     } finally {
-      fs.closeSync(fd);
+      rawFs.closeSync(fd);
     }
   },
 
@@ -70,8 +92,9 @@ const builtinAsar = {
   },
 
   extractAll(archivePath, destDir) {
+    const rawFs = getRawFs();
     const { header, baseOffset } = readHeader(archivePath);
-    const fd = fs.openSync(archivePath, 'r');
+    const fd = rawFs.openSync(archivePath, 'r');
     try {
       function walk(tree, currentDir, relDir) {
         fs.mkdirSync(currentDir, { recursive: true });
@@ -81,28 +104,48 @@ const builtinAsar = {
           if (info.files) {
             walk(info, targetPath, relPath);
           } else if (info.unpacked) {
-            const unpackedSrc = path.join(archivePath + '.unpacked', relPath);
-            if (fs.existsSync(unpackedSrc)) {
+            let unpackedSrc = path.join(archivePath + '.unpacked', relPath);
+            if (!rawFs.existsSync(unpackedSrc)) {
+              try {
+                const mainAsar = findAsarPath();
+                const candidate = path.join(mainAsar + '.unpacked', relPath);
+                if (rawFs.existsSync(candidate)) unpackedSrc = candidate;
+              } catch {}
+            }
+            if (rawFs.existsSync(unpackedSrc)) {
               fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-              fs.copyFileSync(unpackedSrc, targetPath);
+              rawFs.copyFileSync(unpackedSrc, targetPath);
+            } else {
+              fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+              fs.writeFileSync(targetPath, Buffer.alloc(0));
             }
           } else {
             const buf = Buffer.alloc(info.size);
-            fs.readSync(fd, buf, 0, info.size, baseOffset + Number(info.offset));
+            rawFs.readSync(fd, buf, 0, info.size, baseOffset + Number(info.offset));
             fs.writeFileSync(targetPath, buf);
           }
         }
       }
       walk(header, destDir, '');
     } finally {
-      fs.closeSync(fd);
+      rawFs.closeSync(fd);
     }
   },
 
+  async createPackage(srcDir, destAsar) {
+    return this.createPackageWithOptions(srcDir, destAsar, {});
+  },
+
   async createPackageWithOptions(srcDir, destAsar, options = {}) {
+    const rawFs = getRawFs();
     let offset = 0;
     const chunks = [];
-    const unpackMatcher = options.unpackDir ? (relPosix => relPosix.includes('chrome-devtools-mcp')) : () => false;
+    const unpackedSet = options.unpackedPaths instanceof Set ? options.unpackedPaths : null;
+    const unpackMatcher = unpackedSet
+      ? (relPosix => unpackedSet.has(relPosix))
+      : (typeof options.unpackMatcher === 'function'
+        ? options.unpackMatcher
+        : (options.unpackDir ? (relPosix => relPosix.includes('chrome-devtools-mcp')) : () => false));
 
     function build(currentDir, relPosix) {
       const files = {};
@@ -154,14 +197,14 @@ const builtinAsar = {
     headerBuf.writeUInt32LE(jsonSize, 12);
     jsonBuf.copy(headerBuf, 16);
 
-    const fd = fs.openSync(destAsar, 'w');
+    const fd = rawFs.openSync(destAsar, 'w');
     try {
-      fs.writeSync(fd, headerBuf);
+      rawFs.writeSync(fd, headerBuf);
       for (const chunk of chunks) {
-        fs.writeSync(fd, chunk);
+        rawFs.writeSync(fd, chunk);
       }
     } finally {
-      fs.closeSync(fd);
+      rawFs.closeSync(fd);
     }
   }
 };
@@ -186,50 +229,16 @@ function getAppDataDir(options = {}) {
   if (options && typeof options.appDataDir === 'string' && options.appDataDir.trim()) {
     return path.resolve(options.appDataDir.trim());
   }
-  const hasExplicitEnv = Boolean(options && options.env && typeof options.env === 'object');
-  const env = hasExplicitEnv ? options.env : process.env;
-  const hasExplicitPlatform = Boolean(options && typeof options.platform === 'string' && options.platform.trim());
-  const platform = hasExplicitPlatform ? options.platform.trim() : process.platform;
-  const hasExplicitHome = Boolean(options && typeof options.homeDir === 'string' && options.homeDir.trim());
-  const home = hasExplicitHome ? options.homeDir.trim() : (
-    hasExplicitEnv ? (env.USERPROFILE || env.HOME || os.homedir()) : os.homedir()
-  );
-
-  // Only honor APPDATA on win32 or when no platform/homeDir override is specified (preserves legacy process.env.APPDATA test overrides).
-  const allowEnvAppData = platform === 'win32'
-    ? (!hasExplicitHome || (hasExplicitEnv && Object.prototype.hasOwnProperty.call(env, 'APPDATA')))
-    : (!hasExplicitPlatform && !hasExplicitHome && (!hasExplicitEnv || Object.prototype.hasOwnProperty.call(env, 'APPDATA')));
-
-  if (allowEnvAppData && env && typeof env.APPDATA === 'string' && env.APPDATA.trim()) {
-    return env.APPDATA;
-  }
+  if (process.env.APPDATA) return process.env.APPDATA;
+  const home = (options && options.homeDir) || os.homedir();
+  const platform = (options && options.platform) || process.platform;
   if (platform === 'win32') {
     return path.join(home, 'AppData', 'Roaming');
   }
   if (platform === 'darwin') {
     return path.join(home, 'Library', 'Application Support');
   }
-  const allowEnvXdg = !hasExplicitHome || (hasExplicitEnv && Object.prototype.hasOwnProperty.call(env, 'XDG_CONFIG_HOME'));
-  return (allowEnvXdg && env && typeof env.XDG_CONFIG_HOME === 'string' && env.XDG_CONFIG_HOME.trim())
-    ? env.XDG_CONFIG_HOME
-    : path.join(home, '.config');
-}
-
-function isIsolatedTestPath(targetPath) {
-  if (!targetPath || typeof targetPath !== 'string') return false;
-  const resolved = path.resolve(targetPath);
-  const lower = resolved.toLowerCase();
-  const prefixes = [os.tmpdir().toLowerCase()];
-  try {
-    prefixes.push(fs.realpathSync(os.tmpdir()).toLowerCase());
-  } catch {}
-  if (process.platform !== 'win32') {
-    prefixes.push('/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/');
-  }
-  return prefixes.some(prefix => {
-    const norm = prefix.replace(/[\\/]+$/, '');
-    return lower === norm || lower.startsWith(norm + path.sep) || lower.startsWith(norm + '/');
-  });
+  return process.env.XDG_CONFIG_HOME || path.join(home, '.config');
 }
 
 function getStateDir() {
@@ -250,24 +259,68 @@ function getStateDir() {
 }
 
 /**
+ * 判断路径是否位于隔离的测试临时目录中（兼容 Windows Temp、Linux /tmp 与 macOS /private/var/folders 软链）
+ */
+function isIsolatedTestPath(targetPath) {
+  if (!targetPath || typeof targetPath !== 'string') return false;
+  const resolved = path.resolve(targetPath);
+  const candidates = [os.tmpdir()];
+  try {
+    candidates.push(fs.realpathSync(os.tmpdir()));
+  } catch {}
+  try {
+    if (fs.existsSync(resolved)) {
+      const realTarget = fs.realpathSync(resolved);
+      for (const tmpBase of candidates) {
+        if (tmpBase && realTarget.toLowerCase().startsWith(path.resolve(tmpBase).toLowerCase())) {
+          return true;
+        }
+      }
+    }
+  } catch {}
+  const lower = resolved.toLowerCase().replace(/\\/g, '/');
+  for (const tmpBase of candidates) {
+    if (tmpBase && lower.startsWith(path.resolve(tmpBase).toLowerCase().replace(/\\/g, '/'))) {
+      return true;
+    }
+  }
+  return (
+    lower.startsWith('/tmp/') ||
+    lower.startsWith('/private/tmp/') ||
+    lower.startsWith('/var/folders/') ||
+    lower.startsWith('/private/var/folders/')
+  );
+}
+
+/**
  * 探测本机 Antigravity 宿主 app.asar 安装路径（纯路径定位，无安装副作用）
  */
 function findAsarPath(customPath) {
-  if (customPath) {
-    let resolved = path.resolve(customPath);
-    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+  const rawFs = getRawFs();
+  const explicitPath = customPath || (process.env.AG_ASAR_PATH ? String(process.env.AG_ASAR_PATH).trim() : '');
+  if (explicitPath) {
+    let resolved = path.resolve(explicitPath);
+    if (rawFs.existsSync(resolved) && rawFs.statSync(resolved).isDirectory()) {
+      const inMacBundle = path.join(resolved, 'Contents', 'Resources', 'app.asar');
+      if (rawFs.existsSync(inMacBundle)) return inMacBundle;
       const inRes = path.join(resolved, 'resources', 'app.asar');
-      if (fs.existsSync(inRes)) return inRes;
+      if (rawFs.existsSync(inRes)) return inRes;
       const direct = path.join(resolved, 'app.asar');
-      if (fs.existsSync(direct)) return direct;
+      if (rawFs.existsSync(direct)) return direct;
     }
-    if (fs.existsSync(resolved)) return resolved;
-    throw new Error(`Could not find app.asar at specified path: ${customPath}`);
+    if (rawFs.existsSync(resolved)) return resolved;
+    throw new Error(`Could not find app.asar at specified path: ${explicitPath}`);
   }
-  // 若在 Electron 宿主运行时内部被调用，优先定位宿主自身捆绑的 resources/app.asar
+  // 若在 Electron 宿主运行时内部被调用，优先定位宿主自身捆绑的 resources/app.asar 或 Contents/Resources/app.asar
   if (process.versions && process.versions.electron && process.execPath) {
-    const hostAsar = path.join(path.dirname(process.execPath), 'resources', 'app.asar');
-    if (fs.existsSync(hostAsar)) return hostAsar;
+    const execDir = path.dirname(process.execPath);
+    const hostCandidates = [
+      path.join(execDir, 'resources', 'app.asar'),
+      path.join(execDir, '..', 'Resources', 'app.asar')
+    ];
+    for (const hostAsar of hostCandidates) {
+      if (rawFs.existsSync(hostAsar)) return path.resolve(hostAsar);
+    }
   }
   const home = os.homedir();
   const candidates = [];
@@ -283,7 +336,11 @@ function findAsarPath(customPath) {
   } else if (process.platform === 'darwin') {
     candidates.push(
       '/Applications/Antigravity.app/Contents/Resources/app.asar',
-      path.join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app.asar')
+      path.join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app.asar'),
+      '/Applications/Antigravity IDE.app/Contents/Resources/app.asar',
+      path.join(home, 'Applications', 'Antigravity IDE.app', 'Contents', 'Resources', 'app.asar'),
+      '/Applications/Google Antigravity.app/Contents/Resources/app.asar',
+      path.join(home, 'Applications', 'Google Antigravity.app', 'Contents', 'Resources', 'app.asar')
     );
   } else {
     candidates.push(
@@ -294,9 +351,28 @@ function findAsarPath(customPath) {
     );
   }
   for (const p of candidates) {
-    if (fs.existsSync(p)) return p;
+    if (rawFs.existsSync(p)) return p;
   }
   throw new Error('Could not auto-detect Antigravity installation (app.asar). Use --path <path-to-app.asar>.');
 }
 
-module.exports = { loadAsarEngine, builtinAsar, getStateDir, getAppDataDir, isIsolatedTestPath, findAsarPath };
+/**
+ * 从源 ASAR 归档收集所有带有 unpacked 标记的 POSIX 相对路径集合，供重打包精确复刻
+ */
+function collectUnpackedPaths(asarLib, archivePath) {
+  const unpacked = new Set();
+  if (!asarLib || typeof asarLib.listPackage !== 'function') return unpacked;
+  try {
+    const entries = asarLib.listPackage(archivePath);
+    for (const file of entries) {
+      const relWin = file.startsWith('/') || file.startsWith('\\') ? file.slice(1) : file;
+      const stat = asarLib.statFile(archivePath, relWin);
+      if (stat && stat.unpacked) {
+        unpacked.add(relWin.replace(/\\/g, '/'));
+      }
+    }
+  } catch {}
+  return unpacked;
+}
+
+module.exports = { loadAsarEngine, builtinAsar, collectUnpackedPaths, getRawFs, getStateDir, getAppDataDir, isIsolatedTestPath, findAsarPath };

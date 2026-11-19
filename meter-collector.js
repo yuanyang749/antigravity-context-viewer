@@ -2,11 +2,35 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
+const http = require('http');
 const https = require('https');
+const { normalizeLoopbackOrigin } = require('./local-api');
 const { fileURLToPath } = require('url');
 const { spawn, spawnSync } = require('child_process');
-const { safeWriteJsonSync, safeReadJsonSync } = require('./meter-storage');
-const { buildCliProxyEnv, detectProxyConfig } = require('./meter-proxy');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const origDateNow = Date.now;
+const origFsMethods = {
+  readFileSync: fs.readFileSync,
+  writeFileSync: fs.writeFileSync,
+  copyFileSync: fs.copyFileSync,
+  renameSync: fs.renameSync,
+  readdirSync: fs.readdirSync,
+  statSync: fs.statSync,
+  existsSync: fs.existsSync
+};
+const { safeWriteJsonSync, safeReadJsonSync, withFileLockSync } = require('./meter-storage');
+const {
+  buildCliProxyEnv,
+  detectProxyConfig,
+  parseAndValidateProxyUrl,
+  matchesNoProxy,
+  redactProxyUrl,
+  openSocks5Tunnel,
+  openHttpConnectTunnel,
+  classifyRequestTimeoutPhase,
+  sanitizeDiagnosticErrorText
+} = require('./meter-proxy');
 const {
   conversationWorkspaces,
   extractWorkspacePathFromUri,
@@ -21,7 +45,9 @@ const {
   analyzeBinary,
   analyzeBinaryAsync,
   applyUnlock: applyContextUnlock,
+  applyUnlockAsync: applyContextUnlockAsync,
   restoreUnlock: restoreContextUnlock,
+  restoreUnlockAsync: restoreContextUnlockAsync,
   validateContextLimit,
   DEFAULT_CHECKPOINT_TOKENS,
   AUTHOR_INFO: CONTEXT_UNLOCK_AUTHOR
@@ -38,12 +64,23 @@ const {
   SUBSCRIPTION_ACQUISITION_PRESETS,
   CURRENCY_SYMBOLS,
   parseUserPlanStatus,
+  buildModelQuotaSnapshot,
+  isDecorativeBadgeTagTitle,
+  getModelPoolKey,
+  getSharedQuotaGroupKey,
   extractCallId,
   parseGeneratorCall,
   extractModelString,
   normalizeModelId,
-  getModelPoolKey,
   resolveStableModelId,
+  UNATTRIBUTED_MODEL_KEY,
+  resolveModelUsageBucket,
+  computeCacheReadStats,
+  summarizeCacheReadStats,
+  summarizeDailyMapCacheStats,
+  normalizeSessionCallRecord,
+  sanitizeTurnPreviewText,
+  groupSessionCallsByTurns,
   isValidSpeedSample,
   MAX_SPEED_SAMPLES_PER_MODEL,
   calculateRequestApiCost,
@@ -51,6 +88,7 @@ const {
   findReleaseAsset,
   compareVersions
 } = require('./meter-core');
+const { PROJECT_VERSION } = require('./modules-config');
 
 let cachedPython = undefined;
 function resolvePython() {
@@ -75,7 +113,7 @@ function resolvePython() {
         cachedPython = p;
         return cachedPython;
       }
-    } catch {}
+    } catch { }
   }
   for (const cmd of process.platform === 'win32' ? ['python', 'python3', 'py'] : ['python3', 'python']) {
     try {
@@ -84,7 +122,7 @@ function resolvePython() {
         cachedPython = check.stdout.trim().split(/\r?\n/)[0];
         return cachedPython;
       }
-    } catch {}
+    } catch { }
   }
   cachedPython = null;
   return null;
@@ -258,7 +296,8 @@ function sanitizeCascadeModelConfig(c) {
   if (!c || typeof c !== 'object') return null;
   const tagTitle = typeof c.tagTitle === 'string' ? c.tagTitle.trim() : '';
   const tagDesc = typeof c.tagDescription === 'string' ? c.tagDescription.trim() : '';
-  const isTagUnavailable = /unavailable|disabled|不可用/i.test(tagTitle);
+  const isTagUnavailable = /unavailable|disabled|不可用|无权限|無權限/i.test(tagTitle);
+  const isDecoTag = isDecorativeBadgeTagTitle(tagTitle);
   const isUnavail = Boolean(
     c.unavailable === true ||
     c.isUnavailable === true ||
@@ -274,32 +313,18 @@ function sanitizeCascadeModelConfig(c) {
     c.isDeprecated === true ||
     (typeof c.label === 'string' && /\(legacy\)|\(deprecated\)|\(old\)/i.test(c.label))
   );
-  const qi = c.quotaInfo || c.quota_info || null;
-  const rawFrac = qi ? (qi.remainingFraction ?? qi.remaining_fraction ?? qi.fraction) : undefined;
-  const rawPct = qi ? (qi.remainingPct ?? qi.remainingPercent ?? qi.remaining_percent) : undefined;
-  let remainingFraction = null;
-  if (typeof rawFrac === 'number' && Number.isFinite(rawFrac)) {
-    remainingFraction = Math.max(0, Math.min(1, rawFrac));
-  } else if (rawFrac != null && rawFrac !== '' && Number.isFinite(Number(rawFrac))) {
-    remainingFraction = Math.max(0, Math.min(1, Number(rawFrac)));
-  } else if (rawPct != null && rawPct !== '' && Number.isFinite(Number(rawPct))) {
-    remainingFraction = Math.max(0, Math.min(1, Number(rawPct) / 100));
-  }
-  const remAmount = qi ? (qi.remainingAmount ?? qi.remaining_amount) : undefined;
-  const resetTime = qi ? (qi.resetTime || qi.reset_time || null) : null;
-  if (remainingFraction === null && qi && qi.disabled !== true && (resetTime || (remAmount != null && Number(remAmount) === 0))) {
-    remainingFraction = 0;
-  }
+  const rawReason = String(c.unavailabilityReason || c.disabledReason || c.reason || '').trim();
+  const safeReason = (rawReason && !isDecorativeBadgeTagTitle(rawReason)) ? rawReason : null;
+  const fallbackTagReason = isUnavail ? (tagDesc || (!isDecoTag && tagTitle ? tagTitle : null)) : null;
   return {
     modelId: c.modelId || c.model || '',
     label: c.label || c.modelDisplayName || c.modelId || '',
     modelOrAlias: c.modelOrAlias || null,
     value: c.value !== undefined ? c.value : undefined,
     modelAlias: c.modelAlias !== undefined ? c.modelAlias : undefined,
-    quotaInfo: qi ? {
-      remainingFraction,
-      resetTime,
-      ...(typeof qi.disabled === 'boolean' ? { disabled: qi.disabled } : {})
+    quotaInfo: c.quotaInfo ? {
+      remainingFraction: typeof c.quotaInfo.remainingFraction === 'number' ? c.quotaInfo.remainingFraction : null,
+      resetTime: c.quotaInfo.resetTime || null
     } : null,
     tagTitle: tagTitle || null,
     tagDescription: tagDesc || null,
@@ -314,9 +339,11 @@ function sanitizeCascadeModelConfig(c) {
       : null,
     modelProvider: typeof (c.modelProvider ?? c.model_provider) === 'string' ? (c.modelProvider ?? c.model_provider) : null,
     capabilitySource: typeof c.capabilitySource === 'string' ? c.capabilitySource : null,
+    disabled: c.disabled === true,
+    allowedTiers: Array.isArray(c.allowedTiers) ? c.allowedTiers.slice() : undefined,
     unavailable: isUnavail,
-    unavailabilityReason: c.unavailabilityReason || c.disabledReason || c.reason || (isUnavail ? (tagDesc || tagTitle || null) : null),
-    notice: c.notice || c.clientNotice || c.warning || (!isUnavail && tagTitle ? `${tagTitle}${tagDesc ? `：${tagDesc}` : ''}` : null),
+    unavailabilityReason: safeReason || fallbackTagReason || null,
+    notice: c.notice || c.clientNotice || c.warning || (!isUnavail && tagTitle && (!isDecoTag || tagDesc) ? `${tagTitle}${tagDesc ? `：${tagDesc}` : ''}` : null),
     isHistorical: isHist,
     releaseDate: c.releaseDate || null,
     family: c.family || null,
@@ -324,41 +351,92 @@ function sanitizeCascadeModelConfig(c) {
   };
 }
 
+const FILES_CACHE_MAX_ENTRIES = 512;
+const CONVERSATIONS_CACHE_MAX_ENTRIES = 32;
 const filesCache = new Map();
 const conversations = new Map();
+const csrfTokenByOrigin = new Map();
 let pythonQueue = Promise.resolve();
 
-function request(origin, method, body, token) {
+function setBoundedMap(map, key, val, maxEntries) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, val);
+  while (map.size > maxEntries) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+}
+
+function request(origin, method, body, token, signal = null) {
   const url = method ? `${origin}/exa.language_server_pb.LanguageServerService/${method}` : origin + '/';
   return new Promise((resolve, reject) => {
-    const req = https.request(url, { rejectUnauthorized: false, method: method ? 'POST' : 'GET', headers: method ? { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'x-codeium-csrf-token': token } : {} }, response => {
-      let chunks = [], size = 0;
-      response.on('data', chunk => { size += chunk.length; if (size > 96 * 1024 * 1024) { req.destroy(new Error('本地响应过大，扫描不完整')); return; } chunks.push(chunk); });
-      response.on('end', () => { const text = Buffer.concat(chunks).toString(); if (response.statusCode !== 200) reject(new Error(`本机接口 HTTP ${response.statusCode}`)); else { try { resolve(method ? JSON.parse(text) : text); } catch (e) { reject(e); } } });
+    if (signal?.aborted) {
+      const err = new Error('请求已取消');
+      err.name = 'AbortError';
+      reject(err);
+      return;
+    }
+    const transport = url.startsWith('https:') ? https : http;
+    const req = transport.request(url, {
+      agent: false,
+      rejectUnauthorized: false,
+      method: method ? 'POST' : 'GET',
+      headers: method ? { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'x-codeium-csrf-token': token } : {},
+      ...(signal ? { signal } : {})
+    }, response => {
+      const chunks = [];
+      let size = 0;
+      response.on('data', chunk => {
+        size += chunk.length;
+        if (size > 96 * 1024 * 1024) {
+          req.destroy(new Error('本地响应过大，扫描不完整'));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on('end', () => {
+        if (signal?.aborted) {
+          const err = new Error('请求已取消');
+          err.name = 'AbortError';
+          reject(err);
+          return;
+        }
+        const text = Buffer.concat(chunks).toString();
+        if (response.statusCode !== 200) reject(new Error(`本机接口 HTTP ${response.statusCode}`));
+        else { try { resolve(method ? JSON.parse(text) : text); } catch (e) { reject(e); } }
+      });
     });
-    req.setTimeout(20000, () => req.destroy(new Error('本机接口读取超时'))); req.on('error', reject); req.end(method ? JSON.stringify(body) : undefined);
+    req.setTimeout(20000, () => req.destroy(new Error('本机接口读取超时')));
+    req.on('error', reject);
+    req.end(method ? JSON.stringify(body) : undefined);
   });
 }
 
-function pythonScan(items) {
-  const task = pythonQueue.then(() => runPythonScan(items));
-  pythonQueue = task.catch(() => {});
+function pythonScan(items, signal = null) {
+  const task = pythonQueue.then(() => {
+    if (signal?.aborted) return items.map(item => ({ key: item.key, ...empty(), status: 'unknown', unknownParts: ['扫描已切换会话取消'] }));
+    return runPythonScan(items, signal);
+  });
+  pythonQueue = task.catch(() => { });
   return task;
 }
 
-function runPythonScan(items) {
+function runPythonScan(items, signal = null) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return resolve(items.map(item => ({ key: item.key, ...empty(), status: 'unknown', unknownParts: ['扫描已切换会话取消'] })));
     const py = resolvePython();
     if (!py) return reject(new Error('本地 Python 解析环境不可用'));
     const source = fs.readFileSync(path.join(__dirname, 'attachment_scan.py'), 'utf8');
     const child = spawn(py, ['-I', '-c', source, '--json-lines'], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    let output = '', errors = '', timedOut = false;
+    let output = '', errors = '', timedOut = false, aborted = false;
     const completed = [];
+    const onAbort = () => { aborted = true; try { child.kill(); } catch { } };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     const timer = setTimeout(() => { timedOut = true; child.kill(); }, 120000);
-    child.stdout.on('data', chunk => { output += chunk; let at; while ((at = output.indexOf('\n')) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) { try { completed.push(JSON.parse(line)); } catch {} } } }); child.stderr.on('data', chunk => { if (errors.length < 1000) errors += chunk; });
-    child.on('error', e => { clearTimeout(timer); reject(e); });
-    child.on('close', code => { clearTimeout(timer); const reason = timedOut ? '扫描超时，未完成部分不计为零' : code !== 0 ? '解析进程失败：' + errors.slice(0, 160) : '附件没有返回解析结果'; const done = new Set(completed.map(v => v.key)); for (const item of items) if (!done.has(item.key)) completed.push({ key: item.key, ...empty(), status: 'unknown', unknownParts: [reason] }); resolve(completed); });
-    child.stdin.on('error', () => {}); child.stdin.end(JSON.stringify(items));
+    child.stdout.on('data', chunk => { output += chunk; let at; while ((at = output.indexOf('\n')) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) { try { completed.push(JSON.parse(line)); } catch { } } } }); child.stderr.on('data', chunk => { if (errors.length < 1000) errors += chunk; });
+    child.on('error', e => { clearTimeout(timer); if (signal) signal.removeEventListener('abort', onAbort); reject(e); });
+    child.on('close', code => { clearTimeout(timer); if (signal) signal.removeEventListener('abort', onAbort); const reason = aborted ? '扫描已切换会话取消' : timedOut ? '扫描超时，未完成部分不计为零' : code !== 0 ? '解析进程失败：' + errors.slice(0, 160) : '附件没有返回解析结果'; const done = new Set(completed.map(v => v.key)); for (const item of items) if (!done.has(item.key)) completed.push({ key: item.key, ...empty(), status: 'unknown', unknownParts: [reason] }); resolve(completed); });
+    child.stdin.on('error', () => { }); child.stdin.end(JSON.stringify(items));
   });
 }
 
@@ -386,7 +464,7 @@ function getImageDimensions(buf) {
         }
       }
     }
-  } catch {}
+  } catch { }
   return { width: null, height: null };
 }
 
@@ -398,9 +476,11 @@ function calcImageTokens(w, h) {
   return [tok, Math.max(tok, (w > 384 || h > 384) ? 1120 : 258)];
 }
 
-async function scanFiles(media) {
+async function scanFiles(media, scanOptions = {}) {
+  const signal = scanOptions?.signal || null;
   const results = new Map(), work = [];
   for (const item of media) {
+    if (signal?.aborted) break;
     try {
       if (item.inlineData) {
         const mime = String(item.mime || '').toLowerCase();
@@ -447,118 +527,207 @@ async function scanFiles(media) {
       }
       if (!item.uri || /^https?:/i.test(item.uri)) throw new Error('无可用本地附件，内容未知');
       const targetPath = item.uri.startsWith('file:') ? fileURLToPath(item.uri) : item.uri;
-      if (!fs.existsSync(targetPath)) throw new Error('附件文件不存在或已移动');
-      const target = fs.realpathSync(targetPath);
-      const stat = fs.statSync(target);
+      let target;
+      let stat;
+      try {
+        target = await fs.promises.realpath(targetPath);
+        stat = await fs.promises.stat(target);
+      } catch (fsErr) {
+        if (fsErr && (fsErr.code === 'ENOENT' || fsErr.code === 'ENOTDIR')) {
+          throw new Error('附件文件不存在或已移动');
+        }
+        throw fsErr;
+      }
       if (!stat.isFile()) throw new Error('附件不是普通文件');
       const key = `${target.toLowerCase()}|${stat.size}|${stat.mtimeMs}`;
-      if (filesCache.has(key)) results.set(item.uri, filesCache.get(key));
-      else work.push({ key: item.uri, path: target, cacheKey: key });
+      if (filesCache.has(key)) {
+        const hit = filesCache.get(key);
+        setBoundedMap(filesCache, key, hit, FILES_CACHE_MAX_ENTRIES);
+        results.set(item.uri, hit);
+      } else {
+        work.push({ key: item.uri, path: target, cacheKey: key });
+      }
     } catch (e) { results.set(item.uri, { ...empty(), status: 'unknown', unknownParts: [item.reason || e.message] }); }
   }
-  if (work.length) {
+  if (work.length && !signal?.aborted) {
     try {
-      const parsed = await pythonScan(work.map(({ key, path }) => ({ key, path })));
-      for (const result of parsed) { const job = work.find(w => w.key === result.key); if (job) { filesCache.set(job.cacheKey, result); results.set(job.key, result); } }
+      const parsed = await pythonScan(work.map(({ key, path }) => ({ key, path })), signal);
+      for (const result of parsed) {
+        const job = work.find(w => w.key === result.key);
+        if (job) {
+          if (result && result.status !== 'unknown') {
+            setBoundedMap(filesCache, job.cacheKey, result, FILES_CACHE_MAX_ENTRIES);
+          }
+          results.set(job.key, result);
+        }
+      }
     } catch (e) { for (const job of work) results.set(job.key, { ...empty(), status: 'unknown', unknownParts: [e.message] }); }
   }
   return media.map(item => ({ ...item, ...(results.get(item.uri) || { ...empty(), status: 'unknown', unknownParts: ['未返回附件统计'] }), uri: undefined, key: undefined }));
 }
 
+let collectSeqCounter = 0;
+const latestCollectSeqByOrigin = new Map();
+
 async function collect(origin, id, options = {}) {
-  if (!/^https:\/\/127\.0\.0\.1:\d+$/.test(origin) || !/^[a-f\d-]{36}$/i.test(id)) throw new Error('无效本机会话');
+  const safeOrigin = normalizeLoopbackOrigin(origin);
+  if (!safeOrigin || !/^[a-f\d-]{36}$/i.test(id)) throw new Error('无效本机会话');
+  origin = safeOrigin;
   const key = `${origin}/${id}`;
+  const supersede = options.supersedePrevious === true;
+  const mySeq = supersede ? (++collectSeqCounter) : 0;
+  const abortController = supersede ? new AbortController() : null;
+  if (supersede) {
+    const prevLatest = latestCollectSeqByOrigin.get(origin);
+    if (prevLatest && prevLatest.id !== id && prevLatest.abortController) {
+      try { prevLatest.abortController.abort(); } catch { }
+    }
+    latestCollectSeqByOrigin.set(origin, { seq: mySeq, id, abortController });
+  }
+  const isSuperseded = () => {
+    if (!supersede) return false;
+    const latest = latestCollectSeqByOrigin.get(origin);
+    return Boolean((latest && latest.seq > mySeq && latest.id !== id) || abortController?.signal?.aborted);
+  };
   const previous = conversations.get(key);
   if (previous?.pending) return previous.pending;
   if (options.force) filesCache.clear();
   if (!options.force && previous?.result && Date.now() - previous.at < 12000) return previous.result;
   const task = (async () => {
-    const html = await request(origin);
-    const token = JSON.parse(html.match(/window.__APP_CONFIG__ = (.*?);/)[1]).csrfToken;
-    const call = (method, body) => request(origin, method, body, token);
-    const full = await call('GetCascadeTrajectory', { cascadeId: id, trajectoryVerbosity: 3 });
-    const trajectory = full.trajectory;
-    if (!trajectory) throw new Error('未取得会话历史，无法完整统计');
-    const wsPath = extractWorkspaceFromTrajectory(trajectory);
-    if (wsPath) conversationWorkspaces.set(id.toLowerCase(), wsPath);
-    const steps = trajectory.steps || [];
-    const expected = Number(full.numTotalSteps ?? steps.length);
-    while (steps.length < expected) {
-      const page = await call('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: steps.length, trajectoryVerbosity: 3 });
-      if (!page.steps?.length) throw new Error(`历史仅取得 ${steps.length}/${expected} 步，扫描未完成`);
-      steps.push(...page.steps);
-    }
-    const session = analyzeSteps(steps);
-    const stepCapabilities = extractObservedModelInfoFromSteps(steps);
-    const attachments = await scanFiles(session.media);
-    const attachmentTotal = empty();
-    for (const a of attachments) { const n = a.references || 1; add(attachmentTotal, Object.fromEntries(['chars', 'bytes', 'low', 'high'].map(k => [k, (a[k] || 0) * n]))); }
-    const total = add({ ...session.total }, attachmentTotal);
-    let latest = null;
-    const count = Number(full.numTotalGeneratorMetadata ?? trajectory.generatorMetadata?.length ?? 0);
-    const tail = await call('GetCascadeTrajectoryGeneratorMetadata', { cascadeId: id, generatorMetadataOffset: Math.max(0, count - 3), includeMessages: false });
-    let knownCascadeConfigs = Array.isArray(cachedHostUserStatus?.cascadeModelConfigs) ? cachedHostUserStatus.cascadeModelConfigs : [];
-    const hasAnyCap = knownCascadeConfigs.some(c => Number.isFinite(c?.maxTokens) && c.maxTokens > 0);
-    if (!knownCascadeConfigs.length || !hasAnyCap) {
-      try {
-        const freshStatus = await fetchUserStatusFromHost();
-        if (Array.isArray(freshStatus?.cascadeModelConfigs) && freshStatus.cascadeModelConfigs.length) {
-          knownCascadeConfigs = freshStatus.cascadeModelConfigs;
+    const signal = abortController?.signal || null;
+    try {
+      let token = !options.force ? csrfTokenByOrigin.get(origin) : null;
+      if (!token) {
+        const html = await request(origin, null, null, null, signal);
+        if (isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now(), errors: [] };
+        token = JSON.parse(html.match(/window.__APP_CONFIG__ = (.*?);/)[1]).csrfToken;
+        csrfTokenByOrigin.set(origin, token);
+      }
+      const call = async (method, body) => {
+        try {
+          return await request(origin, method, body, token, signal);
+        } catch (err) {
+          if (err && /HTTP 40[13]/.test(String(err.message || '')) && !signal?.aborted) {
+            csrfTokenByOrigin.delete(origin);
+            const html = await request(origin, null, null, null, signal);
+            token = JSON.parse(html.match(/window.__APP_CONFIG__ = (.*?);/)[1]).csrfToken;
+            csrfTokenByOrigin.set(origin, token);
+            return await request(origin, method, body, token, signal);
+          }
+          throw err;
         }
-      } catch {}
-    }
-    const mergedCascadeConfigs = mergeModelCapabilitiesIntoConfigs(
-      knownCascadeConfigs,
-      cachedHostUserStatus?.availableModelDetails || null,
-      stepCapabilities
-    );
-    let latestModel = null;
-    let latestCallId = null;
-    for (const m of (tail.generatorMetadata || []).slice().reverse()) {
-      latest = summarize(m, { cascadeModelConfigs: mergedCascadeConfigs });
-      if (latest) {
-        latestModel = m.chatModel;
+      };
+      const full = await call('GetCascadeTrajectory', { cascadeId: id, trajectoryVerbosity: 3 });
+      if (isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now(), errors: [] };
+      const trajectory = full.trajectory;
+      if (!trajectory) throw new Error('未取得会话历史，无法完整统计');
+      const wsPath = extractWorkspaceFromTrajectory(trajectory);
+      if (wsPath) conversationWorkspaces.set(id.toLowerCase(), wsPath);
+      const steps = trajectory.steps || [];
+      const expected = Number(full.numTotalSteps ?? steps.length);
+      while (steps.length < expected) {
+        if (isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now(), errors: [] };
+        const page = await call('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: steps.length, trajectoryVerbosity: 3 });
+        if (!page.steps?.length) throw new Error(`历史仅取得 ${steps.length}/${expected} 步，扫描未完成`);
+        steps.push(...page.steps);
+      }
+      if (isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now(), errors: [] };
+      const session = analyzeSteps(steps);
+      const stepCapabilities = extractObservedModelInfoFromSteps(steps);
+      const attachments = await scanFiles(session.media, { signal });
+      if (isSuperseded()) return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now(), errors: [] };
+      const attachmentTotal = empty();
+      for (const a of attachments) { const n = a.references || 1; add(attachmentTotal, Object.fromEntries(['chars', 'bytes', 'low', 'high'].map(k => [k, (a[k] || 0) * n]))); }
+      const total = add({ ...session.total }, attachmentTotal);
+      let latest = null;
+      const count = Number(full.numTotalGeneratorMetadata ?? trajectory.generatorMetadata?.length ?? 0);
+      const tail = await call('GetCascadeTrajectoryGeneratorMetadata', { cascadeId: id, generatorMetadataOffset: Math.max(0, count - 3), includeMessages: false });
+      let cachedHostUserStatus = cachedUserStatusByOrigin.get(normalizeQuotaOriginScope({ origin }))?.status || null;
+      let knownCascadeConfigs = Array.isArray(cachedHostUserStatus?.cascadeModelConfigs) ? cachedHostUserStatus.cascadeModelConfigs : [];
+      const hasAnyCap = knownCascadeConfigs.some(c => Number.isFinite(c?.maxTokens) && c.maxTokens > 0);
+      if (!knownCascadeConfigs.length || !hasAnyCap) {
+        try {
+          const freshStatus = await fetchUserStatusFromHost({ origin });
+          if (freshStatus) cachedHostUserStatus = freshStatus;
+          if (Array.isArray(freshStatus?.cascadeModelConfigs) && freshStatus.cascadeModelConfigs.length) {
+            knownCascadeConfigs = freshStatus.cascadeModelConfigs;
+          }
+        } catch { }
+      }
+      const mergedCascadeConfigs = mergeModelCapabilitiesIntoConfigs(
+        knownCascadeConfigs,
+        cachedHostUserStatus?.availableModelDetails || null,
+        stepCapabilities
+      );
+      let latestModel = null;
+      let latestCallId = null;
+      let latestCallRecord = null;
+      const recentGeneratorCalls = [];
+      for (const m of (tail.generatorMetadata || [])) {
         const callMeta = parseGeneratorCall(m, id, 'desktop', { cascadeModelConfigs: mergedCascadeConfigs });
-        latestCallId = callMeta?.callId || null;
-        break;
+        if (callMeta) {
+          const normCall = normalizeSessionCallRecord(callMeta, { cascadeId: id, cascadeModelConfigs: mergedCascadeConfigs });
+          if (normCall) recentGeneratorCalls.push(normCall);
+        }
       }
-    }
-    const system = latestModel ? measure((latestModel.promptSections || []).map(p => p.content || '').join('\n') || latestModel.systemPrompt || '') : empty();
-    const definitions = latestModel ? measure(JSON.stringify(latestModel.tools || [])) : empty();
-    session.groups.system = system; session.groups.definitions = definitions;
-    add(total, system); add(total, definitions);
-    if (session.currentError) {
-      const fromStep = summarize({ chatModel: { retryInfos: [{ error: session.currentError.text }] } }, {
-        currentModel: latest?.model || latestModel?.modelDisplayName || latestModel?.model || '',
-        cascadeModelConfigs: mergedCascadeConfigs,
-        previousValidContext: latest
-      });
-      if (fromStep?.error) {
-        latest = {
-          ...(latest || {}),
-          error: fromStep.error,
-          errorClassification: fromStep.errorClassification,
-          exceeded: fromStep.exceeded,
-          network: fromStep.network,
-          serviceLimit: fromStep.serviceLimit || latest?.serviceLimit || null,
-          status: fromStep.status,
-          actual: fromStep.exceeded ? null : (latest?.actual ?? null),
-          percent: fromStep.exceeded ? null : (latest?.percent ?? null),
-          estimated: latest?.actual == null
-        };
+      for (const m of (tail.generatorMetadata || []).slice().reverse()) {
+        latest = summarize(m, { cascadeModelConfigs: mergedCascadeConfigs });
+        if (latest) {
+          latestModel = m.chatModel;
+          const callMeta = parseGeneratorCall(m, id, 'desktop', { cascadeModelConfigs: mergedCascadeConfigs });
+          latestCallId = callMeta?.callId || null;
+          if (callMeta) {
+            latestCallRecord = normalizeSessionCallRecord(callMeta, { cascadeId: id, cascadeModelConfigs: mergedCascadeConfigs });
+          }
+          break;
+        }
       }
-    }
+      const system = latestModel ? measure((latestModel.promptSections || []).map(p => p.content || '').join('\n') || latestModel.systemPrompt || '') : empty();
+      const definitions = latestModel ? measure(JSON.stringify(latestModel.tools || [])) : empty();
+      session.groups.system = system; session.groups.definitions = definitions;
+      add(total, system); add(total, definitions);
+      if (session.currentError) {
+        const fromStep = summarize({ chatModel: { retryInfos: [{ error: session.currentError.text }] } }, {
+          currentModel: latest?.model || latestModel?.modelDisplayName || latestModel?.model || '',
+          cascadeModelConfigs: mergedCascadeConfigs,
+          previousValidContext: latest
+        });
+        if (fromStep?.error) {
+          latest = {
+            ...(latest || {}),
+            error: fromStep.error,
+            errorClassification: fromStep.errorClassification,
+            exceeded: fromStep.exceeded,
+            network: fromStep.network,
+            serviceLimit: fromStep.serviceLimit || latest?.serviceLimit || null,
+            status: fromStep.status,
+            actual: fromStep.exceeded ? null : (latest?.actual ?? null),
+            percent: fromStep.exceeded ? null : (latest?.percent ?? null),
+            estimated: latest?.actual == null
+          };
+        }
+      }
     const unknownFiles = attachments.filter(a => a.status !== 'parsed').length;
     const compactCascadeConfigs = mergedCascadeConfigs.map(sanitizeCascadeModelConfig).filter(Boolean);
     const modelCapabilitiesById = {
       ...(cachedHostUserStatus?.availableModelDetails || {}),
       ...stepCapabilities
     };
-    const result = { version: '0.8.3', conversation: id, workspacePath: wsPath || null, latest, latestCallId, generatorCount: count, cascadeModelConfigs: compactCascadeConfigs, modelCapabilitiesById, session: { ...session, media: undefined, attachmentTotal, total, attachments, unknownFiles, complete: unknownFiles === 0, scope: '全量可读取历史 + 上传附件 + 当前系统提示与工具定义；不将每轮重复输入累加；非服务端分词结果' }, scannedAt: Date.now(), errors: [] };
-    conversations.set(key, { result, at: Date.now() });
+    const result = { version: PROJECT_VERSION, conversation: id, workspacePath: wsPath || null, latest, latestCallId, latestCallRecord, recentGeneratorCalls, generatorCount: count, cascadeModelConfigs: compactCascadeConfigs, modelCapabilitiesById, session: { ...session, media: undefined, attachmentTotal, total, attachments, unknownFiles, complete: unknownFiles === 0, scope: '全量可读取历史 + 上传附件 + 当前系统提示与工具定义；不将每轮重复输入累加；非服务端分词结果' }, scannedAt: Date.now(), errors: [] };
+    if (isSuperseded()) {
+      conversations.delete(key);
+      return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now(), errors: [] };
+    }
+    setBoundedMap(conversations, key, { result, at: Date.now() }, CONVERSATIONS_CACHE_MAX_ENTRIES);
     return result;
+    } catch (err) {
+      if (isSuperseded() || (err && err.name === 'AbortError' && signal?.aborted)) {
+        return { version: PROJECT_VERSION, conversation: id, abortedStale: true, scannedAt: Date.now(), errors: [] };
+      }
+      throw err;
+    }
   })();
-  conversations.set(key, { ...previous, pending: task });
+  setBoundedMap(conversations, key, { ...previous, pending: task }, CONVERSATIONS_CACHE_MAX_ENTRIES);
   try { return await task; } catch (e) { conversations.delete(key); throw e; }
 }
 
@@ -576,11 +745,11 @@ function formatLocalDateKey(dateObj) {
 function isCompanionOrTempFile(fileName) {
   const lower = fileName.toLowerCase();
   return lower.endsWith('-wal') ||
-         lower.endsWith('-shm') ||
-         lower.endsWith('-journal') ||
-         lower.endsWith('.tmp') ||
-         lower.endsWith('.lock') ||
-         lower.endsWith('.bak');
+    lower.endsWith('-shm') ||
+    lower.endsWith('-journal') ||
+    lower.endsWith('.tmp') ||
+    lower.endsWith('.lock') ||
+    lower.endsWith('.bak');
 }
 
 // 尝试安全读取 LanguageServer 的 GetUserStatus
@@ -600,12 +769,12 @@ function isSyntheticCall(callId, call = {}) {
   const sId = String(callId).toLowerCase();
   const cId = String(call?.cascadeId || '').toLowerCase();
   return sId.startsWith('test_') ||
-         sId.startsWith('fixture_') ||
-         sId.startsWith('synthetic_') ||
-         sId.includes('desktop_response_001') ||
-         cId.includes('verify') ||
-         cId.includes('test') ||
-         cId.includes('mock');
+    sId.startsWith('fixture_') ||
+    sId.startsWith('synthetic_') ||
+    sId.includes('desktop_response_001') ||
+    cId.includes('verify') ||
+    cId.includes('test') ||
+    cId.includes('mock');
 }
 
 function getPricingLedgerPath(overridePathOrDir) {
@@ -764,7 +933,7 @@ function loadPricingLedger(overridePathOrDir, options = {}) {
       if (!fsImpl.existsSync(bakPath) || Math.random() < 0.1) {
         fsImpl.copyFileSync(p, bakPath);
       }
-    } catch {}
+    } catch { }
   }
 
   if (readRes.ok && !hasSynthetic && !options?.fs) {
@@ -815,7 +984,7 @@ function savePricingLedger(ledger, overridePathOrDir, options = {}) {
         }
         ledgerCacheByPath.set(cacheKey, { ledger: cachedCopy, mtimeMs: st.mtimeMs, size: st.size });
       }
-    } catch {}
+    } catch { }
   }
   return res;
 }
@@ -1052,8 +1221,6 @@ function shouldAdoptSameRankAuthDate(baseEntry, incomingEntry, baseDateInfo, inc
   if (incomingIsStaleStatus || !incDateInfo.date) return false;
   if (!baseDateInfo.date) return true;
   if (forceIncomingDate) return true;
-  // 同等级权威日期修订：需显式更新的修订号（且用量未回退）、严格增长的用量（且修订号未倒退）或 streaming -> final 状态完成；
-  // 已完成记录在无修订依据且同用量时保持首个权威日期（first-write-wins），阻断乱序旧包回滚与交替震荡
   if (baseEntry.status !== 'final' && incomingEntry.status === 'final' && usageCmp >= 0 && revCmp >= 0) return true;
   if (revCmp > 0 && usageCmp >= 0) return true;
   if (usageCmp > 0 && revCmp >= 0) return true;
@@ -1079,27 +1246,6 @@ function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitSt
   const mergedModel = preferIncomingModel && !incomingIsStaleStatus
     ? pickRicherModel(incomingEntry.model, baseEntry.model)
     : pickRicherModel(baseEntry.model, incomingEntry.model);
-
-  const mergedModelExactId = (preferIncomingModel && !incomingIsStaleStatus)
-    ? (incomingEntry.modelExactId || baseEntry.modelExactId)
-    : (baseEntry.modelExactId || (!incomingIsStaleStatus ? incomingEntry.modelExactId : undefined));
-  const mergedModelLabel = (preferIncomingModel && !incomingIsStaleStatus)
-    ? (incomingEntry.modelLabel || baseEntry.modelLabel)
-    : (baseEntry.modelLabel || (!incomingIsStaleStatus ? incomingEntry.modelLabel : undefined));
-  const mergedEffort = (preferIncomingModel && !incomingIsStaleStatus)
-    ? (incomingEntry.effort || baseEntry.effort)
-    : (baseEntry.effort || (!incomingIsStaleStatus ? incomingEntry.effort : undefined));
-
-  const baseHasSpeed = hasSpeedMetrics(baseEntry) && isValidSpeedSample(baseEntry);
-  const incHasSpeed = !incomingIsStaleStatus && hasSpeedMetrics(incomingEntry) && isValidSpeedSample(incomingEntry);
-  const speedFields = {};
-  if (incHasSpeed && (takeIncUsage || !baseHasSpeed)) {
-    if (incomingEntry.ttftSec !== undefined) speedFields.ttftSec = incomingEntry.ttftSec;
-    if (incomingEntry.streamingSec !== undefined) speedFields.streamingSec = incomingEntry.streamingSec;
-    if (incomingEntry.durationSec !== undefined) speedFields.durationSec = incomingEntry.durationSec;
-    if (incomingEntry.tps !== undefined) speedFields.tps = incomingEntry.tps;
-    if (incomingEntry.origin !== undefined) speedFields.origin = incomingEntry.origin;
-  }
 
   const resolvedStep = explicitStep
     ?? baseEntry.stepIndex
@@ -1137,19 +1283,43 @@ function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitSt
     : (incomingEntry.status || baseEntry.status || 'final');
   const mergedRev = !incomingIsStaleStatus && revCmp >= 0 ? (incRev ?? baseRev) : baseRev;
 
+  // 保护已有测速指标与精确模型元数据不被无测速的后续校准覆盖
+  const preservedExactId = incomingEntry.modelExactId || baseEntry.modelExactId;
+  const preservedLabel = incomingEntry.modelLabel || baseEntry.modelLabel;
+  const preservedEffort = incomingEntry.effort || baseEntry.effort;
+  const keepSpeed = (!hasSpeedMetrics(baseEntry) && hasSpeedMetrics(incomingEntry) && isValidSpeedSample(incomingEntry))
+    ? {
+      ...(incomingEntry.ttftSec != null ? { ttftSec: incomingEntry.ttftSec } : {}),
+      ...(incomingEntry.streamingSec != null ? { streamingSec: incomingEntry.streamingSec } : {}),
+      ...(incomingEntry.durationSec != null ? { durationSec: incomingEntry.durationSec } : {}),
+      ...(incomingEntry.tps != null ? { tps: incomingEntry.tps } : {}),
+      ...(incomingEntry.origin ? { origin: incomingEntry.origin } : {})
+    }
+    : (hasSpeedMetrics(baseEntry)
+      ? {
+        ...(baseEntry.ttftSec != null ? { ttftSec: baseEntry.ttftSec } : {}),
+        ...(baseEntry.streamingSec != null ? { streamingSec: baseEntry.streamingSec } : {}),
+        ...(baseEntry.durationSec != null ? { durationSec: baseEntry.durationSec } : {}),
+        ...(baseEntry.tps != null ? { tps: baseEntry.tps } : {}),
+        ...(baseEntry.origin ? { origin: baseEntry.origin } : {})
+      }
+      : {});
+
+  // 保留账号归属元数据，避免后续无账号扫描富化抹除已确认的账号归属
+  const attributionMerged = mergeAccountAttributionFields(baseEntry, incomingEntry);
+
   const merged = {
     ...baseEntry,
     ...(!incomingIsStaleStatus && takeIncUsage ? incomingEntry : {}),
-    ...speedFields,
     ...(chosenDateInfo === incDateInfo && incomingEntry.timestamp !== undefined ? { timestamp: incomingEntry.timestamp } : {}),
     callId: canonicalKey,
     source: baseEntry.source || incomingEntry.source || 'desktop',
     ...(resolvedCascadeId ? { cascadeId: resolvedCascadeId } : {}),
     stepIndex: resolvedStep,
     model: mergedModel,
-    ...(mergedModelExactId ? { modelExactId: mergedModelExactId } : {}),
-    ...(mergedModelLabel ? { modelLabel: mergedModelLabel } : {}),
-    ...(mergedEffort ? { effort: mergedEffort } : {}),
+    ...(preservedExactId ? { modelExactId: preservedExactId } : {}),
+    ...(preservedLabel ? { modelLabel: preservedLabel } : {}),
+    ...(preservedEffort ? { effort: preservedEffort } : {}),
     inputTokens: inp,
     cacheTokens: cap,
     cacheReadTokens: cap,
@@ -1162,8 +1332,19 @@ function mergeSameCallRecords(baseEntry, incomingEntry, canonicalKey, explicitSt
     ...(chosenDateInfo.dateSource ? { dateSource: chosenDateInfo.dateSource } : {}),
     dateIsProvisional: Boolean(chosenDateInfo.dateIsProvisional),
     ...(mergedRev !== null ? { sourceRevision: mergedRev } : {}),
+    ...keepSpeed,
+    ...attributionMerged,
     updatedAt: Date.now()
   };
+  if (!attributionMerged.accountScopeKey) {
+    delete merged.accountScopeKey;
+  }
+  if (!attributionMerged.accountAttributionEvidence) {
+    delete merged.accountAttributionEvidence;
+  }
+  if (!attributionMerged.unattributedReason) {
+    delete merged.unattributedReason;
+  }
   if (!chosenDateInfo.dateSource) {
     delete merged.dateSource;
   }
@@ -1215,13 +1396,6 @@ function callSemanticSignature(c) {
     String(c.model || ''),
     String(c.modelKey || ''),
     String(c.modelExactId || ''),
-    String(c.modelLabel || ''),
-    String(c.effort || ''),
-    c.ttftSec ?? '',
-    c.streamingSec ?? '',
-    c.durationSec ?? '',
-    c.tps ?? '',
-    String(c.origin || ''),
     String(c.status || ''),
     Boolean(c.isEstimated),
     Boolean(c.isPriced),
@@ -1231,11 +1405,16 @@ function callSemanticSignature(c) {
     u.out,
     u.think,
     u.tot,
+    c.durationSec ?? '',
+    c.tps ?? '',
     String(c.date || ''),
     String(c.created_at || ''),
     String(c.dateSource || ''),
     Boolean(c.dateIsProvisional),
-    rev ?? ''
+    rev ?? '',
+    String(c.accountScopeKey || ''),
+    String(c.accountAttributionConfidence || ''),
+    String(c.unattributedReason || '')
   ].join('|');
 }
 
@@ -1273,6 +1452,37 @@ function reconcileConfirmableDuplicateStepCalls(callsObj) {
 
   if (!synItems.length || !realItems.length) return false;
 
+  // 按 (source, cascadeId) 建立局部哈希索引，将 O(syn * real) 降至线性 O(syn + real)
+  const synCidSet = new Set();
+  for (let i = 0; i < synItems.length; i++) {
+    synCidSet.add(`${synItems[i].synSrc}\0${synItems[i].synCid}`);
+  }
+  const ruleAIndex = new Map();
+  const ruleBIndex = new Map();
+  for (let i = 0; i < realItems.length; i++) {
+    const item = realItems[i];
+    const { realKey, real } = item;
+    const src = real.source || 'desktop';
+    const cid = String(real.cascadeId || '').toLowerCase();
+    const srcCid = `${src}\0${cid}`;
+    if (!synCidSet.has(srcCid)) continue;
+    const stepNums = extractCallStepNumbers(real, realKey);
+    if (stepNums.length > 0) {
+      for (let j = 0; j < stepNums.length; j++) {
+        const aKey = `${srcCid}\0${stepNums[j]}`;
+        let list = ruleAIndex.get(aKey);
+        if (!list) { list = []; ruleAIndex.set(aKey, list); }
+        list.push(item);
+      }
+    } else {
+      const uReal = getCallTokenBreakdown(real);
+      const bKey = `${srcCid}\0${uReal.inp}:${uReal.cap}:${uReal.out}`;
+      let list = ruleBIndex.get(bKey);
+      if (!list) { list = []; ruleBIndex.set(bKey, list); }
+      list.push(item);
+    }
+  }
+
   let reconciled = false;
   const usedRealKeys = new Set();
   const unmatchedSyn = [];
@@ -1280,22 +1490,18 @@ function reconcileConfirmableDuplicateStepCalls(callsObj) {
   // Rule A: 同 (source, cascadeId) 下显式包含相同 stepIndex 且模型兼容的真实 responseId 记录
   for (const sItem of synItems) {
     const { synKey, syn, synSrc, synCid, synStep } = sItem;
-    const cands = realItems.filter(({ realKey, real }) => {
+    const indexedA = ruleAIndex.get(`${synSrc}\0${synCid}\0${synStep}`);
+    const cands = indexedA ? indexedA.filter(({ realKey, real }) => {
       if (usedRealKeys.has(realKey) || !callsObj[realKey]) return false;
-      if ((real.source || 'desktop') !== synSrc) return false;
-      if (String(real.cascadeId || '').toLowerCase() !== synCid) return false;
-      if (!extractCallStepNumbers(real, realKey).includes(synStep)) return false;
       return areModelsCompatible(real.model, syn.model);
-    });
+    }) : [];
 
     let matchedRealKey = null;
     if (cands.length === 1) {
-      // 单候选必须满足充分证据（精确用量一致 / 任一为流式或估算或 0 用量 / 任一缺失模型），证据不足时保留合成记录
       if (isConfirmableSingleStepMatch(cands[0].real, syn)) {
         matchedRealKey = cands[0].realKey;
       }
     } else if (cands.length > 1) {
-      // 多条真实调用位于同一步骤：仅当恰好 1 条非零精确用量完全一致时才确认归并，否则保留合成记录
       const uSyn = getCallTokenBreakdown(syn);
       if (uSyn.inp + uSyn.cap + uSyn.out > 0) {
         const exactCands = cands.filter(({ real }) => {
@@ -1334,15 +1540,11 @@ function reconcileConfirmableDuplicateStepCalls(callsObj) {
       if (synGroup.length !== 1) continue;
       const { synKey, syn, synSrc, synCid, synStep } = synGroup[0];
       const uSyn = getCallTokenBreakdown(syn);
-      const cands = realItems.filter(({ realKey, real }) => {
+      const indexedB = ruleBIndex.get(`${synSrc}\0${synCid}\0${uSyn.inp}:${uSyn.cap}:${uSyn.out}`);
+      const cands = indexedB ? indexedB.filter(({ realKey, real }) => {
         if (usedRealKeys.has(realKey) || !callsObj[realKey]) return false;
-        if ((real.source || 'desktop') !== synSrc) return false;
-        if (String(real.cascadeId || '').toLowerCase() !== synCid) return false;
-        if (extractCallStepNumbers(real, realKey).length > 0) return false;
-        const uReal = getCallTokenBreakdown(real);
-        if (uReal.inp !== uSyn.inp || uReal.cap !== uSyn.cap || uReal.out !== uSyn.out) return false;
         return areModelsCompatible(real.model, syn.model);
-      });
+      }) : [];
 
       if (cands.length === 1) {
         const matchedRealKey = cands[0].realKey;
@@ -1357,149 +1559,1204 @@ function reconcileConfirmableDuplicateStepCalls(callsObj) {
   return reconciled;
 }
 
+const SCOPE_KEY_REGEX = /^acct_[0-9a-f]{16}$/i;
+
+function isValidAccountScopeKey(val) {
+  return typeof val === 'string' && SCOPE_KEY_REGEX.test(val.trim());
+}
+
+function getAccountAttributionRank(conf) {
+  switch (String(conf || '')) {
+    case 'explicit_account_email':
+    case 'keepalive_bound':
+      return 4;
+    case 'session_window_verified':
+      return 3;
+    case 'repaired_session_window':
+    case 'live_confirmed_account':
+      return 2;
+    case 'unattributed':
+    default:
+      return 0;
+  }
+}
+
+function parseTimestampToMs(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    return raw < 1e11 ? Math.round(raw * 1000) : Math.round(raw);
+  }
+  const str = String(raw).trim();
+  if (!str) return null;
+  // 纯日期 YYYY-MM-DD 缺少精确时刻，不得视为请求精确时间窗边界
+  if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+  if (/^\d+(\.\d+)?$/.test(str)) {
+    const num = Number(str);
+    if (!Number.isFinite(num) || num <= 0) return null;
+    return num < 1e11 ? Math.round(num * 1000) : Math.round(num);
+  }
+  const parsed = Date.parse(str);
+  return (Number.isFinite(parsed) && parsed > 0) ? parsed : null;
+}
+
+function extractCallTimeBoundsMs(call) {
+  if (!call || typeof call !== 'object') return { startMs: null, endMs: null };
+  // 临时轮询时间戳 (dateIsProvisional / dateSource === 'provisional') 是点开旧会话时填入的浏览时刻 Date.now()，绝不可当作请求真实发生时间
+  const isProvisional = Boolean(call.dateIsProvisional || call.dateSource === 'provisional');
+  const allowRawTimestamp = !isProvisional;
+  const liveObsMs = call.liveRealtimeConfirmed === true ? parseTimestampToMs(call.liveObservedAtMs) : null;
+  const startCand = parseTimestampToMs(call.requestStartMs)
+    ?? parseTimestampToMs(call.startTimeMs)
+    ?? parseTimestampToMs(call.startTime)
+    ?? parseTimestampToMs(call.startedAt)
+    ?? parseTimestampToMs(call.created_at)
+    ?? parseTimestampToMs(call.createdAt)
+    ?? (allowRawTimestamp ? parseTimestampToMs(call.timestamp) : null)
+    ?? liveObsMs;
+  const endCand = parseTimestampToMs(call.requestEndMs)
+    ?? parseTimestampToMs(call.endTimeMs)
+    ?? parseTimestampToMs(call.endTime)
+    ?? parseTimestampToMs(call.completedAt)
+    ?? (allowRawTimestamp ? parseTimestampToMs(call.timestamp) : null)
+    ?? parseTimestampToMs(call.created_at)
+    ?? liveObsMs
+    ?? startCand;
+  if (startCand == null && endCand == null) return { startMs: null, endMs: null };
+  const s = startCand ?? endCand;
+  const e = endCand ?? startCand;
+  return { startMs: Math.min(s, e), endMs: Math.max(s, e) };
+}
+
+function mergeAccountAttributionFields(baseEntry = {}, incomingEntry = {}) {
+  const bScope = isValidAccountScopeKey(baseEntry.accountScopeKey) && baseEntry.accountAttributionConfidence !== 'unattributed'
+    ? baseEntry.accountScopeKey.trim()
+    : null;
+  const iScope = isValidAccountScopeKey(incomingEntry.accountScopeKey) && incomingEntry.accountAttributionConfidence !== 'unattributed'
+    ? incomingEntry.accountScopeKey.trim()
+    : null;
+  const bRank = bScope ? Math.max(1, getAccountAttributionRank(baseEntry.accountAttributionConfidence)) : 0;
+  const iRank = iScope ? Math.max(1, getAccountAttributionRank(incomingEntry.accountAttributionConfidence)) : 0;
+
+  if (bScope && iScope) {
+    if (bScope === iScope) {
+      const winner = iRank >= bRank ? incomingEntry : baseEntry;
+      return {
+        accountScopeKey: bScope,
+        accountAttributionConfidence: winner.accountAttributionConfidence || baseEntry.accountAttributionConfidence || incomingEntry.accountAttributionConfidence || 'live_confirmed_account',
+        accountAttributionEvidence: winner.accountAttributionEvidence || baseEntry.accountAttributionEvidence || incomingEntry.accountAttributionEvidence || null,
+        unattributedReason: null
+      };
+    }
+    if (iRank > bRank) {
+      return {
+        accountScopeKey: iScope,
+        accountAttributionConfidence: incomingEntry.accountAttributionConfidence,
+        accountAttributionEvidence: incomingEntry.accountAttributionEvidence || null,
+        unattributedReason: null
+      };
+    }
+    if (bRank > iRank) {
+      return {
+        accountScopeKey: bScope,
+        accountAttributionConfidence: baseEntry.accountAttributionConfidence,
+        accountAttributionEvidence: baseEntry.accountAttributionEvidence || null,
+        unattributedReason: null
+      };
+    }
+    // 同一置信度指向不同账号时拒绝猜测，降级未归属冲突
+    return {
+      accountScopeKey: null,
+      accountAttributionConfidence: 'unattributed',
+      accountAttributionEvidence: null,
+      unattributedReason: 'account_conflict'
+    };
+  }
+
+  if (bScope && !iScope) {
+    const baseIsHardBound = baseEntry.accountAttributionConfidence === 'explicit_account_email'
+      || baseEntry.accountAttributionConfidence === 'keepalive_bound';
+    if (!baseIsHardBound && incomingEntry.forceUnattributed && incomingEntry.unattributedReason) {
+      return {
+        accountScopeKey: null,
+        accountAttributionConfidence: 'unattributed',
+        accountAttributionEvidence: null,
+        unattributedReason: incomingEntry.unattributedReason
+      };
+    }
+    return {
+      accountScopeKey: bScope,
+      accountAttributionConfidence: baseEntry.accountAttributionConfidence || 'live_confirmed_account',
+      accountAttributionEvidence: baseEntry.accountAttributionEvidence || null,
+      unattributedReason: null
+    };
+  }
+
+  if (!bScope && iScope) {
+    return {
+      accountScopeKey: iScope,
+      accountAttributionConfidence: incomingEntry.accountAttributionConfidence || 'live_confirmed_account',
+      accountAttributionEvidence: incomingEntry.accountAttributionEvidence || null,
+      unattributedReason: null
+    };
+  }
+
+  return {
+    accountScopeKey: null,
+    accountAttributionConfidence: 'unattributed',
+    accountAttributionEvidence: incomingEntry.accountAttributionEvidence || baseEntry.accountAttributionEvidence || null,
+    unattributedReason: incomingEntry.unattributedReason || baseEntry.unattributedReason || null
+  };
+}
+
+function matchTimestampAgainstSessions(startMs, endMs, source, accountSessions = [], matchOpts = {}) {
+  const normSource = String(source || 'desktop').toLowerCase();
+  if (normSource === 'ide') {
+    return { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'unverified_source_ide' };
+  }
+  if (!Number.isFinite(startMs) || startMs <= 0) {
+    return { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'missing_request_timestamp' };
+  }
+  const rStart = Math.min(startMs, Number.isFinite(endMs) ? endMs : startMs);
+  const rEnd = Math.max(startMs, Number.isFinite(endMs) ? endMs : startMs);
+  const sessions = Array.isArray(accountSessions)
+    ? accountSessions.filter(s => s && s.email && Number.isFinite(Number(s.startAtMs)))
+    : [];
+  if (!sessions.length) {
+    return { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'before_account_tracking' };
+  }
+
+  const openVerifiedMs = Number.isFinite(Number(matchOpts.openSessionVerifiedUntilMs))
+    ? Number(matchOpts.openSessionVerifiedUntilMs)
+    : 0;
+  const openEmailNorm = typeof matchOpts.openSessionEmail === 'string'
+    ? matchOpts.openSessionEmail.trim().toLowerCase()
+    : '';
+
+  const getSessionWinEnd = (s) => {
+    const sStart = Number(s.startAtMs);
+    const sLast = Number.isFinite(Number(s.lastVerifiedAtMs)) ? Number(s.lastVerifiedAtMs) : sStart;
+    if (s.endAtMs != null) return Number(s.endAtMs) + 5000;
+    const isMatchedOpen = openVerifiedMs > 0 && (!openEmailNorm || String(s.email).trim().toLowerCase() === openEmailNorm);
+    const effLast = isMatchedOpen ? Math.max(sLast, sStart, openVerifiedMs) : Math.max(sLast, sStart);
+    return effLast + 180000;
+  };
+
+  let earliestStart = Infinity;
+  const matching = [];
+  for (const s of sessions) {
+    const sStart = Number(s.startAtMs);
+    if (sStart < earliestStart) earliestStart = sStart;
+    const winStart = sStart - 5000;
+    const winEnd = getSessionWinEnd(s);
+    if (rStart >= winStart && rEnd <= winEnd) {
+      matching.push(s);
+    }
+  }
+  if (matching.length > 0) {
+    const distinct = new Set(matching.map(m => String(m.email).trim().toLowerCase()));
+    if (distinct.size === 1) {
+      const m = matching[0];
+      return {
+        accountScopeKey: isValidAccountScopeKey(m.accountScopeKey) ? m.accountScopeKey.trim() : buildAccountScopeKey(m.email),
+        confidence: 'session_window_verified',
+        evidence: m.evidence || 'host_user_status_window'
+      };
+    }
+    return { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'cross_switch_boundary' };
+  }
+  const touched = sessions.filter(s => {
+    const sStart = Number(s.startAtMs);
+    const winStart = sStart - 5000;
+    const winEnd = getSessionWinEnd(s);
+    return rEnd >= winStart && rStart <= winEnd;
+  });
+  if (touched.length > 0) {
+    return { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'cross_switch_boundary' };
+  }
+  if (rEnd < earliestStart - 5000) {
+    return { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'before_account_tracking' };
+  }
+  return { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'outside_verified_window' };
+}
+
+function resolveCallAccountAttribution(call, options = {}, existing = null) {
+  if (call.accountAttributionConfidence === 'unattributed' && !call.accountEmail) {
+    return {
+      accountScopeKey: null,
+      accountAttributionConfidence: 'unattributed',
+      unattributedReason: call.unattributedReason || 'explicit_unattributed',
+      forceUnattributed: Boolean(call.forceUnattributed)
+    };
+  }
+  const explicitEmail = (typeof call.accountEmail === 'string' && call.accountEmail.includes('@'))
+    ? call.accountEmail.trim().toLowerCase()
+    : '';
+  const explicitScope = isValidAccountScopeKey(call.accountScopeKey) ? call.accountScopeKey.trim() : null;
+  const isHardBound = Boolean(explicitEmail || (explicitScope && (call.isKeepalive || call.accountAttributionConfidence === 'explicit_account_email' || call.accountAttributionConfidence === 'keepalive_bound')));
+  if (isHardBound || (explicitScope && !Array.isArray(options.accountSessions))) {
+    return {
+      accountScopeKey: explicitScope || buildAccountScopeKey(explicitEmail),
+      accountAttributionConfidence: call.accountAttributionConfidence || (call.isKeepalive ? 'keepalive_bound' : 'explicit_account_email'),
+      accountAttributionEvidence: call.accountAttributionEvidence || (explicitEmail ? 'call_account_email' : 'call_account_scope_key'),
+      unattributedReason: null
+    };
+  }
+
+  const callSource = String(call.source || existing?.source || 'desktop').toLowerCase();
+  if (Array.isArray(options.accountSessions)) {
+    if (callSource === 'ide') {
+      return {
+        accountScopeKey: null,
+        accountAttributionConfidence: 'unattributed',
+        unattributedReason: 'unverified_source_ide',
+        forceUnattributed: true
+      };
+    }
+    // 优先采用非临时的权威请求时间戳（若入参为点开旧会话产生的 provisional 浏览记录，必须使用账本已有 existing 的权威时间）
+    const callBounds = extractCallTimeBoundsMs(call);
+    const existBounds = existing ? extractCallTimeBoundsMs(existing) : { startMs: null, endMs: null };
+    const authBounds = callBounds.startMs != null ? callBounds : existBounds;
+    const hasExactTs = authBounds.startMs != null;
+
+    if (hasExactTs && options.accountSessions.length > 0) {
+      const liveAcct = options.liveConfirmedAccount;
+      const m = matchTimestampAgainstSessions(authBounds.startMs, authBounds.endMs, callSource, options.accountSessions, {
+        openSessionEmail: liveAcct?.email || null,
+        openSessionVerifiedUntilMs: liveAcct?.verifiedAtMs || null
+      });
+      if (m.accountScopeKey) {
+        return {
+          accountScopeKey: m.accountScopeKey,
+          accountAttributionConfidence: m.confidence,
+          accountAttributionEvidence: m.evidence || 'host_user_status_window',
+          unattributedReason: null
+        };
+      }
+      return {
+        accountScopeKey: null,
+        accountAttributionConfidence: 'unattributed',
+        unattributedReason: m.unattributedReason || 'outside_verified_window',
+        forceUnattributed: true
+      };
+    }
+
+    if (hasExactTs && options.accountSessions.length === 0) {
+      return {
+        accountScopeKey: null,
+        accountAttributionConfidence: 'unattributed',
+        unattributedReason: 'before_account_tracking',
+        forceUnattributed: true
+      };
+    }
+
+    // 尚无 transcript 精确时间时：仅对前端明确确认为“会话水合后实时新产生/流式刚结束”的本机请求归入当前已验证活跃账号；
+    // 点开历史旧会话首次水合出来的旧步骤严禁按当前登录账号猜测归属！
+    const liveAcct = options.liveConfirmedAccount;
+    const isOfflineScan = Boolean(options.trustTranscriptDate || call.fromTranscriptScan);
+    if (!hasExactTs && !isOfflineScan && call.liveRealtimeConfirmed === true && callSource === 'desktop' && liveAcct && typeof liveAcct.email === 'string' && liveAcct.email.includes('@')) {
+      const nowMs = Date.now();
+      const verifiedAt = Number(liveAcct.verifiedAtMs) || nowMs;
+      if (nowMs <= verifiedAt + 180000) {
+        return {
+          accountScopeKey: buildAccountScopeKey(liveAcct.email),
+          accountAttributionConfidence: 'live_confirmed_account',
+          accountAttributionEvidence: 'live_ipc_confirmed_account',
+          unattributedReason: null
+        };
+      }
+    }
+
+    // 若既无精确时间也非实时确认新请求，保持现有有效归属或暂列未归属（等待 transcript 权威时间落盘裁决）
+    if (existing && isValidAccountScopeKey(existing.accountScopeKey) && existing.accountAttributionConfidence !== 'unattributed') {
+      return {
+        accountScopeKey: existing.accountScopeKey.trim(),
+        accountAttributionConfidence: existing.accountAttributionConfidence,
+        accountAttributionEvidence: existing.accountAttributionEvidence || null,
+        unattributedReason: null
+      };
+    }
+
+    return {
+      accountScopeKey: null,
+      accountAttributionConfidence: 'unattributed',
+      unattributedReason: 'pending_authoritative_timestamp'
+    };
+  }
+
+  // 未提供 accountSessions 时：历史离线扫描严禁按当前账号强行归属；保留测试或明确传参兼容性
+  if (options.trustTranscriptDate || call.fromTranscriptScan) {
+    return {
+      accountScopeKey: null,
+      accountAttributionConfidence: 'unattributed',
+      unattributedReason: 'history_scan_without_sessions'
+    };
+  }
+
+  const fallbackEmail = (typeof options.confirmedAccountEmail === 'string' && options.confirmedAccountEmail.includes('@'))
+    ? options.confirmedAccountEmail.trim().toLowerCase()
+    : '';
+  const fallbackScope = fallbackEmail
+    ? buildAccountScopeKey(fallbackEmail)
+    : (isValidAccountScopeKey(options.accountScopeKey) ? options.accountScopeKey.trim() : null);
+
+  if (fallbackScope) {
+    return {
+      accountScopeKey: fallbackScope,
+      accountAttributionConfidence: options.accountAttributionConfidence || 'live_confirmed_account',
+      accountAttributionEvidence: options.accountAttributionEvidence || 'confirmed_account_email_option',
+      unattributedReason: null
+    };
+  }
+
+  return {
+    accountScopeKey: null,
+    accountAttributionConfidence: 'unattributed',
+    unattributedReason: 'missing_account_context'
+  };
+}
+
 function recordModelCalls(newCalls = [], options = {}) {
   if (!Array.isArray(newCalls) || !newCalls.length) return createRecordResult(true, false);
   const targetDir = typeof options === 'string' ? options : (options.ledgerPath || options.agDir);
   const fsOpt = (options && typeof options === 'object' && options.fs) ? { fs: options.fs } : undefined;
-  const ledger = loadPricingLedger(targetDir, fsOpt);
+  const resolvedLedgerPath = path.resolve(getPricingLedgerPath(targetDir));
 
-  if (ledger.__corrupted || ledger.__unreadable) {
-    const prefix = ledger.__corrupted
-      ? '账本已损坏，阻止空覆盖'
-      : `账本当前不可读 (${ledger.__error || 'I/O 异常'})，阻止覆盖`;
-    return createRecordResult(
-      false,
-      false,
-      `${prefix} (${ledger.__corruptedPath})`,
-      ledger.__guardPhase || (ledger.__corrupted ? 'corrupted_guard' : 'unreadable_guard'),
-      ledger.__code
-    );
-  }
+  const executeLocked = () => {
+    // 持锁期间强制失效内存缓存，确保跨进程场景读到前一进程刚落盘的最新账本状态
+    if (!fsOpt) {
+      ledgerCacheByPath.delete(normalizeLedgerKey(resolvedLedgerPath));
+    }
+    const ledger = loadPricingLedger(targetDir, fsOpt);
 
-  // 第一阶段：每条传入记录仅按自身 targetKey 入表或同键合并，避免逐条贪心跨键绑定引发输入顺序依赖
-  const beforeCalls = ledger.calls || {};
-  const draftCalls = { ...beforeCalls };
+    if (ledger.__corrupted || ledger.__unreadable) {
+      const prefix = ledger.__corrupted
+        ? '账本已损坏，阻止空覆盖'
+        : `账本当前不可读 (${ledger.__error || 'I/O 异常'})，阻止覆盖`;
+      return createRecordResult(
+        false,
+        false,
+        `${prefix} (${ledger.__corruptedPath})`,
+        ledger.__guardPhase || (ledger.__corrupted ? 'corrupted_guard' : 'unreadable_guard'),
+        ledger.__code
+      );
+    }
 
-  for (const call of newCalls) {
-    if (!call || !call.callId) continue;
-    // 默认阻止测试样例和合成调用污染生产账本
-    if (!options.allowSynthetic && isSyntheticCall(call.callId, call)) continue;
+    // 第一阶段：每条传入记录仅按自身 targetKey 入表或同键合并，避免逐条贪心跨键绑定引发输入顺序依赖
+    const beforeCalls = ledger.calls || {};
+    const draftCalls = { ...beforeCalls };
 
-    const targetKey = String(call.callId);
-    const incomingFallback = parseStepFallbackKey(targetKey, call.cascadeId);
-    const callCidRaw = call.cascadeId || incomingFallback?.cascadeId;
-    const existing = draftCalls[targetKey];
+    for (const call of newCalls) {
+      if (!call || !call.callId) continue;
+      // 默认阻止测试样例和合成调用污染生产账本
+      if (!options.allowSynthetic && isSyntheticCall(call.callId, call)) continue;
 
-    if (!existing) {
-      const normalizedStep = extractCallStepNumbers(call, targetKey)[0] ?? null;
-      const uInc = getCallTokenBreakdown(call);
-      const dInfo = extractNormalizedDateInfo(call);
-      const incRev = extractSourceRevision(call);
-      const nextEntry = {
+      const targetKey = String(call.callId);
+      const incomingFallback = parseStepFallbackKey(targetKey, call.cascadeId);
+      const callCidRaw = call.cascadeId || incomingFallback?.cascadeId;
+      const existing = draftCalls[targetKey];
+
+      // 严格账号归属：结合会话活跃时间窗或显式已核实账号，绝不把离线扫描旧记录或跨号边界错记到当前账号
+      const attrRes = resolveCallAccountAttribution(call, options, existing);
+      const resolvedScopeKey = attrRes.accountScopeKey;
+      const resolvedAttrConf = attrRes.accountAttributionConfidence;
+      const resolvedAttrEvidence = attrRes.accountAttributionEvidence || null;
+      const resolvedUnattrReason = attrRes.unattributedReason || null;
+      const callWithAttr = {
         ...call,
-        callId: targetKey,
-        ...(callCidRaw && !call.cascadeId ? { cascadeId: callCidRaw } : {}),
-        ...(normalizedStep !== null && call.stepIndex == null ? { stepIndex: normalizedStep } : {}),
-        ...(call.totalTokens == null && uInc.tot > 0 ? { totalTokens: uInc.tot } : {}),
-        ...(dInfo.date ? { date: dInfo.date } : {}),
-        ...(dInfo.created_at ? { created_at: dInfo.created_at } : (dInfo.dateIsProvisional ? { created_at: null } : {})),
-        ...(dInfo.dateSource ? { dateSource: dInfo.dateSource } : {}),
-        dateIsProvisional: Boolean(dInfo.dateIsProvisional),
-        ...(incRev !== null ? { sourceRevision: incRev } : {}),
-        updatedAt: Date.now()
+        ...(resolvedScopeKey ? { accountScopeKey: resolvedScopeKey } : {}),
+        accountAttributionConfidence: resolvedAttrConf,
+        ...(resolvedAttrEvidence ? { accountAttributionEvidence: resolvedAttrEvidence } : {}),
+        ...(resolvedUnattrReason ? { unattributedReason: resolvedUnattrReason } : {}),
+        ...(attrRes.forceUnattributed ? { forceUnattributed: true } : {})
       };
-      if (incRev === null) {
-        delete nextEntry.sourceRevision;
+      if (!resolvedScopeKey) {
+        delete callWithAttr.accountScopeKey;
       }
-      if (dInfo.date && dInfo.date !== call.date) {
-        const recalc = calculateRequestApiCost(nextEntry);
-        if (recalc.isPriced) {
-          nextEntry.modelKey = recalc.modelKey;
-          nextEntry.isPriced = true;
-          nextEntry.costUSD = recalc.costUSD ?? 0;
+
+      if (!existing) {
+        const normalizedStep = extractCallStepNumbers(callWithAttr, targetKey)[0] ?? null;
+        const uInc = getCallTokenBreakdown(callWithAttr);
+        const dInfo = extractNormalizedDateInfo(callWithAttr);
+        const incRev = extractSourceRevision(callWithAttr);
+        const nextEntry = {
+          ...callWithAttr,
+          callId: targetKey,
+          ...(resolvedScopeKey ? { accountScopeKey: resolvedScopeKey } : {}),
+          accountAttributionConfidence: resolvedAttrConf,
+          ...(resolvedAttrEvidence ? { accountAttributionEvidence: resolvedAttrEvidence } : {}),
+          ...(resolvedUnattrReason ? { unattributedReason: resolvedUnattrReason } : {}),
+          ...(call.isKeepalive ? { isKeepalive: true } : {}),
+          ...(callCidRaw && !call.cascadeId ? { cascadeId: callCidRaw } : {}),
+          ...(normalizedStep !== null && call.stepIndex == null ? { stepIndex: normalizedStep } : {}),
+          ...(call.totalTokens == null && uInc.tot > 0 ? { totalTokens: uInc.tot } : {}),
+          ...(dInfo.date ? { date: dInfo.date } : {}),
+          ...(dInfo.created_at ? { created_at: dInfo.created_at } : (dInfo.dateIsProvisional ? { created_at: null } : {})),
+          ...(dInfo.dateSource ? { dateSource: dInfo.dateSource } : {}),
+          dateIsProvisional: Boolean(dInfo.dateIsProvisional),
+          ...(incRev !== null ? { sourceRevision: incRev } : {}),
+          updatedAt: Date.now()
+        };
+        if (incRev === null) {
+          delete nextEntry.sourceRevision;
+        }
+        if (dInfo.date && dInfo.date !== call.date) {
+          const recalc = calculateRequestApiCost(nextEntry);
+          if (recalc.isPriced) {
+            nextEntry.modelKey = recalc.modelKey;
+            nextEntry.isPriced = true;
+            nextEntry.costUSD = recalc.costUSD ?? 0;
+          }
+        }
+        draftCalls[targetKey] = nextEntry;
+        continue;
+      }
+
+      const uExist = getCallTokenBreakdown(existing);
+      const uCall = getCallTokenBreakdown(call);
+      const usageCmp = compareCallUsage(uCall, uExist);
+      const existRev = extractSourceRevision(existing);
+      const callRev = extractSourceRevision(call);
+      const revCmp = compareSourceRevision(callRev, existRev);
+      const incomingIsStaleStatus = existing.status === 'final' && Boolean(call.status) && call.status !== 'final';
+      const isUsageRollback = incomingIsStaleStatus || (existing.status === 'final' && usageCmp < 0);
+      const existDateInfo = extractNormalizedDateInfo(existing);
+      const callDateInfo = extractNormalizedDateInfo(call);
+      const trustIncomingTranscriptDate = Boolean(options.trustTranscriptDate && callDateInfo.dateSource === 'transcript');
+      const adoptIncomingSameRankDate = callDateInfo.rank >= 2 &&
+        callDateInfo.rank === existDateInfo.rank &&
+        shouldAdoptSameRankAuthDate(existing, call, existDateInfo, callDateInfo, usageCmp, revCmp, trustIncomingTranscriptDate);
+      const sameRankAuthDateProgressed = adoptIncomingSameRankDate && (
+        callDateInfo.date !== existDateInfo.date ||
+        (callDateInfo.rank >= 3 && Boolean(callDateInfo.created_at) && callDateInfo.created_at !== existDateInfo.created_at)
+      );
+      const dateProgressed = (
+        callDateInfo.rank > existDateInfo.rank ||
+        sameRankAuthDateProgressed ||
+        (existing.date && existDateInfo.date && existing.date !== existDateInfo.date)
+      ) && Boolean(callDateInfo.date || existDateInfo.date);
+      const stateProgressed = existing.status !== 'final' && call.status === 'final';
+      const usageProgressed = !incomingIsStaleStatus && usageCmp > 0;
+      const revisionUsageProgressed = !isUsageRollback && usageCmp === 0 && revCmp > 0 && (
+        uCall.inp !== uExist.inp || uCall.cap !== uExist.cap || uCall.think !== uExist.think
+      );
+      const revisionMetaProgressed = !isUsageRollback && revCmp > 0 && callRev !== existRev;
+      const modelProgressed = getCollectorModelRank(call.model) > getCollectorModelRank(existing.model);
+      const speedProgressed = !hasSpeedMetrics(existing) && hasSpeedMetrics(call) && isValidSpeedSample(call);
+      const modelExactProgressed = !existing.modelExactId && Boolean(call.modelExactId);
+      const recalcExist = calculateRequestApiCost(existing);
+      const costOutOfSync = Boolean(recalcExist.isPriced) !== Boolean(existing.isPriced)
+        || (recalcExist.isPriced && Number(existing.costUSD || 0) !== Number(recalcExist.costUSD || 0));
+      const pricingProgressed = costOutOfSync || ((!existing.isPriced || !existing.costUSD) && Boolean((call.isPriced && call.costUSD > 0) || normalizeModelId(call.model || existing.model)));
+      const resolvedStepIndex = existing.stepIndex ?? call.stepIndex ?? extractCallStepNumbers(existing, targetKey)[0] ?? extractCallStepNumbers(call, targetKey)[0] ?? null;
+      const existScopeClean = isValidAccountScopeKey(existing.accountScopeKey) && existing.accountAttributionConfidence !== 'unattributed'
+        ? existing.accountScopeKey.trim()
+        : null;
+      const existRank = existScopeClean ? Math.max(1, getAccountAttributionRank(existing.accountAttributionConfidence)) : 0;
+      const incRank = resolvedScopeKey ? Math.max(1, getAccountAttributionRank(resolvedAttrConf)) : 0;
+      const existBaseHardBound = existing.accountAttributionConfidence === 'explicit_account_email'
+        || existing.accountAttributionConfidence === 'keepalive_bound';
+      const attributionProgressed = Boolean(
+        (!existScopeClean && resolvedScopeKey)
+        || (existScopeClean && resolvedScopeKey && existScopeClean === resolvedScopeKey && incRank > existRank)
+        || (existScopeClean && resolvedScopeKey && existScopeClean !== resolvedScopeKey && incRank >= existRank)
+        || (existScopeClean && !resolvedScopeKey && attrRes.forceUnattributed && !existBaseHardBound)
+        || (!existScopeClean && !existing.unattributedReason && resolvedUnattrReason)
+      );
+      const metaProgressed = (existing.stepIndex == null && resolvedStepIndex != null) || (!existing.cascadeId && Boolean(callCidRaw)) || modelExactProgressed || attributionProgressed;
+
+      if (modelProgressed || metaProgressed || dateProgressed || (!isUsageRollback && (stateProgressed || usageProgressed || revisionUsageProgressed || revisionMetaProgressed || pricingProgressed || speedProgressed))) {
+        draftCalls[targetKey] = mergeSameCallRecords(
+          existing,
+          callWithAttr,
+          targetKey,
+          resolvedStepIndex,
+          !isUsageRollback && revCmp >= 0,
+          adoptIncomingSameRankDate
+        );
+      }
+    }
+
+    // 第二阶段：在完整候选集（既有记录 + 整批新入账记录）上统一执行无顺序依赖的充分证据跨键消解
+    reconcileConfirmableDuplicateStepCalls(draftCalls);
+    pruneExcessSpeedSamples(draftCalls);
+
+    const changed = Boolean(ledger.__hadDuplicateStepKeys) || hasCallsMapChanged(beforeCalls, draftCalls);
+
+    if (changed) {
+      const draftLedger = {
+        ...ledger,
+        calls: draftCalls,
+        updatedAt: new Date().toISOString()
+      };
+      const saveRes = savePricingLedger(draftLedger, targetDir, fsOpt);
+      if (!saveRes.ok) {
+        return createRecordResult(false, false, saveRes.error || '保存账本落盘失败', saveRes.phase, saveRes.code);
+      }
+      // 同步落盘物理隔离的分账号账本目录（account_ledgers/<accountScopeKey>.json 与 unattributed.json）
+      if (!fsOpt || typeof fsOpt.fs?.writeFileSync === 'function') {
+        try {
+          syncAccountLedgerPartitions(resolvedLedgerPath, draftCalls, fsOpt?.fs || fs);
+        } catch { }
+      }
+      // 账本变化时失效聚合热缓存（含按 agDir 隔离作用域的扫描缓存）
+      cachedTokenHistoryAt = 0;
+    }
+
+    return createRecordResult(true, changed);
+  };
+
+  if (fsOpt) {
+    return executeLocked();
+  }
+  return withFileLockSync(resolvedLedgerPath, executeLocked);
+}
+
+/**
+ * 将账本 calls 按 accountScopeKey 严格拆分为独立账号分片与 unattributed.json
+ * 不同账号数据绝不互相混合，未归属历史单独隔离。
+ */
+function syncAccountLedgerPartitions(resolvedLedgerPath, callsMap = {}, fsImpl = fs) {
+  const partDir = path.join(path.dirname(resolvedLedgerPath), 'account_ledgers');
+  if (!fsImpl.existsSync(partDir)) {
+    fsImpl.mkdirSync(partDir, { recursive: true });
+  }
+  const buckets = new Map();
+  buckets.set('unattributed', {});
+  for (const [callId, rec] of Object.entries(callsMap || {})) {
+    if (!rec || typeof rec !== 'object') continue;
+    const rawKey = (typeof rec.accountScopeKey === 'string' && /^acct_[0-9a-f]{16}$/i.test(rec.accountScopeKey.trim()))
+      ? rec.accountScopeKey.trim()
+      : 'unattributed';
+    if (!buckets.has(rawKey)) buckets.set(rawKey, {});
+    buckets.get(rawKey)[callId] = rec;
+  }
+  const nowIso = new Date().toISOString();
+  for (const [scopeKey, partCalls] of buckets.entries()) {
+    const targetFile = path.join(partDir, `${scopeKey}.json`);
+    const payload = JSON.stringify({
+      version: 1,
+      accountScopeKey: scopeKey,
+      updatedAt: nowIso,
+      callCount: Object.keys(partCalls).length,
+      calls: partCalls
+    });
+    const tmp = `${targetFile}.${process.pid}.tmp`;
+    fsImpl.writeFileSync(tmp, payload, 'utf8');
+    fsImpl.renameSync(tmp, targetFile);
+  }
+  // 清理纠偏后已不再包含任何归属记录的陈旧 acct_*.json 分片文件，保证分片目录与主账本 100% 一致
+  if (typeof fsImpl.readdirSync === 'function' && typeof fsImpl.unlinkSync === 'function') {
+    try {
+      for (const fName of fsImpl.readdirSync(partDir)) {
+        if (!/^acct_[0-9a-f]{16}\.json$/i.test(fName)) continue;
+        const sk = fName.slice(0, -5);
+        if (!buckets.has(sk)) {
+          fsImpl.unlinkSync(path.join(partDir, fName));
         }
       }
-      draftCalls[targetKey] = nextEntry;
+    } catch { }
+  }
+}
+
+function accumulateDayBucket(map, dKey, u, tot, steps = 1) {
+  if (!dKey) return;
+  if (!map[dKey]) {
+    map[dKey] = { input: 0, cache: 0, output: 0, total: 0, steps: 0 };
+  }
+  map[dKey].input += u.inp;
+  map[dKey].cache += u.cap;
+  map[dKey].output += u.out;
+  map[dKey].total += tot;
+  map[dKey].steps += steps;
+}
+
+function accumulateModelDayBucket(srcMap, dKey, vKey, u, tot, steps = 1) {
+  if (!dKey || !vKey) return;
+  if (!srcMap[dKey]) srcMap[dKey] = {};
+  if (!srcMap[dKey][vKey]) {
+    srcMap[dKey][vKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+  }
+  srcMap[dKey][vKey].total += tot;
+  srcMap[dKey][vKey].input += u.inp;
+  srcMap[dKey][vKey].output += u.out;
+  srcMap[dKey][vKey].cache += u.cap;
+  srcMap[dKey][vKey].steps += steps;
+}
+
+function buildRefCostBundle(inp, outp, cap, tot, mInp, mOutp, mCap, mTot, costAll, costMonth) {
+  return {
+    all: calculateReferenceModelCost({ inputTokens: inp, outputTokens: outp, cacheTokens: cap, totalTokens: tot }, 'gemini-3.8-flash', { pricingDate: '2026-11-08', mode: 'all' }),
+    currentMonth: calculateReferenceModelCost({ inputTokens: mInp, outputTokens: mOutp, cacheTokens: mCap, totalTokens: mTot }, 'gemini-3.8-flash', { pricingDate: '2026-11-08', mode: 'all' }),
+    hybrid: calculateReferenceModelCost({ inputTokens: inp, outputTokens: outp, cacheTokens: cap, totalTokens: tot }, 'gemini-3.8-flash', {
+      pricingDate: '2026-11-09',
+      mode: 'unpriced_only',
+      knownUsage: { byCategory: costAll?.byCategory, costUSD: costAll?.pricedCostUSD || 0 }
+    }),
+    currentMonthHybrid: calculateReferenceModelCost({ inputTokens: mInp, outputTokens: mOutp, cacheTokens: mCap, totalTokens: mTot }, 'gemini-3.8-flash', {
+      pricingDate: '2026-11-09',
+      mode: 'unpriced_only',
+      knownUsage: { byCategory: costMonth?.byCategory, costUSD: costMonth?.pricedCostUSD || 0 }
+    })
+  };
+}
+
+/**
+ * 构建严格的跨账号用量隔离统计：
+ * - 只有带明确 accountScopeKey 且非 unattributed 的记录计入对应账号；
+ * - 为每个账号完整生成 dailyMapBySource / dailyModelMapBySource / 费用 / 缓存 / 对话数，确保全界面任意筛选项严密同步；
+ * - 未归属记录与旧档案按照「全量 - 已归属各账号总和」精确对账并入 unattributed，绝不默认算给当前账号。
+ * - 保活请求 (isKeepalive: true) 计入对应账号同时提供独立统计 keepaliveStats。
+ */
+function buildAccountUsageBreakdown({
+  finalCallsEntries = [],
+  resolveLedgerCallDate = (k, c) => c?.date || null,
+  dailyMapAll = {},
+  mergedDesktop = {},
+  mergedCli = {},
+  mergedLegacyUnallocated = {},
+  dailyModelMapBySource = null,
+  modelMetaByKey = {},
+  compactModelConfigs = [],
+  availableModelDetails = null,
+  totalConversationsAll = 0,
+  unpricedSummaryBySource = null,
+  now = new Date()
+} = {}) {
+  const todayKey = formatLocalDateKey(now);
+  const monthPrefix = todayKey.slice(0, 7);
+  const yearPrefix = todayKey.slice(0, 4);
+
+  const ensureAcct = (scopeKey) => ({
+    accountScopeKey: scopeKey,
+    totalTokens: 0,
+    totalInputTokens: 0,
+    totalCacheTokens: 0,
+    totalOutputTokens: 0,
+    todayTokens: 0,
+    monthTokens: 0,
+    yearTokens: 0,
+    currentMonthInput: 0,
+    currentMonthCache: 0,
+    currentMonthOutput: 0,
+    callCount: 0,
+    totalSteps: 0,
+    totalConversations: 0,
+    activeDaysCount: 0,
+    firstUseDate: null,
+    keepaliveRequests: 0,
+    keepaliveTokens: 0,
+    sources: { desktop: 0, cli: 0, agent: 0, ide: 0 },
+    dailyMap: {},
+    dailyMapBySource: { all: {}, desktop: {}, cli: {}, legacyUnallocated: {} },
+    dailyModelMapBySource: { all: {}, desktop: {}, cli: {} },
+    modelMetaByKey: {},
+    _convIds: new Set(),
+    _cacheItems: [],
+    _monthCacheItems: [],
+    _calls: [],
+    _monthCalls: [],
+    _desktopCalls: [],
+    _cliCalls: []
+  });
+
+  const byAccount = {};
+  const unattributedCallsMap = new Map();
+  const attributedByDayAll = {};
+  const attributedByDayDesktop = {};
+  const attributedByDayCli = {};
+  const attributedModelByDay = { all: {}, desktop: {}, cli: {} };
+  const attributedConvIds = new Set();
+  const bucketMemo = new Map();
+
+  const resolveCallModelBucket = (callObj) => {
+    const memoKey = `${callObj.model || ''}\0${callObj.modelExactId || ''}\0${callObj.modelLabel || ''}\0${callObj.effort || ''}`;
+    let bucket = bucketMemo.get(memoKey);
+    if (!bucket) {
+      bucket = resolveModelUsageBucket(callObj, compactModelConfigs, availableModelDetails);
+      if (bucketMemo.size < 2000) bucketMemo.set(memoKey, bucket);
+    }
+    return bucket;
+  };
+
+  for (const [ledgerKey, call] of (Array.isArray(finalCallsEntries) ? finalCallsEntries : [])) {
+    if (!call || typeof call !== 'object') continue;
+    const scopeKey = (typeof call.accountScopeKey === 'string' && SCOPE_KEY_REGEX.test(call.accountScopeKey.trim()) && call.accountAttributionConfidence !== 'unattributed')
+      ? call.accountScopeKey.trim()
+      : 'unattributed';
+    const dKey = resolveLedgerCallDate(ledgerKey, call) || todayKey;
+    const u = getCallTokenBreakdown(call);
+    const tot = u.tot || (u.inp + u.cap + u.out);
+    if (tot <= 0 && !call.isKeepalive) continue;
+
+    if (scopeKey === 'unattributed') {
+      unattributedCallsMap.set(ledgerKey, { call, dKey, u, tot });
       continue;
     }
 
-    const uExist = getCallTokenBreakdown(existing);
-    const uCall = getCallTokenBreakdown(call);
-    const usageCmp = compareCallUsage(uCall, uExist);
-    const existRev = extractSourceRevision(existing);
-    const callRev = extractSourceRevision(call);
-    const revCmp = compareSourceRevision(callRev, existRev);
-    const incomingIsStaleStatus = existing.status === 'final' && Boolean(call.status) && call.status !== 'final';
-    const isUsageRollback = incomingIsStaleStatus || (existing.status === 'final' && usageCmp < 0);
-    const existDateInfo = extractNormalizedDateInfo(existing);
-    const callDateInfo = extractNormalizedDateInfo(call);
-    const trustIncomingTranscriptDate = Boolean(options.trustTranscriptDate && callDateInfo.dateSource === 'transcript');
-    const adoptIncomingSameRankDate = callDateInfo.rank >= 2 &&
-      callDateInfo.rank === existDateInfo.rank &&
-      shouldAdoptSameRankAuthDate(existing, call, existDateInfo, callDateInfo, usageCmp, revCmp, trustIncomingTranscriptDate);
-    const sameRankAuthDateProgressed = adoptIncomingSameRankDate && (
-      callDateInfo.date !== existDateInfo.date ||
-      (callDateInfo.rank >= 3 && Boolean(callDateInfo.created_at) && callDateInfo.created_at !== existDateInfo.created_at)
-    );
-    const dateProgressed = (
-      callDateInfo.rank > existDateInfo.rank ||
-      sameRankAuthDateProgressed ||
-      (existing.date && existDateInfo.date && existing.date !== existDateInfo.date)
-    ) && Boolean(callDateInfo.date || existDateInfo.date);
-    const stateProgressed = existing.status !== 'final' && call.status === 'final';
-    const usageProgressed = !incomingIsStaleStatus && usageCmp > 0;
-    const revisionUsageProgressed = !isUsageRollback && usageCmp === 0 && revCmp > 0 && (
-      uCall.inp !== uExist.inp || uCall.cap !== uExist.cap || uCall.think !== uExist.think
-    );
-    const revisionMetaProgressed = !isUsageRollback && revCmp > 0 && callRev !== existRev;
-    const modelProgressed = getCollectorModelRank(call.model) > getCollectorModelRank(existing.model);
-    const speedProgressed = !isUsageRollback && !hasSpeedMetrics(existing) && hasSpeedMetrics(call) && isValidSpeedSample(call);
-    const modelExactProgressed = !isUsageRollback && (
-      (!existing.modelExactId && Boolean(call.modelExactId)) ||
-      (!existing.modelLabel && Boolean(call.modelLabel)) ||
-      (!existing.effort && Boolean(call.effort))
-    );
-    const recalcExist = calculateRequestApiCost(existing);
-    const costOutOfSync = Boolean(recalcExist.isPriced) !== Boolean(existing.isPriced)
-      || (recalcExist.isPriced && Number(existing.costUSD || 0) !== Number(recalcExist.costUSD || 0));
-    const pricingProgressed = costOutOfSync || ((!existing.isPriced || !existing.costUSD) && Boolean((call.isPriced && call.costUSD > 0) || normalizeModelId(call.model || existing.model)));
-    const resolvedStepIndex = existing.stepIndex ?? call.stepIndex ?? extractCallStepNumbers(existing, targetKey)[0] ?? extractCallStepNumbers(call, targetKey)[0] ?? null;
-    const metaProgressed = (existing.stepIndex == null && resolvedStepIndex != null) || (!existing.cascadeId && Boolean(callCidRaw));
-
-    if (modelProgressed || metaProgressed || dateProgressed || modelExactProgressed || (!isUsageRollback && (stateProgressed || usageProgressed || revisionUsageProgressed || revisionMetaProgressed || pricingProgressed || speedProgressed))) {
-      draftCalls[targetKey] = mergeSameCallRecords(
-        existing,
-        call,
-        targetKey,
-        resolvedStepIndex,
-        !isUsageRollback && revCmp >= 0,
-        adoptIncomingSameRankDate
-      );
+    if (!byAccount[scopeKey]) byAccount[scopeKey] = ensureAcct(scopeKey);
+    const acc = byAccount[scopeKey];
+    acc.callCount += 1;
+    acc.totalSteps += 1;
+    acc.totalInputTokens += u.inp;
+    acc.totalCacheTokens += u.cap;
+    acc.totalOutputTokens += u.out;
+    acc.totalTokens += tot;
+    if (!acc.firstUseDate || dKey < acc.firstUseDate) acc.firstUseDate = dKey;
+    if (dKey === todayKey) acc.todayTokens += tot;
+    if (dKey.startsWith(monthPrefix)) {
+      acc.monthTokens += tot;
+      acc.currentMonthInput += u.inp;
+      acc.currentMonthCache += u.cap;
+      acc.currentMonthOutput += u.out;
+      acc._monthCacheItems.push({ inputTokens: u.inp, cacheReadTokens: u.cap, outputTokens: u.out, totalTokens: tot, hasInputCacheFields: true });
+      acc._monthCalls.push(call);
     }
+    if (dKey.startsWith(yearPrefix)) acc.yearTokens += tot;
+    if (call.isKeepalive) {
+      acc.keepaliveRequests += 1;
+      acc.keepaliveTokens += tot;
+    }
+
+    const roleSrc = call.agentRole === 'subagent' ? 'agent' : (call.source === 'cli' ? 'cli' : (call.source === 'ide' ? 'ide' : 'desktop'));
+    acc.sources[roleSrc] = (acc.sources[roleSrc] || 0) + 1;
+
+    const srcKey = call.source === 'cli' ? 'cli' : 'desktop';
+    const convKey = call.cascadeId ? `${srcKey}:${String(call.cascadeId).toLowerCase()}` : `call:${ledgerKey}`;
+    acc._convIds.add(convKey);
+    attributedConvIds.add(convKey);
+
+    accumulateDayBucket(acc.dailyMap, dKey, u, tot, 1);
+    accumulateDayBucket(acc.dailyMapBySource.all, dKey, u, tot, 1);
+    accumulateDayBucket(acc.dailyMapBySource[srcKey], dKey, u, tot, 1);
+    accumulateDayBucket(attributedByDayAll, dKey, u, tot, 1);
+    accumulateDayBucket(srcKey === 'cli' ? attributedByDayCli : attributedByDayDesktop, dKey, u, tot, 1);
+
+    const bucket = resolveCallModelBucket(call);
+    const vKey = bucket.variantKey || UNATTRIBUTED_MODEL_KEY;
+    if (bucket.isAttributed && vKey !== UNATTRIBUTED_MODEL_KEY) {
+      acc.modelMetaByKey[vKey] = modelMetaByKey[vKey] || {
+        modelKey: bucket.modelKey,
+        modelLabel: bucket.modelLabel,
+        variantKey: vKey,
+        variantLabel: bucket.variantLabel
+      };
+    }
+    accumulateModelDayBucket(acc.dailyModelMapBySource.all, dKey, vKey, u, tot, 1);
+    accumulateModelDayBucket(acc.dailyModelMapBySource[srcKey], dKey, vKey, u, tot, 1);
+    accumulateModelDayBucket(attributedModelByDay.all, dKey, vKey, u, tot, 1);
+    accumulateModelDayBucket(attributedModelByDay[srcKey], dKey, vKey, u, tot, 1);
+
+    acc._cacheItems.push({ inputTokens: u.inp, cacheReadTokens: u.cap, outputTokens: u.out, totalTokens: tot, hasInputCacheFields: true });
+    acc._calls.push(call);
+    if (srcKey === 'cli') acc._cliCalls.push(call);
+    else acc._desktopCalls.push(call);
   }
 
-  // 第二阶段：在完整候选集（既有记录 + 整批新入账记录）上统一执行无顺序依赖的充分证据跨键消解
-  reconcileConfirmableDuplicateStepCalls(draftCalls);
-  const speedPruned = pruneExcessSpeedSamples(draftCalls);
-
-  const changed = Boolean(ledger.__hadDuplicateStepKeys) || speedPruned || hasCallsMapChanged(beforeCalls, draftCalls);
-
-  if (changed) {
-    const draftLedger = {
-      ...ledger,
-      calls: draftCalls,
-      updatedAt: new Date().toISOString()
+  for (const acc of Object.values(byAccount)) {
+    acc.activeDaysCount = Object.keys(acc.dailyMap).length;
+    acc.totalConversations = acc._convIds.size;
+    acc.cacheReadStats = summarizeCacheReadStats(acc._cacheItems);
+    acc.currentMonthCacheReadStats = summarizeCacheReadStats(acc._monthCacheItems);
+    acc.cacheReadStatsBySource = {
+      all: acc.cacheReadStats,
+      desktop: summarizeDailyMapCacheStats(acc.dailyMapBySource.desktop),
+      cli: summarizeDailyMapCacheStats(acc.dailyMapBySource.cli)
     };
-    const saveRes = savePricingLedger(draftLedger, targetDir, fsOpt);
-    if (!saveRes.ok) {
-      return createRecordResult(false, false, saveRes.error || '保存账本落盘失败', saveRes.phase, saveRes.code);
+    acc.currentMonthCacheReadStatsBySource = {
+      all: acc.currentMonthCacheReadStats,
+      desktop: summarizeDailyMapCacheStats(acc.dailyMapBySource.desktop, monthPrefix),
+      cli: summarizeDailyMapCacheStats(acc.dailyMapBySource.cli, monthPrefix)
+    };
+    acc.costEstimate = summarizeApiCost(acc._calls, 0, {}, 0);
+    acc.costEstimateCurrentMonth = summarizeApiCost(acc._monthCalls, 0, {}, 0);
+    acc.costEstimateBySource = {
+      all: acc.costEstimate,
+      desktop: summarizeApiCost(acc._desktopCalls, 0, {}, 0),
+      cli: summarizeApiCost(acc._cliCalls, 0, {}, 0)
+    };
+    acc.referenceCost = buildRefCostBundle(
+      acc.totalInputTokens, acc.totalOutputTokens, acc.totalCacheTokens, acc.totalTokens,
+      acc.currentMonthInput, acc.currentMonthOutput, acc.currentMonthCache, acc.monthTokens,
+      acc.costEstimate, acc.costEstimateCurrentMonth
+    );
+    delete acc._convIds;
+    delete acc._cacheItems;
+    delete acc._monthCacheItems;
+    delete acc._calls;
+    delete acc._monthCalls;
+    delete acc._desktopCalls;
+    delete acc._cliCalls;
+  }
+
+  // 构建严格“未归属历史”视图：严格遵循「全量 - SUM(已归属账号)」守恒公式
+  const unattributed = ensureAcct('unattributed');
+  unattributed.unattributedReasonCounts = {};
+  unattributed.unattributedReasonTokens = {};
+
+  const subtractSourceDailyMap = (fullMap, attrMap, targetMap) => {
+    for (const [dKey, rec] of Object.entries(fullMap || {})) {
+      if (!rec || typeof rec !== 'object') continue;
+      const attr = attrMap[dKey] || { input: 0, cache: 0, output: 0, total: 0, steps: 0 };
+      const remInp = Math.max(0, Number(rec.input || 0) - attr.input);
+      const remCap = Math.max(0, Number(rec.cache || 0) - attr.cache);
+      const remOut = Math.max(0, Number(rec.output || 0) - attr.output);
+      const remTot = Math.max(0, Number(rec.total || 0) - attr.total);
+      const remSteps = Math.max(0, Number(rec.steps || rec.conversations || 0) - attr.steps);
+      if (remTot <= 0 && remSteps <= 0) continue;
+      targetMap[dKey] = { input: remInp, cache: remCap, output: remOut, total: remTot, steps: remSteps };
     }
-    if (!targetDir) {
+  };
+
+  subtractSourceDailyMap(dailyMapAll, attributedByDayAll, unattributed.dailyMap);
+  unattributed.dailyMapBySource.all = unattributed.dailyMap;
+  subtractSourceDailyMap(mergedDesktop, attributedByDayDesktop, unattributed.dailyMapBySource.desktop);
+  subtractSourceDailyMap(mergedCli, attributedByDayCli, unattributed.dailyMapBySource.cli);
+  unattributed.dailyMapBySource.legacyUnallocated = { ...(mergedLegacyUnallocated || {}) };
+
+  for (const [dKey, rec] of Object.entries(unattributed.dailyMap)) {
+    if (!unattributed.firstUseDate || dKey < unattributed.firstUseDate) unattributed.firstUseDate = dKey;
+    unattributed.totalInputTokens += rec.input;
+    unattributed.totalCacheTokens += rec.cache;
+    unattributed.totalOutputTokens += rec.output;
+    unattributed.totalTokens += rec.total;
+    unattributed.callCount += rec.steps;
+    unattributed.totalSteps += rec.steps;
+    if (dKey === todayKey) unattributed.todayTokens += rec.total;
+    if (dKey.startsWith(monthPrefix)) {
+      unattributed.monthTokens += rec.total;
+      unattributed.currentMonthInput += rec.input;
+      unattributed.currentMonthCache += rec.cache;
+      unattributed.currentMonthOutput += rec.output;
+    }
+    if (dKey.startsWith(yearPrefix)) unattributed.yearTokens += rec.total;
+  }
+
+  const subtractSourceModelMap = (srcName, authDailyMap) => {
+    const fullSrcModel = dailyModelMapBySource?.[srcName] || {};
+    const attrSrcModel = attributedModelByDay[srcName] || {};
+    const out = {};
+    for (const [dKey, authRec] of Object.entries(authDailyMap || {})) {
+      if (!authRec || authRec.total <= 0) continue;
+      const fullDay = fullSrcModel[dKey] || {};
+      const attrDay = attrSrcModel[dKey] || {};
+      const dayOut = {};
+      let sumTot = 0, sumInp = 0, sumCap = 0, sumOut = 0, sumSteps = 0;
+      for (const [vKey, fRec] of Object.entries(fullDay)) {
+        const aRec = attrDay[vKey] || { total: 0, input: 0, cache: 0, output: 0, steps: 0 };
+        const rTot = Math.max(0, Number(fRec.total || 0) - aRec.total);
+        if (rTot <= 0) continue;
+        const rInp = Math.max(0, Number(fRec.input || 0) - aRec.input);
+        const rCap = Math.max(0, Number(fRec.cache || 0) - aRec.cache);
+        const rOut = Math.max(0, Number(fRec.output || 0) - aRec.output);
+        const rStp = Math.max(0, Number(fRec.steps || 0) - aRec.steps);
+        dayOut[vKey] = { total: rTot, input: rInp, output: rOut, cache: rCap, steps: rStp };
+        if (modelMetaByKey?.[vKey]) unattributed.modelMetaByKey[vKey] = modelMetaByKey[vKey];
+        sumTot += rTot; sumInp += rInp; sumCap += rCap; sumOut += rOut; sumSteps += rStp;
+      }
+      const diffTot = Math.max(0, authRec.total - sumTot);
+      if (diffTot > 0) {
+        if (!dayOut[UNATTRIBUTED_MODEL_KEY]) {
+          dayOut[UNATTRIBUTED_MODEL_KEY] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+        }
+        dayOut[UNATTRIBUTED_MODEL_KEY].total += diffTot;
+        dayOut[UNATTRIBUTED_MODEL_KEY].input += Math.max(0, authRec.input - sumInp);
+        dayOut[UNATTRIBUTED_MODEL_KEY].cache += Math.max(0, authRec.cache - sumCap);
+        dayOut[UNATTRIBUTED_MODEL_KEY].output += Math.max(0, authRec.output - sumOut);
+        dayOut[UNATTRIBUTED_MODEL_KEY].steps += Math.max(0, authRec.steps - sumSteps);
+      }
+      if (Object.keys(dayOut).length > 0) out[dKey] = dayOut;
+    }
+    unattributed.dailyModelMapBySource[srcName] = out;
+  };
+  subtractSourceModelMap('all', unattributed.dailyMapBySource.all);
+  subtractSourceModelMap('desktop', unattributed.dailyMapBySource.desktop);
+  subtractSourceModelMap('cli', unattributed.dailyMapBySource.cli);
+
+  const unattrCalls = [], unattrMonthCalls = [], unattrDesktopCalls = [], unattrCliCalls = [];
+  for (const { call, dKey, tot } of unattributedCallsMap.values()) {
+    const reason = call.unattributedReason || (call.source === 'ide' ? 'unverified_source_ide' : 'before_account_tracking');
+    unattributed.unattributedReasonCounts[reason] = (unattributed.unattributedReasonCounts[reason] || 0) + 1;
+    unattributed.unattributedReasonTokens[reason] = (unattributed.unattributedReasonTokens[reason] || 0) + tot;
+    unattrCalls.push(call);
+    if (dKey.startsWith(monthPrefix)) unattrMonthCalls.push(call);
+    if (call.source === 'cli') unattrCliCalls.push(call);
+    else unattrDesktopCalls.push(call);
+  }
+
+  unattributed.activeDaysCount = Object.keys(unattributed.dailyMap).length;
+  unattributed.totalConversations = Math.max(0, (Number(totalConversationsAll) || unattributed.activeDaysCount) - attributedConvIds.size);
+  unattributed.cacheReadStats = summarizeDailyMapCacheStats(unattributed.dailyMap);
+  unattributed.currentMonthCacheReadStats = summarizeDailyMapCacheStats(unattributed.dailyMap, monthPrefix);
+  unattributed.cacheReadStatsBySource = {
+    all: unattributed.cacheReadStats,
+    desktop: summarizeDailyMapCacheStats(unattributed.dailyMapBySource.desktop),
+    cli: summarizeDailyMapCacheStats(unattributed.dailyMapBySource.cli)
+  };
+  unattributed.currentMonthCacheReadStatsBySource = {
+    all: unattributed.currentMonthCacheReadStats,
+    desktop: summarizeDailyMapCacheStats(unattributed.dailyMapBySource.desktop, monthPrefix),
+    cli: summarizeDailyMapCacheStats(unattributed.dailyMapBySource.cli, monthPrefix)
+  };
+  unattributed.costEstimate = summarizeApiCost(
+    unattrCalls,
+    unpricedSummaryBySource?.all?.count || 0,
+    unpricedSummaryBySource?.all?.reasons || {},
+    unpricedSummaryBySource?.all?.tokens || 0
+  );
+  unattributed.costEstimateCurrentMonth = summarizeApiCost(
+    unattrMonthCalls,
+    unpricedSummaryBySource?.currentMonth?.count || 0,
+    unpricedSummaryBySource?.currentMonth?.reasons || {},
+    unpricedSummaryBySource?.currentMonth?.tokens || 0
+  );
+  unattributed.costEstimateBySource = {
+    all: unattributed.costEstimate,
+    desktop: summarizeApiCost(
+      unattrDesktopCalls,
+      unpricedSummaryBySource?.desktop?.count || 0,
+      unpricedSummaryBySource?.desktop?.reasons || {},
+      unpricedSummaryBySource?.desktop?.tokens || 0
+    ),
+    cli: summarizeApiCost(
+      unattrCliCalls,
+      unpricedSummaryBySource?.cli?.count || 0,
+      unpricedSummaryBySource?.cli?.reasons || {},
+      unpricedSummaryBySource?.cli?.tokens || 0
+    )
+  };
+  unattributed.referenceCost = buildRefCostBundle(
+    unattributed.totalInputTokens, unattributed.totalOutputTokens, unattributed.totalCacheTokens, unattributed.totalTokens,
+    unattributed.currentMonthInput, unattributed.currentMonthOutput, unattributed.currentMonthCache, unattributed.monthTokens,
+    unattributed.costEstimate, unattributed.costEstimateCurrentMonth
+  );
+  delete unattributed._convIds;
+  delete unattributed._cacheItems;
+  delete unattributed._monthCacheItems;
+  delete unattributed._calls;
+  delete unattributed._monthCalls;
+  delete unattributed._desktopCalls;
+  delete unattributed._cliCalls;
+
+  return {
+    byAccount,
+    unattributed
+  };
+}
+
+const CURRENT_ATTRIBUTION_REPAIR_VERSION = 'elv89-v3';
+
+/**
+ * 幂等账本账号归属迁移与纠偏：
+ * - 先对原 pricing_ledger_v1.json 做 .bak 备份；
+ * - 对带有精确时间戳且落在单一已核实 accountSessions 窗口内的记录准确归属；
+ * - 剥离早于追踪起点、缺时间戳、IDE 未核实或跨切号边界却被错误标为当前账号的 accountScopeKey；
+ * - 写入 attributionRepairVersion: CURRENT_ATTRIBUTION_REPAIR_VERSION，多次执行保持幂等不重复计数。
+ */
+function repairAndMigrateAccountLedger({
+  agDir = null,
+  ledgerPath = null,
+  accountSessions = [],
+  force = false,
+  dryRun = false,
+  backupSuffix = null
+} = {}) {
+  const targetDir = ledgerPath || agDir;
+  const resolvedLedgerPath = path.resolve(getPricingLedgerPath(targetDir));
+
+  const runLocked = () => {
+    ledgerCacheByPath.delete(normalizeLedgerKey(resolvedLedgerPath));
+    const ledger = loadPricingLedger(targetDir);
+    if (!ledger || ledger.__corrupted || ledger.__unreadable) {
+      return { ok: false, error: ledger?.__error || '账本不可读或已损坏' };
+    }
+    const calls = ledger.calls || {};
+    const nextCalls = { ...calls };
+
+    const summarizeCounts = (map) => {
+      const counts = { total: 0, attributed: {}, unattributed: 0 };
+      for (const rec of Object.values(map)) {
+        if (!rec || typeof rec !== 'object') continue;
+        counts.total += 1;
+        const sk = isValidAccountScopeKey(rec.accountScopeKey) && rec.accountAttributionConfidence !== 'unattributed'
+          ? rec.accountScopeKey.trim()
+          : null;
+        if (sk) counts.attributed[sk] = (counts.attributed[sk] || 0) + 1;
+        else counts.unattributed += 1;
+      }
+      return counts;
+    };
+
+    const before = summarizeCounts(calls);
+    let updatedCount = 0;
+    let clearedCount = 0;
+    let attributedOrFixedCount = 0;
+    const unattributedReasons = {};
+
+    for (const [k, rec] of Object.entries(calls)) {
+      if (!rec || typeof rec !== 'object') continue;
+      if (!force && rec.attributionRepairVersion === CURRENT_ATTRIBUTION_REPAIR_VERSION) continue;
+
+      const copy = { ...rec };
+      const curScope = isValidAccountScopeKey(copy.accountScopeKey) && copy.accountAttributionConfidence !== 'unattributed'
+        ? copy.accountScopeKey.trim()
+        : null;
+
+      // 保护极近期（3分钟内）实时确认的新增调用，避免在 transcript 落盘前或窗口同步间隙被误清除（不写入修复版本号以便稳定后复核）
+      if (copy.accountAttributionConfidence === 'live_confirmed_account' && curScope && !force) {
+        const obsMs = Number(copy.liveObservedAtMs) || (copy.updatedAt ? Date.parse(copy.updatedAt) : NaN) || Number(copy.timestamp);
+        if (Number.isFinite(obsMs) && (Date.now() - obsMs) >= 0 && (Date.now() - obsMs) < 180000) {
+          nextCalls[k] = copy;
+          continue;
+        }
+      }
+
+      // 显式保留用户/实验硬绑定的账号记录（keepalive / explicit email），其余均依据权威时间戳严格复核
+      if (copy.isKeepalive && curScope && copy.accountAttributionConfidence === 'keepalive_bound') {
+        copy.attributionRepairVersion = CURRENT_ATTRIBUTION_REPAIR_VERSION;
+        nextCalls[k] = copy;
+        continue;
+      }
+      if (copy.accountEmail && typeof copy.accountEmail === 'string' && copy.accountEmail.includes('@')) {
+        copy.accountScopeKey = buildAccountScopeKey(copy.accountEmail);
+        copy.accountAttributionConfidence = 'explicit_account_email';
+        copy.accountAttributionEvidence = copy.accountAttributionEvidence || 'call_account_email';
+        delete copy.unattributedReason;
+        copy.attributionRepairVersion = CURRENT_ATTRIBUTION_REPAIR_VERSION;
+        nextCalls[k] = copy;
+        if (curScope !== copy.accountScopeKey) updatedCount++;
+        continue;
+      }
+
+      const { startMs, endMs } = extractCallTimeBoundsMs(copy);
+      const src = String(copy.source || 'desktop').toLowerCase();
+      let verdict;
+      if (src === 'ide') {
+        verdict = { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'unverified_source_ide' };
+      } else if (startMs != null) {
+        verdict = matchTimestampAgainstSessions(startMs, endMs, src, accountSessions);
+      } else {
+        verdict = { accountScopeKey: null, confidence: 'unattributed', unattributedReason: 'missing_request_timestamp' };
+      }
+
+      if (verdict.accountScopeKey) {
+        if (curScope !== verdict.accountScopeKey || copy.accountAttributionConfidence !== 'repaired_session_window') {
+          attributedOrFixedCount += 1;
+          updatedCount += 1;
+        }
+        copy.accountScopeKey = verdict.accountScopeKey;
+        copy.accountAttributionConfidence = 'repaired_session_window';
+        copy.accountAttributionEvidence = verdict.evidence || 'session_window_repair';
+        delete copy.unattributedReason;
+      } else {
+        if (curScope) {
+          clearedCount += 1;
+          updatedCount += 1;
+        } else if (copy.accountAttributionConfidence !== 'unattributed' || !copy.unattributedReason) {
+          updatedCount += 1;
+        }
+        delete copy.accountScopeKey;
+        copy.accountAttributionConfidence = 'unattributed';
+        copy.unattributedReason = verdict.unattributedReason || 'before_account_tracking';
+        delete copy.accountAttributionEvidence;
+        unattributedReasons[copy.unattributedReason] = (unattributedReasons[copy.unattributedReason] || 0) + 1;
+      }
+      copy.attributionRepairVersion = CURRENT_ATTRIBUTION_REPAIR_VERSION;
+      nextCalls[k] = copy;
+    }
+
+    const after = summarizeCounts(nextCalls);
+    let backupPath = null;
+    if (!dryRun && fs.existsSync(resolvedLedgerPath)) {
+      const tsTag = backupSuffix || `${Date.now()}`;
+      backupPath = `${resolvedLedgerPath}.bak-pre-elv89-${tsTag}`;
+      fs.copyFileSync(resolvedLedgerPath, backupPath);
+    }
+
+    if (!dryRun && (updatedCount > 0 || force)) {
+      const draftLedger = {
+        ...ledger,
+        calls: nextCalls,
+        updatedAt: new Date().toISOString()
+      };
+      const saveRes = savePricingLedger(draftLedger, targetDir);
+      if (!saveRes.ok) {
+        return { ok: false, error: saveRes.error || '修复后账本保存失败', backupPath };
+      }
+      try {
+        syncAccountLedgerPartitions(resolvedLedgerPath, nextCalls, fs);
+      } catch { }
       cachedTokenHistoryAt = 0;
     }
+
+    return {
+      ok: true,
+      dryRun: Boolean(dryRun),
+      ledgerPath: resolvedLedgerPath,
+      backupPath,
+      updatedCount,
+      clearedCount,
+      attributedOrFixedCount,
+      unattributedReasons,
+      before,
+      after
+    };
+  };
+
+  return withFileLockSync(resolvedLedgerPath, runLocked);
+}
+
+/**
+ * 查询某账号在某模型共享池与指定时间区间内的本地实测消耗（专供 ELV-57 配额变化对照使用）
+ */
+function summarizeAccountWindowUsage({ agDir, ledgerPath, accountScopeKey, poolKey, startMs, endMs } = {}) {
+  const targetDir = ledgerPath || agDir;
+  const ledger = loadPricingLedger(targetDir);
+  const calls = ledger?.calls && typeof ledger.calls === 'object' ? Object.values(ledger.calls) : [];
+  const start = Number(startMs) || 0;
+  const end = Number(endMs) || Date.now();
+  let requestCount = 0;
+  let uncachedInputTokens = 0;
+  let cacheReadTokens = 0;
+  let outputTokens = 0;
+  let totalTokens = 0;
+  let keepaliveRequests = 0;
+  let keepaliveTokens = 0;
+
+  for (const call of calls) {
+    if (!call || typeof call !== 'object') continue;
+    if (accountScopeKey && call.accountScopeKey !== accountScopeKey) continue;
+    if (call.accountAttributionConfidence === 'unattributed') continue;
+    const ts = getCallSortTimestamp(call) ?? Number(call.timestamp) ?? (call.created_at ? Date.parse(call.created_at) : NaN);
+    if (!Number.isFinite(ts) || ts < start || ts > end) continue;
+    if (poolKey) {
+      const rawModel = call.modelExactId || extractModelString(call) || call.model || '';
+      const sharedKey = typeof getSharedQuotaGroupKey === 'function' ? getSharedQuotaGroupKey(rawModel || call.modelLabel || '') : null;
+      const singlePoolKey = typeof getModelPoolKey === 'function' ? getModelPoolKey(rawModel, call.modelLabel || '') : null;
+      if (sharedKey !== poolKey && singlePoolKey !== poolKey) continue;
+    }
+    const u = getCallTokenBreakdown(call);
+    const tot = u.tot || (u.inp + u.cap + u.out);
+    requestCount += 1;
+    uncachedInputTokens += u.inp;
+    cacheReadTokens += u.cap;
+    outputTokens += u.out;
+    totalTokens += tot;
+    if (call.isKeepalive) {
+      keepaliveRequests += 1;
+      keepaliveTokens += tot;
+    }
   }
 
-  return createRecordResult(true, changed);
+  return {
+    requestCount,
+    uncachedInputTokens,
+    cacheReadTokens,
+    outputTokens,
+    totalTokens,
+    keepaliveRequests,
+    keepaliveTokens
+  };
 }
 
 // ============================================================================
@@ -1687,7 +2944,7 @@ function loadCustomPlanSettings(overridePathOrDir) {
       try {
         const bakCorrupt = p.replace(/\.json$/i, '') + '.corrupt.bak.json';
         fs.copyFileSync(p, bakCorrupt);
-      } catch {}
+      } catch { }
       return { ...def, recoveredFromCorruption: true };
     }
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -2083,62 +3340,306 @@ function savePluginSettings(payload = {}, options = {}) {
   };
 }
 
-let cachedHostUserStatus = null;
-let cachedHostUserStatusAt = 0;
+const cachedUserStatusByOrigin = new Map();
+const cachedQuotaStateByOrigin = new Map();
+const activeQuotaFetchByOrigin = new Map();
+
+function normalizeQuotaOriginScope(options = {}) {
+  const raw = typeof options.origin === 'string' ? options.origin.trim() : '';
+  return raw || '__default__';
+}
+
+function buildAccountScopeKey(emailOrId) {
+  const raw = typeof emailOrId === 'string' ? emailOrId.trim().toLowerCase() : '';
+  if (!raw) return 'anonymous';
+  return 'acct_' + crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16);
+}
+
+function resetQuotaHostCacheForTest() {
+  cachedUserStatusByOrigin.clear();
+  cachedQuotaStateByOrigin.clear();
+  activeQuotaFetchByOrigin.clear();
+}
+
+function classifyQuotaFetchError(err) {
+  const msg = String(err?.message || err || '未知错误').trim();
+  const lower = msg.toLowerCase();
+  if (/enoent|devtoolsactiveport/i.test(lower)) {
+    return { kind: 'network', message: '本地额度服务尚未就绪，请稍后重试' };
+  }
+  if (/timeout|timed out|etimedout|deadline/i.test(lower)) {
+    return { kind: 'timeout', message: '请求语言服务超时' };
+  }
+  if (/econnrefused|econnreset|enotfound|not running|unreachable|network|socket|connect/i.test(lower)) {
+    return { kind: 'network', message: '未能连接到 Antigravity 本地服务' };
+  }
+  if (/unauthorized|forbidden|401|403|csrf|鉴权/i.test(lower)) {
+    return { kind: 'auth', message: '本地鉴权失败或已失效' };
+  }
+  return { kind: 'network', message: msg || '额度数据获取失败' };
+}
+
+/**
+ * 并发拉取宿主模型额度池与可用模型详情，带多窗口 origin 隔离、并发去重、短缓存、失败分级及账号切换检测
+ * @param {Object} options - 支持 force / origin / backendSource / userStatus / quotaSummary / connect 等参数
+ */
+async function fetchQuotaSnapshotFromHost(options = {}) {
+  const nowMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+  const force = options.force === true;
+  const hasStaticFixture = options.userStatus !== undefined || options.quotaSummary !== undefined || options.error !== undefined;
+  const originScope = normalizeQuotaOriginScope(options);
+  const backendSource = typeof options.backendSource === 'string' && options.backendSource.trim()
+    ? options.backendSource.trim()
+    : 'host';
+
+  // 短缓存防刷（仅在非强制刷新且无静态测试桩时生效，15s 内复用同 origin 结果）
+  const prevCachedQuota = cachedQuotaStateByOrigin.get(originScope) || null;
+  if (!force && !hasStaticFixture && !options.agDir && prevCachedQuota && (nowMs - prevCachedQuota.fetchedAtMs < 15000)) {
+    if (prevCachedQuota.backendSource === backendSource && prevCachedQuota.collectorVersion === PROJECT_VERSION) {
+      return prevCachedQuota;
+    }
+    return {
+      ...prevCachedQuota,
+      collectorVersion: PROJECT_VERSION,
+      backendVersion: PROJECT_VERSION,
+      backendSource
+    };
+  }
+
+  // 如果已有相同 origin 请求进行中，直接合并等待，避免重复请求
+  const activePromise = activeQuotaFetchByOrigin.get(originScope) || null;
+  if (!hasStaticFixture && activePromise) {
+    if (!force) return activePromise;
+    try { await activePromise; } catch { }
+  }
+
+  const runFetch = async () => {
+    let userStatusRes = null;
+    let quotaSummaryRes = null;
+    let fetchError = null;
+    let errorKind = null;
+
+    if (options.error) {
+      const classified = classifyQuotaFetchError(options.error);
+      fetchError = classified.message;
+      errorKind = classified.kind;
+    } else if (options.userStatus !== undefined || options.quotaSummary !== undefined) {
+      userStatusRes = options.userStatus || null;
+      quotaSummaryRes = options.quotaSummary || null;
+    } else {
+      try {
+        const connector = typeof options.connect === 'function' ? options.connect : require('./local-api').connect;
+        const api = await connector(options.origin ? { origin: options.origin } : undefined);
+        const [uRes, qRes] = await Promise.allSettled([
+          api.call('GetUserStatus', {}),
+          api.call('RetrieveUserQuotaSummary', {})
+        ]);
+        if (uRes.status === 'fulfilled' && uRes.value) {
+          userStatusRes = uRes.value;
+        }
+        if (qRes.status === 'fulfilled' && qRes.value) {
+          quotaSummaryRes = qRes.value;
+        }
+        if (!userStatusRes && !quotaSummaryRes) {
+          const firstErr = uRes.status === 'rejected' ? uRes.reason : (qRes.status === 'rejected' ? qRes.reason : new Error('宿主未返回额度数据'));
+          const classified = classifyQuotaFetchError(firstErr);
+          fetchError = classified.message;
+          errorKind = classified.kind;
+        }
+      } catch (e) {
+        const classified = classifyQuotaFetchError(e);
+        fetchError = classified.message;
+        errorKind = classified.kind;
+      }
+    }
+
+    const doneAtMs = Number.isFinite(Number(options.nowMs)) ? Number(options.nowMs) : Date.now();
+    const rawConfigs = userStatusRes?.userStatus?.cascadeModelConfigData?.clientModelConfigs
+      || userStatusRes?.cascadeModelConfigData?.clientModelConfigs
+      || [];
+    const sanitizedConfigs = Array.isArray(rawConfigs)
+      ? rawConfigs.map(sanitizeCascadeModelConfig).filter(Boolean)
+      : [];
+    const parsedPlan = userStatusRes ? parseUserPlanStatus(userStatusRes) : null;
+    const rawEmail = parsedPlan?.email || userStatusRes?.userStatus?.email || '';
+    const scopeQuotaState = cachedQuotaStateByOrigin.get(originScope) || null;
+    const scopeUserEntry = cachedUserStatusByOrigin.get(originScope) || null;
+    const prevAccountScopeKey = scopeUserEntry?.accountScopeKey || scopeQuotaState?.accountScopeKey || null;
+    const nextScopeKey = rawEmail ? buildAccountScopeKey(rawEmail) : (prevAccountScopeKey || 'anonymous');
+
+    // 账号切换检测：一旦发现同 origin 作用域下账号变化，立即清掉旧账号缓存，绝不跨账号残留旧额度
+    const accountSwitched = Boolean(
+      rawEmail &&
+      prevAccountScopeKey &&
+      nextScopeKey !== prevAccountScopeKey
+    );
+    if (accountSwitched) {
+      cachedQuotaStateByOrigin.delete(originScope);
+      cachedUserStatusByOrigin.delete(originScope);
+    }
+    if (rawEmail) {
+      const existingEntry = cachedUserStatusByOrigin.get(originScope) || {};
+      cachedUserStatusByOrigin.set(originScope, {
+        ...existingEntry,
+        accountScopeKey: nextScopeKey
+      });
+    }
+
+    if (fetchError) {
+      // 保留同 origin 同账号最后一次有效原始响应以产出 stale 状态；无旧数据时产出 error 状态
+      const curScoped = cachedQuotaStateByOrigin.get(originScope) || null;
+      const prevRaw = (!accountSwitched && curScoped?._raw) ? curScoped._raw : null;
+      const snapshot = buildModelQuotaSnapshot({
+        cascadeModelConfigs: prevRaw?.cascadeModelConfigs || [],
+        quotaSummaryRes: prevRaw?.quotaSummaryRes || null,
+        planStatus: prevRaw?.planStatus || null,
+        currentModel: options.currentModel || null,
+        browsePoolKey: options.browsePoolKey || null,
+        fetchMeta: {
+          fetchedAtMs: prevRaw?.fetchedAtMs || null,
+          error: fetchError,
+          errorKind
+        },
+        nowMs: doneAtMs
+      });
+      const out = {
+        ok: false,
+        collectorVersion: PROJECT_VERSION,
+        backendVersion: PROJECT_VERSION,
+        backendSource,
+        originScope,
+        accountScopeKey: prevRaw?.accountScopeKey || nextScopeKey,
+        accountSwitched,
+        fetchedAtMs: doneAtMs,
+        lastSuccessAtMs: prevRaw?.fetchedAtMs || null,
+        error: fetchError,
+        errorKind,
+        planTierSummary: prevRaw?.planStatus ? {
+          status: prevRaw.planStatus.status,
+          tierKey: prevRaw.planStatus.tierKey,
+          tierId: prevRaw.planStatus.tierId || null,
+          teamsTier: prevRaw.planStatus.teamsTier || null,
+          tierName: prevRaw.planStatus.tierName || null,
+          planName: prevRaw.planStatus.planName || null
+        } : null,
+        snapshot,
+        _raw: prevRaw
+      };
+      if (!hasStaticFixture && !options.agDir && curScoped) {
+        cachedQuotaStateByOrigin.set(originScope, { ...curScoped, error: fetchError, errorKind, snapshot });
+      }
+      return out;
+    }
+
+    const rawRecord = {
+      cascadeModelConfigs: sanitizedConfigs,
+      quotaSummaryRes,
+      planStatus: parsedPlan,
+      fetchedAtMs: doneAtMs,
+      accountScopeKey: nextScopeKey
+    };
+
+    const snapshot = buildModelQuotaSnapshot({
+      cascadeModelConfigs: sanitizedConfigs,
+      quotaSummaryRes,
+      planStatus: parsedPlan,
+      currentModel: options.currentModel || null,
+      browsePoolKey: options.browsePoolKey || null,
+      fetchMeta: {
+        fetchedAtMs: doneAtMs,
+        error: null,
+        errorKind: null
+      },
+      nowMs: doneAtMs
+    });
+
+    const out = {
+      ok: true,
+      collectorVersion: PROJECT_VERSION,
+      backendVersion: PROJECT_VERSION,
+      backendSource,
+      originScope,
+      accountScopeKey: nextScopeKey,
+      accountSwitched,
+      fetchedAtMs: doneAtMs,
+      lastSuccessAtMs: doneAtMs,
+      error: null,
+      errorKind: null,
+      planTierSummary: parsedPlan ? {
+        status: parsedPlan.status,
+        tierKey: parsedPlan.tierKey,
+        tierId: parsedPlan.tierId || null,
+        teamsTier: parsedPlan.teamsTier || null,
+        tierName: parsedPlan.tierName || null,
+        planName: parsedPlan.planName || null
+      } : null,
+      snapshot,
+      cascadeModelConfigs: sanitizedConfigs,
+      _raw: rawRecord
+    };
+
+    if (!hasStaticFixture && !options.agDir) {
+      cachedQuotaStateByOrigin.set(originScope, out);
+    }
+    return out;
+  };
+
+  if (!hasStaticFixture) {
+    const p = runFetch().finally(() => {
+      if (activeQuotaFetchByOrigin.get(originScope) === p) activeQuotaFetchByOrigin.delete(originScope);
+    });
+    activeQuotaFetchByOrigin.set(originScope, p);
+    return p;
+  }
+  return runFetch();
+}
 
 async function fetchUserStatusFromHost(options = {}) {
-  if (options && (options.userStatus !== undefined || options.quotaSummary !== undefined || options.availableModels !== undefined)) {
-    if (!options.userStatus && !options.quotaSummary) return null;
-    const baseInput = options.userStatus && typeof options.userStatus === 'object' ? options.userStatus : {};
-    const mergedInput = options.quotaSummary !== undefined
-      ? { ...baseInput, quotaSummary: options.quotaSummary }
-      : options.userStatus;
-    let parsed = mergedInput ? parseUserPlanStatus(mergedInput) : null;
-    const quotaSummary = options.quotaSummary !== undefined
-      ? options.quotaSummary
-      : (baseInput.quotaSummary || baseInput.userStatus?.quotaSummary || null);
-    if (!parsed && quotaSummary) parsed = { quotaSummary };
-    const configs = baseInput.userStatus?.cascadeModelConfigData?.clientModelConfigs || baseInput.cascadeModelConfigData?.clientModelConfigs || [];
+  if (options && options.userStatus !== undefined) {
+    if (!options.userStatus) return null;
+    const parsed = parseUserPlanStatus(options.userStatus);
+    const configs = options.userStatus?.userStatus?.cascadeModelConfigData?.clientModelConfigs || options.userStatus?.cascadeModelConfigData?.clientModelConfigs || [];
     const availMap = options.availableModels ? parseAvailableModelsResponse(options.availableModels) : {};
     if (parsed) {
       if (Object.keys(availMap).length) parsed.availableModelDetails = availMap;
       if (configs.length) parsed.cascadeModelConfigs = mergeModelCapabilitiesIntoConfigs(configs, availMap);
-      if (quotaSummary && !parsed.quotaSummary) parsed.quotaSummary = quotaSummary;
     }
     return parsed;
   }
-  if (!options.agDir && !options.force && cachedHostUserStatus && Date.now() - cachedHostUserStatusAt < 60000) {
-    return cachedHostUserStatus;
+  const originScope = normalizeQuotaOriginScope(options);
+  const cachedEntry = cachedUserStatusByOrigin.get(originScope) || null;
+  if (!options.agDir && !options.force && cachedEntry?.status && Date.now() - (cachedEntry.fetchedAt || 0) < 60000) {
+    return cachedEntry.status;
   }
   try {
     const { connect } = require('./local-api');
-    const api = await connect();
-    const [statusSettled, availSettled, summarySettled] = await Promise.allSettled([
+    const api = await connect(options.origin ? { origin: options.origin } : undefined);
+    const [res, availRes] = await Promise.all([
       api.call('GetUserStatus', {}),
-      api.call('GetAvailableModels', { forceRefresh: false }),
-      api.call('RetrieveUserQuotaSummary', {})
+      api.call('GetAvailableModels', { forceRefresh: false }).catch(() => null)
     ]);
-    const res = statusSettled.status === 'fulfilled' ? statusSettled.value : null;
-    const availRes = availSettled.status === 'fulfilled' ? availSettled.value : null;
-    const summaryRes = summarySettled.status === 'fulfilled' ? summarySettled.value : null;
-    let parsed = res ? parseUserPlanStatus(res) : null;
-    if (!parsed && summaryRes) {
-      parsed = parseUserPlanStatus({ quotaSummary: summaryRes }) || { quotaSummary: summaryRes };
-    }
+    const parsed = parseUserPlanStatus(res);
     const configs = res?.userStatus?.cascadeModelConfigData?.clientModelConfigs || [];
     const availMap = availRes ? parseAvailableModelsResponse(availRes) : {};
     if (parsed) {
       if (Object.keys(availMap).length) parsed.availableModelDetails = availMap;
       if (configs.length) parsed.cascadeModelConfigs = mergeModelCapabilitiesIntoConfigs(configs, availMap);
-      if (summaryRes && !parsed.quotaSummary) parsed.quotaSummary = summaryRes;
     }
     if (parsed && !options.agDir) {
-      cachedHostUserStatus = parsed;
-      cachedHostUserStatusAt = Date.now();
+      const nextScope = parsed.email ? buildAccountScopeKey(parsed.email) : null;
+      const prevScope = cachedEntry?.accountScopeKey || null;
+      if (nextScope && prevScope && nextScope !== prevScope) {
+        cachedQuotaStateByOrigin.delete(originScope);
+      }
+      cachedUserStatusByOrigin.set(originScope, {
+        status: parsed,
+        fetchedAt: Date.now(),
+        accountScopeKey: nextScope || prevScope || null
+      });
     }
     return parsed;
   } catch {
-    return cachedHostUserStatus || null;
+    return cachedEntry?.status || null;
   }
 }
 
@@ -2149,32 +3650,1292 @@ let currentScanSequence = 0;
 const TRANSCRIPT_SKIP_DIRS = new Set(['steps', 'tasks', 'scratch', 'media', 'artifacts', 'node_modules', '.git', '__pycache__']);
 const transcriptFileCache = new Map();
 
-function getEffectiveScanScopeKey(options = {}) {
-  const home = process.env.USERPROFILE || os.homedir();
-  const agDir = path.resolve(options.agDir || process.env.AG_DIR || path.join(home, '.gemini', 'antigravity'));
-  const agCliDir = path.resolve(options.agCliDir || process.env.AG_CLI_DIR || path.join(home, '.gemini', 'antigravity-cli'));
-  return process.platform === 'win32'
-    ? `${agDir.toLowerCase()}|${agCliDir.toLowerCase()}`
-    : `${agDir}|${agCliDir}`;
+const IGNORED_WSL_DISTRO_RE = /^(?:docker-desktop(?:-data)?|rancher-desktop(?:-data)?|podman-machine(?:-[a-z0-9_-]+)?)$/i;
+const WSL_LXSS_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss';
+
+function dedupeScanPaths(paths = [], platform = process.platform) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of paths) {
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const pathMod = (platform === 'win32' || trimmed.startsWith('\\\\')) ? path.win32 : path;
+    const resolved = pathMod.resolve(trimmed);
+    const key = (platform === 'win32' || resolved.startsWith('\\\\')) ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(resolved);
+  }
+  return out;
 }
 
-async function collectTokenHistoryAsync(options = {}) {
+/**
+ * 解析 Windows 注册表 Lxss 导出内容，提取已安装且可用的 WSL 发行版
+ * @param {string} rawText
+ */
+function parseLxssRegistryOutput(rawText = '') {
+  if (typeof rawText !== 'string' || !rawText.trim()) return [];
+  const distros = [];
+  const seenNames = new Set();
+  let current = null;
+
+  const flush = () => {
+    if (!current || !current.name) return;
+    const name = current.name.trim();
+    if (!name || IGNORED_WSL_DISTRO_RE.test(name)) return;
+    if (current.state !== null && current.state !== 1) return;
+    const key = name.toLowerCase();
+    if (seenNames.has(key)) return;
+    seenNames.add(key);
+    distros.push({
+      name,
+      state: current.state,
+      version: current.version,
+      defaultUid: current.defaultUid
+    });
+  };
+
+  for (const line of rawText.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (/^(?:HKEY_CURRENT_USER|HKCU)\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\/i.test(trimmed)) {
+      flush();
+      current = { name: '', state: null, version: null, defaultUid: null };
+      continue;
+    }
+    if (!current) continue;
+    const nameMatch = trimmed.match(/^DistributionName\s+REG_SZ\s+(.+)$/i);
+    if (nameMatch) {
+      current.name = nameMatch[1].trim();
+      continue;
+    }
+    const stateMatch = trimmed.match(/^State\s+REG_DWORD\s+(?:0x([0-9a-f]+)|(\d+))$/i);
+    if (stateMatch) {
+      current.state = stateMatch[1] ? parseInt(stateMatch[1], 16) : parseInt(stateMatch[2], 10);
+      continue;
+    }
+    const verMatch = trimmed.match(/^Version\s+REG_DWORD\s+(?:0x([0-9a-f]+)|(\d+))$/i);
+    if (verMatch) {
+      current.version = verMatch[1] ? parseInt(verMatch[1], 16) : parseInt(verMatch[2], 10);
+      continue;
+    }
+    const uidMatch = trimmed.match(/^DefaultUid\s+REG_DWORD\s+(?:0x([0-9a-f]+)|(\d+))$/i);
+    if (uidMatch) {
+      current.defaultUid = uidMatch[1] ? parseInt(uidMatch[1], 16) : parseInt(uidMatch[2], 10);
+    }
+  }
+  flush();
+  return distros;
+}
+
+function listRegisteredWslDistros(options = {}) {
+  if (Array.isArray(options.wslDistros)) {
+    const out = [];
+    const seen = new Set();
+    for (const item of options.wslDistros) {
+      const rawName = typeof item === 'string' ? item : item?.name;
+      const name = typeof rawName === 'string' ? rawName.trim() : '';
+      if (!name || IGNORED_WSL_DISTRO_RE.test(name)) continue;
+      const state = typeof item === 'object' && item && item.state !== undefined ? Number(item.state) : null;
+      if (state !== null && Number.isFinite(state) && state !== 1) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        name,
+        state: Number.isFinite(state) ? state : null,
+        version: typeof item === 'object' && item ? (item.version ?? null) : null,
+        defaultUid: typeof item === 'object' && item ? (item.defaultUid ?? null) : null
+      });
+    }
+    return out;
+  }
+  const platform = options.platform || process.platform;
+  if (platform !== 'win32') return [];
+  try {
+    const res = spawnSync('reg.exe', ['query', WSL_LXSS_REG_KEY, '/s'], {
+      encoding: 'utf8',
+      timeout: 2500,
+      windowsHide: true
+    });
+    if (res.error || res.status !== 0 || !res.stdout) return [];
+    return parseLxssRegistryOutput(res.stdout);
+  } catch {
+    return [];
+  }
+}
+
+function resolveWslDistroUncRoot(distroName, options = {}) {
+  const fsApi = options.fs || fs;
+  const name = typeof distroName === 'string' ? distroName.trim() : '';
+  if (!name) return null;
+  for (const prefix of ['\\\\wsl.localhost', '\\\\wsl$']) {
+    const candidate = `${prefix}\\${name}`;
+    try {
+      if (fsApi.existsSync(path.win32.join(candidate, 'root')) || fsApi.existsSync(path.win32.join(candidate, 'home'))) {
+        return candidate;
+      }
+    } catch { }
+  }
+  return null;
+}
+
+function collectGeminiDirsFromLinuxRoot(rootDir, options = {}) {
+  const fsApi = options.fs || fs;
+  const platform = options.platform || process.platform;
+  const desktopDirs = [];
+  const cliDirs = [];
+  if (typeof rootDir !== 'string' || !rootDir.trim()) return { desktopDirs, cliDirs };
+  const pathMod = (platform === 'win32' || rootDir.startsWith('\\\\')) ? path.win32 : path;
+
+  const candidateHomes = [];
+  const rootHome = pathMod.join(rootDir, 'root');
+  try {
+    if (fsApi.existsSync(rootHome)) candidateHomes.push(rootHome);
+  } catch { }
+
+  const homeParent = pathMod.join(rootDir, 'home');
+  try {
+    if (fsApi.existsSync(homeParent)) {
+      for (const entry of fsApi.readdirSync(homeParent, { withFileTypes: true })) {
+        const sub = pathMod.join(homeParent, entry.name);
+        if (entry.isDirectory()) {
+          candidateHomes.push(sub);
+        } else if (entry.isSymbolicLink()) {
+          try {
+            if (fsApi.statSync(sub).isDirectory()) candidateHomes.push(sub);
+          } catch { }
+        }
+      }
+    }
+  } catch { }
+
+  const uniqueHomes = dedupeScanPaths(candidateHomes.map((h) => {
+    try {
+      return typeof fsApi.realpathSync === 'function' ? fsApi.realpathSync(h) : h;
+    } catch {
+      return h;
+    }
+  }), platform);
+
+  for (const h of uniqueHomes) {
+    const ag = pathMod.join(h, '.gemini', 'antigravity');
+    const cli = pathMod.join(h, '.gemini', 'antigravity-cli');
+    try {
+      if (fsApi.existsSync(ag)) desktopDirs.push(ag);
+    } catch { }
+    try {
+      if (fsApi.existsSync(cli)) cliDirs.push(cli);
+    } catch { }
+  }
+  return {
+    desktopDirs: dedupeScanPaths(desktopDirs, platform),
+    cliDirs: dedupeScanPaths(cliDirs, platform)
+  };
+}
+
+const WSL_DISCOVERY_CACHE_TTL_MS = 45000;
+let wslDiscoveryCache = { scopeKey: '', at: 0, value: null };
+
+function discoverWslGeminiDirs(options = {}) {
+  const platform = options.platform || process.platform;
+  if (options.includeWsl === false || process.env.AG_DISABLE_WSL_SCAN === '1') {
+    return { distros: [], roots: [], desktopDirs: [], cliDirs: [], skippedRoots: [] };
+  }
+  const hasExplicitPrimary = Boolean(options.agDir || options.agCliDir || process.env.AG_DIR || process.env.AG_CLI_DIR);
+  const allowAutoDistros = options.includeWsl === true ||
+    (platform === 'win32' && !hasExplicitPrimary && process.env.AG_METER_TEST_MODE !== '1');
+
+  const distros = allowAutoDistros ? listRegisteredWslDistros(options) : [];
+  const discoveredRoots = [];
+  const skippedRoots = [];
+  for (const d of distros) {
+    try {
+      const uncRoot = resolveWslDistroUncRoot(d.name, options);
+      if (uncRoot) discoveredRoots.push(uncRoot);
+      else skippedRoots.push({ target: d.name, reason: 'unreachable' });
+    } catch (e) {
+      skippedRoots.push({ target: d.name, reason: e?.code || e?.message || 'error' });
+    }
+  }
+  const explicitRoots = Array.isArray(options.wslRoots) ? options.wslRoots : [];
+  const roots = dedupeScanPaths([...discoveredRoots, ...explicitRoots], platform);
+
+  const desktopDirs = [];
+  const cliDirs = [];
+  for (const r of roots) {
+    try {
+      const found = collectGeminiDirsFromLinuxRoot(r, options);
+      desktopDirs.push(...found.desktopDirs);
+      cliDirs.push(...found.cliDirs);
+    } catch (e) {
+      skippedRoots.push({ target: r, reason: e?.code || e?.message || 'error' });
+    }
+  }
+  return {
+    distros: distros.map(d => d.name),
+    roots,
+    desktopDirs: dedupeScanPaths(desktopDirs, platform),
+    cliDirs: dedupeScanPaths(cliDirs, platform),
+    skippedRoots
+  };
+}
+
+/**
+ * 带超时保护与缓存的异步 WSL 目录发现：
+ * - 对慢 UNC/休眠发行版施加有界超时（默认 1500ms），不阻塞主循环或拖慢 UI；
+ * - 不执行任何写入或主动拉起未运行发行版，权限不足/不可达时记录 skippedRoots 并安全跳过。
+ */
+async function discoverWslGeminiDirsAsync(options = {}) {
+  const platform = options.platform || process.platform;
+  if (options.includeWsl === false || process.env.AG_DISABLE_WSL_SCAN === '1') {
+    return { distros: [], roots: [], desktopDirs: [], cliDirs: [], skippedRoots: [] };
+  }
+  const hasCustomOverride = Boolean(options.fs || options.wslDistros || options.wslProbeFn || options.wslProbeTimeoutMs);
   const scopeKey = getEffectiveScanScopeKey(options);
-  if (!options.force && !options.agDir && cachedTokenHistory && cachedTokenHistoryScope === scopeKey && Date.now() - cachedTokenHistoryAt < 15000) {
-    return cachedTokenHistory;
-  }
-  if (!options.force && !options.agDir && activeScanPromise && activeScanScope === scopeKey) {
-    return activeScanPromise;
+  if (!hasCustomOverride && !options.force && wslDiscoveryCache.value && wslDiscoveryCache.scopeKey === scopeKey && (Date.now() - wslDiscoveryCache.at) < WSL_DISCOVERY_CACHE_TTL_MS) {
+    return wslDiscoveryCache.value;
   }
 
-  const thisScanSeq = ++currentScanSequence;
-  const runner = (async () => {
-    const home = process.env.USERPROFILE || os.homedir();
-  const agDir = options.agDir || process.env.AG_DIR || path.join(home, '.gemini', 'antigravity');
-  const agCliDir = options.agCliDir || process.env.AG_CLI_DIR || path.join(home, '.gemini', 'antigravity-cli');
+  const hasExplicitPrimary = Boolean(options.agDir || options.agCliDir || process.env.AG_DIR || process.env.AG_CLI_DIR);
+  const allowAutoDistros = options.includeWsl === true ||
+    (platform === 'win32' && !hasExplicitPrimary && process.env.AG_METER_TEST_MODE !== '1');
 
-  const brainDir = path.join(agDir, 'brain');
-  const convDir = path.join(agDir, 'conversations');
+  const distros = allowAutoDistros ? listRegisteredWslDistros(options) : [];
+  const timeoutMs = Number.isFinite(Number(options.wslProbeTimeoutMs)) && Number(options.wslProbeTimeoutMs) > 0
+    ? Number(options.wslProbeTimeoutMs)
+    : 1500;
+  const fsPromises = options.fs?.promises || fs.promises;
+  const pathMod = platform === 'win32' ? path.win32 : path;
+
+  const runWithBoundedTimeout = async (promiseFactory, targetLabel) => {
+    let timer = null;
+    try {
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(`WSL 探测超时 (${timeoutMs}ms): ${targetLabel}`);
+          err.code = 'ETIMEDOUT';
+          reject(err);
+        }, timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+      });
+      return await Promise.race([promiseFactory(), timeoutPromise]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
+  const probeDistroAsync = async (d) => {
+    if (typeof options.wslProbeFn === 'function') {
+      return await runWithBoundedTimeout(() => Promise.resolve(options.wslProbeFn(d)), d.name);
+    }
+    if (options.fs && !options.fs.promises) {
+      return resolveWslDistroUncRoot(d.name, options);
+    }
+    return await runWithBoundedTimeout(async () => {
+      for (const prefix of ['\\\\wsl.localhost', '\\\\wsl$']) {
+        const candidate = `${prefix}\\${d.name}`;
+        for (const sub of ['root', 'home']) {
+          try {
+            await fsPromises.access(pathMod.join(candidate, sub));
+            return candidate;
+          } catch { }
+        }
+      }
+      return null;
+    }, d.name);
+  };
+
+  const discoveredRoots = [];
+  const skippedRoots = [];
+  const probeResults = await Promise.all(distros.map(async (d) => {
+    try {
+      const root = await probeDistroAsync(d);
+      return { name: d.name, root, error: null };
+    } catch (e) {
+      return { name: d.name, root: null, error: e };
+    }
+  }));
+
+  for (const r of probeResults) {
+    if (r.error) {
+      skippedRoots.push({ target: r.name, reason: r.error.code === 'ETIMEDOUT' ? 'timeout' : (r.error.code || r.error.message || 'error') });
+    } else if (r.root) {
+      discoveredRoots.push(r.root);
+    } else {
+      skippedRoots.push({ target: r.name, reason: 'unreachable' });
+    }
+  }
+
+  const explicitRoots = Array.isArray(options.wslRoots) ? options.wslRoots : [];
+  const roots = dedupeScanPaths([...discoveredRoots, ...explicitRoots], platform);
+
+  const desktopDirs = [];
+  const cliDirs = [];
+  for (const r of roots) {
+    try {
+      const found = await runWithBoundedTimeout(
+        () => Promise.resolve(collectGeminiDirsFromLinuxRoot(r, options)),
+        r
+      );
+      desktopDirs.push(...found.desktopDirs);
+      cliDirs.push(...found.cliDirs);
+    } catch (e) {
+      skippedRoots.push({ target: r, reason: e?.code === 'ETIMEDOUT' ? 'timeout' : (e?.code || e?.message || 'error') });
+    }
+  }
+
+  const result = {
+    distros: distros.map(d => d.name),
+    roots,
+    desktopDirs: dedupeScanPaths(desktopDirs, platform),
+    cliDirs: dedupeScanPaths(cliDirs, platform),
+    skippedRoots
+  };
+  if (!hasCustomOverride) {
+    wslDiscoveryCache = { scopeKey, at: Date.now(), value: result };
+  }
+  return result;
+}
+
+function resolvePrimaryGeminiDirs(options = {}) {
+  const home = process.env.USERPROFILE || os.homedir();
+  const explicitAg = options.agDir || process.env.AG_DIR || null;
+  const agDir = explicitAg || path.join(home, '.gemini', 'antigravity');
+  const agCliDir = options.agCliDir || process.env.AG_CLI_DIR || (
+    explicitAg
+      ? path.join(path.dirname(path.resolve(explicitAg)), 'antigravity-cli')
+      : path.join(home, '.gemini', 'antigravity-cli')
+  );
+  return { home, agDir, agCliDir };
+}
+
+function getEffectiveScanScopeKey(options = {}) {
+  const resolved = resolvePrimaryGeminiDirs(options);
+  const agDir = path.resolve(resolved.agDir);
+  const agCliDir = path.resolve(resolved.agCliDir);
+  const extraDesk = dedupeScanPaths(Array.isArray(options.extraAgDirs) ? options.extraAgDirs : []);
+  const extraCli = dedupeScanPaths(Array.isArray(options.extraAgCliDirs) ? options.extraAgCliDirs : []);
+  const wslRoots = dedupeScanPaths(Array.isArray(options.wslRoots) ? options.wslRoots : []);
+  const wslFlag = options.includeWsl === false || process.env.AG_DISABLE_WSL_SCAN === '1'
+    ? 'wsl=0'
+    : (options.includeWsl === true ? 'wsl=1' : 'wsl=auto');
+  const parts = [agDir, agCliDir, wslFlag, ...extraDesk, ...extraCli, ...wslRoots];
+  return process.platform === 'win32'
+    ? parts.map(p => p.toLowerCase()).join('|')
+    : parts.join('|');
+}
+
+function isFsMonkeyPatched() {
+  return fs.readFileSync !== origFsMethods.readFileSync ||
+    fs.writeFileSync !== origFsMethods.writeFileSync ||
+    fs.copyFileSync !== origFsMethods.copyFileSync ||
+    fs.renameSync !== origFsMethods.renameSync ||
+    fs.readdirSync !== origFsMethods.readdirSync ||
+    fs.statSync !== origFsMethods.statSync ||
+    fs.existsSync !== origFsMethods.existsSync;
+}
+
+function captureCollectorEnvSnapshot() {
+  const snap = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === 'string') snap[k] = v;
+  }
+  return snap;
+}
+
+function cloneCollectorOptionsForWorker(options = {}) {
+  const out = {};
+  if (!options || typeof options !== 'object') return out;
+  for (const [k, v] of Object.entries(options)) {
+    if (k === '_inWorker' || k === 'fs' || k === 'hostFetcher') continue;
+    if (typeof v === 'function' || typeof v === 'symbol' || v === undefined) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+function canUseHistoryWorker(options = {}) {
+  if (!isMainThread || typeof Worker !== 'function') return false;
+  if (historyWorkerDisabled || options.useWorker === false || options._inWorker) return false;
+  if (options.fs || options.hostFetcher) return false;
+  if (Date.now !== origDateNow || isFsMonkeyPatched()) return false;
+  return true;
+}
+
+let historyWorkerDisabled = false;
+let historyWorkerConsecutiveErrors = 0;
+let historyWorkerInstance = null;
+let historyWorkerScriptPath = __filename;
+let historyWorkerIdleTimer = null;
+let historyWorkerReqId = 1;
+const historyWorkerPending = new Map();
+const HISTORY_WORKER_IDLE_MS = 45000;
+const DEFAULT_HISTORY_WORKER_TIMEOUT_MS = 45000;
+
+function clearAllHistoryWorkerPending(targetWorker = null, errReason = null) {
+  for (const [id, entry] of historyWorkerPending.entries()) {
+    if (targetWorker && entry.worker !== targetWorker) continue;
+    historyWorkerPending.delete(id);
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.resolve(errReason ? { _workerHandled: false, error: errReason } : null);
+  }
+}
+
+function scheduleHistoryWorkerIdleCleanup() {
+  if (historyWorkerIdleTimer) {
+    clearTimeout(historyWorkerIdleTimer);
+    historyWorkerIdleTimer = null;
+  }
+  if (!historyWorkerInstance || historyWorkerPending.size > 0) return;
+  const idleMs = process.env.NODE_TEST_CONTEXT ? 120 : HISTORY_WORKER_IDLE_MS;
+  historyWorkerIdleTimer = setTimeout(() => {
+    historyWorkerIdleTimer = null;
+    if (historyWorkerInstance && historyWorkerPending.size === 0) {
+      const w = historyWorkerInstance;
+      historyWorkerInstance = null;
+      try { w.terminate(); } catch { }
+    }
+  }, idleMs);
+  if (typeof historyWorkerIdleTimer.unref === 'function') historyWorkerIdleTimer.unref();
+}
+
+function getOrStartHistoryWorker(workerEntry = __filename) {
+  const targetScript = workerEntry || __filename;
+  if (historyWorkerInstance && historyWorkerScriptPath === targetScript) return historyWorkerInstance;
+  if (historyWorkerInstance && historyWorkerScriptPath !== targetScript) {
+    const oldW = historyWorkerInstance;
+    historyWorkerInstance = null;
+    clearAllHistoryWorkerPending(oldW, 'worker_replaced');
+    try { oldW.terminate(); } catch { }
+  }
+  historyWorkerScriptPath = targetScript;
+  const w = new Worker(targetScript, {
+    workerData: { agCollectorHistoryWorker: true }
+  });
+  w.on('message', (msg) => {
+    if (!msg || !msg.id) return;
+    const entry = historyWorkerPending.get(msg.id);
+    if (!entry) return;
+    historyWorkerPending.delete(msg.id);
+    if (entry.timer) clearTimeout(entry.timer);
+    historyWorkerConsecutiveErrors = 0;
+    if (historyWorkerPending.size === 0) {
+      try { w.unref(); } catch { }
+    }
+    scheduleHistoryWorkerIdleCleanup();
+    if (msg.ok) entry.resolve({ _workerHandled: true, result: msg.result });
+    else entry.resolve({ _workerHandled: false, error: msg.error || 'Worker 执行失败' });
+  });
+  w.on('error', (err) => {
+    historyWorkerConsecutiveErrors++;
+    if (historyWorkerConsecutiveErrors >= 3) {
+      historyWorkerDisabled = true;
+    }
+    if (historyWorkerInstance === w) historyWorkerInstance = null;
+    clearAllHistoryWorkerPending(w, err?.message || 'worker_error');
+    try { w.terminate(); } catch { }
+  });
+  w.on('exit', (code) => {
+    if (code !== 0) {
+      let hadPending = false;
+      for (const entry of historyWorkerPending.values()) {
+        if (entry.worker === w) { hadPending = true; break; }
+      }
+      if (hadPending) {
+        historyWorkerConsecutiveErrors++;
+        if (historyWorkerConsecutiveErrors >= 3) {
+          historyWorkerDisabled = true;
+        }
+      }
+    }
+    if (historyWorkerInstance === w) historyWorkerInstance = null;
+    clearAllHistoryWorkerPending(w, code !== 0 ? `worker_exit_${code}` : null);
+  });
+  // Node.js v24 注册 message 监听会隐式 ref 底层 MessagePort，必须在全部监听绑定之后再 unref
+  try { w.unref(); } catch { }
+  historyWorkerInstance = w;
+  return w;
+}
+
+let recordCallsAsyncQueue = Promise.resolve();
+
+function invalidateHostLedgerAndHistoryCaches() {
+  ledgerCacheByPath.clear();
+  cachedTokenHistory = null;
+  cachedTokenHistoryAt = 0;
+}
+
+/**
+ * 异步入账模型调用记录（优先交由后台 Worker 线程执行大账本读写与合并，保持串行无竞态并零阻塞主进程事件循环）
+ * @param {Array<object>} newCalls
+ * @param {object|string} options
+ */
+async function recordModelCallsAsync(newCalls = [], options = {}) {
+  if (!Array.isArray(newCalls) || !newCalls.length) return { ok: true, changed: false };
+  const optsObj = typeof options === 'string' ? { agDir: options } : (options && typeof options === 'object' ? options : {});
+  const task = recordCallsAsyncQueue.then(async () => {
+    if (canUseHistoryWorker(optsObj)) {
+      const workerResp = await runHistoryWorkerTask({
+        newCalls,
+        options: cloneCollectorOptionsForWorker(optsObj)
+      }, 'recordModelCalls', optsObj);
+      if (workerResp && workerResp._workerHandled) {
+        const res = workerResp.result;
+        if (res && res.changed) {
+          invalidateHostLedgerAndHistoryCaches();
+        }
+        return res;
+      }
+    }
+    const res = recordModelCalls(newCalls, optsObj);
+    if (res && res.changed) {
+      invalidateHostLedgerAndHistoryCaches();
+    }
+    return res;
+  });
+  recordCallsAsyncQueue = task.catch(() => { });
+  return task;
+}
+
+async function runHistoryWorkerTask(payload, cmd = 'collectTokenHistory', taskOptions = {}) {
+  try {
+    if (historyWorkerIdleTimer) {
+      clearTimeout(historyWorkerIdleTimer);
+      historyWorkerIdleTimer = null;
+    }
+    const workerEntry = (taskOptions && taskOptions._historyWorkerScript) || __filename;
+    const timeoutMs = Number.isFinite(Number(taskOptions?.workerTimeoutMs)) && Number(taskOptions.workerTimeoutMs) > 0
+      ? Number(taskOptions.workerTimeoutMs)
+      : DEFAULT_HISTORY_WORKER_TIMEOUT_MS;
+    const w = getOrStartHistoryWorker(workerEntry);
+    const id = historyWorkerReqId++;
+    return await new Promise((resolve) => {
+      const entry = { resolve, timer: null, worker: w };
+      entry.timer = setTimeout(() => {
+        if (!historyWorkerPending.has(id)) return;
+        historyWorkerPending.delete(id);
+        if (historyWorkerInstance === w) historyWorkerInstance = null;
+        clearAllHistoryWorkerPending(w, `Worker 任务超时 (${timeoutMs}ms)`);
+        try { w.terminate(); } catch { }
+        resolve({ _workerHandled: false, error: `Worker 任务超时 (${timeoutMs}ms)`, timedOut: true });
+      }, timeoutMs);
+      if (typeof entry.timer.unref === 'function') entry.timer.unref();
+      historyWorkerPending.set(id, entry);
+      try {
+        try { w.ref(); } catch { }
+        w.postMessage({ id, cmd, payload, env: captureCollectorEnvSnapshot() });
+      } catch {
+        historyWorkerPending.delete(id);
+        if (historyWorkerPending.size === 0) {
+          try { w.unref(); } catch { }
+        }
+        if (entry.timer) clearTimeout(entry.timer);
+        resolve(null);
+      }
+    });
+  } catch {
+    return null;
+  }
+}
+
+let cachedNodeDatabaseSync;
+
+function getNodeDatabaseSync() {
+  if (cachedNodeDatabaseSync !== undefined) return cachedNodeDatabaseSync;
+  try {
+    cachedNodeDatabaseSync = require('node:sqlite').DatabaseSync || null;
+  } catch {
+    cachedNodeDatabaseSync = null;
+  }
+  return cachedNodeDatabaseSync;
+}
+
+function buildSqliteUriWithQuery(dbPath, query) {
+  const normalized = String(dbPath || '').replace(/\\/g, '/');
+  const encoded = encodeURI(normalized).replace(/#/g, '%23').replace(/\?/g, '%3F');
+  if (encoded.startsWith('//')) {
+    return `file://${encoded}?${query}`;
+  }
+  return `file:///${encoded.replace(/^\/+/, '')}?${query}`;
+}
+
+/**
+ * 构建 SQLite 只读 immutable URI，兼容 Windows 盘符、UNC (\\wsl.localhost\...) 与 POSIX 路径。
+ * 必须显式使用 file:////wsl.localhost/...?immutable=1，否则 9P 共享目录会报 database is locked。
+ * @param {string} dbPath
+ * @returns {string}
+ */
+function buildSqliteImmutableUri(dbPath) {
+  return buildSqliteUriWithQuery(dbPath, 'immutable=1');
+}
+
+function buildSqliteModeRoUri(dbPath) {
+  return buildSqliteUriWithQuery(dbPath, 'mode=ro');
+}
+
+function readPbVarint(buf, offset, end = buf.length) {
+  let value = 0;
+  let multiplier = 1;
+  let pos = offset;
+  while (pos < end && pos - offset < 10) {
+    const byte = buf[pos++];
+    value += (byte & 0x7f) * multiplier;
+    if ((byte & 0x80) === 0) {
+      return { value, next: pos };
+    }
+    multiplier *= 128;
+  }
+  return null;
+}
+
+function walkPbFields(buf, start, end, onField) {
+  let pos = start;
+  while (pos < end) {
+    const tagInfo = readPbVarint(buf, pos, end);
+    if (!tagInfo) break;
+    pos = tagInfo.next;
+    const fieldNum = Math.floor(tagInfo.value / 8);
+    const wireType = tagInfo.value % 8;
+    if (fieldNum <= 0) break;
+
+    if (wireType === 0) {
+      const valInfo = readPbVarint(buf, pos, end);
+      if (!valInfo) break;
+      pos = valInfo.next;
+      onField(fieldNum, wireType, valInfo.value, 0, 0);
+    } else if (wireType === 1) {
+      if (pos + 8 > end) break;
+      pos += 8;
+      onField(fieldNum, wireType, 0, pos - 8, pos);
+    } else if (wireType === 2) {
+      const lenInfo = readPbVarint(buf, pos, end);
+      if (!lenInfo || lenInfo.value < 0) break;
+      const valStart = lenInfo.next;
+      const valEnd = valStart + lenInfo.value;
+      if (valEnd > end) break;
+      pos = valEnd;
+      onField(fieldNum, wireType, 0, valStart, valEnd);
+    } else if (wireType === 5) {
+      if (pos + 4 > end) break;
+      pos += 4;
+      onField(fieldNum, wireType, 0, pos - 4, pos);
+    } else {
+      break;
+    }
+  }
+}
+
+function parsePbDurationSec(buf, start, end) {
+  let seconds = 0;
+  let nanos = 0;
+  let hasField = false;
+  walkPbFields(buf, start, end, (fn, wt, val) => {
+    if (wt !== 0) return;
+    if (fn === 1) { seconds = val; hasField = true; }
+    else if (fn === 2) { nanos = val; hasField = true; }
+  });
+  if (!hasField) return null;
+  const secVal = seconds + nanos / 1e9;
+  return Number.isFinite(secVal) && secVal >= 0 ? Number(secVal.toFixed(2)) : null;
+}
+
+/**
+ * 从 gen_metadata.data 的 Protobuf 负载提取完整的步骤元数据（兼容模型 ID、展示标签、耗时、responseId 与父子关联）。
+ */
+function extractStepMetaFromGenMetadataBlob(rawData) {
+  if (!rawData || !rawData.length) return [];
+  const buf = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData);
+  const steps = [];
+  let rawModel = '';
+  let label = '';
+  let modelEnum = '';
+  let responseId = '';
+  let ttftSec = null;
+  let streamingSec = null;
+  let parentCascadeId = '';
+  let rootCascadeId = '';
+  let subagentType = '';
+
+  walkPbFields(buf, 0, buf.length, (fn, wt, val, vs, ve) => {
+    if (fn === 2) {
+      if (wt === 0 && Number.isInteger(val) && val >= 0) {
+        steps.push(val);
+      } else if (wt === 2) {
+        let p = vs;
+        while (p < ve) {
+          const item = readPbVarint(buf, p, ve);
+          if (!item) break;
+          if (Number.isInteger(item.value) && item.value >= 0) {
+            steps.push(item.value);
+          }
+          p = item.next;
+        }
+      }
+    } else if (fn === 1 && wt === 2) {
+      walkPbFields(buf, vs, ve, (cfn, cwt, _cval, cvs, cve) => {
+        if (cwt !== 2) return;
+        if (cfn === 4) {
+          walkPbFields(buf, cvs, cve, (ufn, uwt, _uval, uvs, uve) => {
+            if (ufn === 7 && uwt === 2) {
+              const str = buf.toString('utf8', uvs, uve).trim();
+              if (str) responseId = str;
+            }
+          });
+        } else if (cfn === 11) {
+          const d = parsePbDurationSec(buf, cvs, cve);
+          if (d !== null) ttftSec = d;
+        } else if (cfn === 12) {
+          const d = parsePbDurationSec(buf, cvs, cve);
+          if (d !== null) streamingSec = d;
+        } else if (cfn === 19) {
+          const str = buf.toString('utf8', cvs, cve).trim();
+          if (str) rawModel = str;
+        } else if (cfn === 20) {
+          let k = '';
+          let v = '';
+          walkPbFields(buf, cvs, cve, (kfn, kwt, _kval, kvs, kve) => {
+            if (kwt !== 2) return;
+            if (kfn === 1) k = buf.toString('utf8', kvs, kve).trim();
+            else if (kfn === 2) v = buf.toString('utf8', kvs, kve).trim();
+          });
+          if (k === 'model_enum' && v) modelEnum = v;
+          else if (k === 'parent_cascade_id' && v) parentCascadeId = v;
+          else if (k === 'root_cascade_id' && v) rootCascadeId = v;
+          else if (k === 'subagent_type' && v) subagentType = v;
+        } else if (cfn === 21) {
+          const str = buf.toString('utf8', cvs, cve).trim();
+          if (str) label = str;
+        }
+      });
+    }
+  });
+
+  const resolvedModel = label || rawModel || modelEnum;
+  const resolvedExactId = modelEnum || rawModel || '';
+  if (!steps.length) return [];
+  if (!resolvedModel && !resolvedExactId && !responseId && ttftSec === null && streamingSec === null && !parentCascadeId && !rootCascadeId) {
+    return [];
+  }
+  return steps.map(stepIndex => ({
+    stepIndex,
+    model: resolvedModel,
+    rawModel,
+    modelLabel: label,
+    modelExactId: resolvedExactId,
+    responseId,
+    ttftSec,
+    streamingSec,
+    parentCascadeId,
+    rootCascadeId,
+    subagentType
+  }));
+}
+
+/**
+ * 从会话数据库 gen_metadata.data 的 Protobuf 负载提取 stepIndex -> model/label 映射（保持兼容旧签名）。
+ * 顶层字段 2 为 stepIndices（单个 varint 或 packed varint），字段 1 内的 19 为 rawModel、21 为展示标签。
+ * @param {Buffer|Uint8Array} rawData
+ * @returns {Array<{stepIndex: number, model: string}>}
+ */
+function extractStepModelsFromGenMetadataBlob(rawData) {
+  return extractStepMetaFromGenMetadataBlob(rawData)
+    .filter(item => Boolean(item.model))
+    .map(item => ({ stepIndex: item.stepIndex, model: item.model }));
+}
+
+function extractTrajectoryBlobMeta(rawData, selfCascadeId = '') {
+  const out = { parentCascadeId: '', rootCascadeId: '', subagentType: '', subagentRole: '' };
+  if (!rawData || !rawData.length) return out;
+  const buf = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData);
+  const selfNorm = String(selfCascadeId || '').trim().toLowerCase();
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  walkPbFields(buf, 0, buf.length, (fn, wt, _val, vs, ve) => {
+    if (wt !== 2) return;
+    if (fn === 4) {
+      walkPbFields(buf, vs, ve, (cfn, cwt, _cval, cvs, cve) => {
+        if (cwt !== 2) return;
+        if (cfn === 1) {
+          const s = buf.toString('utf8', cvs, cve).trim();
+          if (s && s.length < 64) out.subagentType = s;
+        } else if (cfn === 2) {
+          const s = buf.toString('utf8', cvs, cve).trim();
+          if (s && s.length < 120) out.subagentRole = s;
+        }
+      });
+    } else if (fn === 5) {
+      const s = buf.toString('utf8', vs, ve).trim();
+      if (uuidRe.test(s) && s.toLowerCase() !== selfNorm) out.parentCascadeId = s;
+    } else if (fn === 6) {
+      const s = buf.toString('utf8', vs, ve).trim();
+      if (uuidRe.test(s) && s.toLowerCase() !== selfNorm) out.rootCascadeId = s;
+    }
+  });
+  return out;
+}
+
+const conversationDbMetaCache = new Map();
+const MAX_CONVERSATION_DB_CACHE_ENTRIES = 500;
+
+function getDbFileCacheSig(dbPath) {
+  try {
+    const stDb = origFsMethods.statSync(dbPath);
+    if (!stDb.isFile()) return null;
+    const walPath = `${dbPath}-wal`;
+    const shmPath = `${dbPath}-shm`;
+    let walSize = 0;
+    let walMtimeMs = 0;
+    let hasWal = false;
+    let hasShm = false;
+    try {
+      if (origFsMethods.existsSync(walPath)) {
+        const stWal = origFsMethods.statSync(walPath);
+        hasWal = stWal.isFile();
+        walSize = stWal.size || 0;
+        walMtimeMs = stWal.mtimeMs || 0;
+      }
+    } catch { }
+    try {
+      hasShm = origFsMethods.existsSync(shmPath) && origFsMethods.statSync(shmPath).isFile();
+    } catch { }
+    return {
+      sig: `${stDb.size}:${stDb.mtimeMs}:${hasWal ? 1 : 0}:${walSize}:${walMtimeMs}:${hasShm ? 1 : 0}`,
+      hasWal,
+      walSize,
+      hasShm
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 严格只读且兼顾 WAL 一致性地读取会话 .db（不修改 .db / -wal / -shm，不以 immutable 绕过活跃锁读取撕裂页）：
+ * - 当不存在非空 -wal 时，使用 ?immutable=1（零写零锁，且兼容 WSL UNC）；
+ * - 当存在非空 -wal 且存在 -shm 时，使用 ?mode=ro（遵守 SQLite 锁读取一致 WAL 快照，不创建新伴生文件）；
+ * - 当存在非空 -wal 但缺少 -shm 或只读受锁阻断时，安全降级返回空（保留未知，等待后续 checkpoint 后再回填）。
+ */
+function loadConversationDbMeta(dbPath, selfCascadeId = '') {
+  const emptyResult = {
+    stepMetaMap: new Map(),
+    stepToModel: new Map(),
+    parentCascadeId: '',
+    rootCascadeId: '',
+    subagentType: '',
+    subagentRole: '',
+    readMode: 'skipped',
+    skippedReason: null
+  };
+  if (!dbPath || !origFsMethods.existsSync(dbPath)) {
+    return { ...emptyResult, skippedReason: 'missing' };
+  }
+  const DatabaseSync = getNodeDatabaseSync();
+  if (!DatabaseSync) {
+    return { ...emptyResult, skippedReason: 'sqlite_unavailable' };
+  }
+  const sigInfo = getDbFileCacheSig(dbPath);
+  if (!sigInfo) {
+    return { ...emptyResult, skippedReason: 'stat_failed' };
+  }
+
+  const cacheKey = process.platform === 'win32' ? String(dbPath).toLowerCase() : String(dbPath);
+  const cached = conversationDbMetaCache.get(cacheKey);
+  if (cached && cached.sig === sigInfo.sig) {
+    return cached.value;
+  }
+
+  let targetUri = null;
+  let readMode = 'immutable';
+  if (!sigInfo.hasWal || sigInfo.walSize === 0) {
+    targetUri = buildSqliteImmutableUri(dbPath);
+    readMode = 'immutable';
+  } else if (sigInfo.hasShm) {
+    targetUri = buildSqliteModeRoUri(dbPath);
+    readMode = 'mode_ro_wal';
+  } else {
+    return { ...emptyResult, readMode: 'skipped', skippedReason: 'wal_without_shm' };
+  }
+
+  const stepMetaMap = new Map();
+  const stepToModel = new Map();
+  let parentCascadeId = '';
+  let rootCascadeId = '';
+  let subagentType = '';
+  let subagentRole = '';
+
+  let db = null;
+  try {
+    db = new DatabaseSync(targetUri, { readOnly: true });
+    try {
+      const rows = db.prepare('SELECT data FROM gen_metadata').all();
+      for (const row of rows) {
+        const entries = extractStepMetaFromGenMetadataBlob(row?.data);
+        for (const item of entries) {
+          if (!item || !Number.isInteger(item.stepIndex)) continue;
+          stepMetaMap.set(item.stepIndex, item);
+          if (item.model) stepToModel.set(item.stepIndex, item.model);
+          if (!parentCascadeId && item.parentCascadeId) parentCascadeId = item.parentCascadeId;
+          if (!rootCascadeId && item.rootCascadeId) rootCascadeId = item.rootCascadeId;
+          if (!subagentType && item.subagentType) subagentType = item.subagentType;
+        }
+      }
+    } catch {
+      // 忽略缺失 gen_metadata 表或非预期 schema
+    }
+    try {
+      const tmbRows = db.prepare('SELECT data FROM trajectory_metadata_blob LIMIT 2').all();
+      for (const row of tmbRows) {
+        const tm = extractTrajectoryBlobMeta(row?.data, selfCascadeId);
+        if (!parentCascadeId && tm.parentCascadeId) parentCascadeId = tm.parentCascadeId;
+        if (!rootCascadeId && tm.rootCascadeId) rootCascadeId = tm.rootCascadeId;
+        if (!subagentType && tm.subagentType) subagentType = tm.subagentType;
+        if (!subagentRole && tm.subagentRole) subagentRole = tm.subagentRole;
+      }
+    } catch {
+      // 旧库可能没有 trajectory_metadata_blob
+    }
+  } catch (err) {
+    return {
+      ...emptyResult,
+      readMode: 'skipped',
+      skippedReason: err?.code || err?.message || 'sqlite_open_error'
+    };
+  } finally {
+    if (db) {
+      try { db.close(); } catch { }
+    }
+  }
+
+  const out = {
+    stepMetaMap,
+    stepToModel,
+    parentCascadeId,
+    rootCascadeId,
+    subagentType,
+    subagentRole,
+    readMode,
+    skippedReason: null
+  };
+  if (conversationDbMetaCache.size >= MAX_CONVERSATION_DB_CACHE_ENTRIES) {
+    const oldest = conversationDbMetaCache.keys().next().value;
+    if (oldest) conversationDbMetaCache.delete(oldest);
+  }
+  conversationDbMetaCache.set(cacheKey, { sig: sigInfo.sig, value: out });
+  return out;
+}
+
+function loadStepModelMapFromSqlite(dbPath) {
+  return loadConversationDbMeta(dbPath).stepToModel;
+}
+
+function needsDbLabelEnrichment(rec) {
+  if (!rec || !(rec.tot > 0)) return false;
+  if (!rec.model) return true;
+  if (/^model_/i.test(rec.model)) return true;
+  if (!rec.modelLabel && !/[A-Z\s()]/.test(rec.model)) return true;
+  return false;
+}
+
+function backfillMissingModelsFromConversationDb(records, convDir, options = {}) {
+  if (!Array.isArray(records) || !records.length || !convDir || options.fs || isFsMonkeyPatched()) return 0;
+
+  const targetByCascade = new Map();
+  for (const rec of records) {
+    if (!rec || !(rec.tot > 0)) continue;
+    const needsLabel = needsDbLabelEnrichment(rec);
+    const needsMeta = !rec.modelExactId || rec.ttftSec == null || rec.streamingSec == null;
+    if (!needsLabel && !needsMeta) continue;
+    if (!Number.isInteger(rec.stepIndex) || rec.stepIndex < 0) continue;
+    const cid = String(rec.cascadeId || '').trim();
+    if (!cid || cid.includes('..') || cid.includes('/') || cid.includes('\\')) continue;
+    let list = targetByCascade.get(cid);
+    if (!list) {
+      list = [];
+      targetByCascade.set(cid, list);
+    }
+    list.push(rec);
+  }
+  if (targetByCascade.size === 0) return 0;
+
+  let filledCount = 0;
+  for (const [cid, recs] of targetByCascade.entries()) {
+    const dbPath = path.join(convDir, `${cid}.db`);
+    const dbMeta = loadConversationDbMeta(dbPath, cid);
+    if (dbMeta.stepMetaMap.size === 0) continue;
+    for (const rec of recs) {
+      const recovered = dbMeta.stepMetaMap.get(rec.stepIndex);
+      if (!recovered) continue;
+      let modelOrLabelFilled = false;
+      if (recovered.model && (!rec.model || (/^model_/i.test(rec.model) && recovered.model !== rec.model))) {
+        rec.model = recovered.model;
+        modelOrLabelFilled = true;
+      }
+      if (!rec.modelExactId && recovered.modelExactId) {
+        rec.modelExactId = recovered.modelExactId;
+      }
+      const recoveredLabel = recovered.modelLabel || (recovered.model && /[A-Z\s()]/.test(recovered.model) ? recovered.model : '');
+      if (!rec.modelLabel && recoveredLabel) {
+        rec.modelLabel = recoveredLabel;
+        modelOrLabelFilled = true;
+      }
+      if (modelOrLabelFilled) filledCount++;
+      if (rec.ttftSec == null && recovered.ttftSec != null) {
+        rec.ttftSec = recovered.ttftSec;
+      }
+      if (rec.streamingSec == null && recovered.streamingSec != null) {
+        rec.streamingSec = recovered.streamingSec;
+      }
+      if (!rec.responseId && recovered.responseId) {
+        rec.responseId = recovered.responseId;
+      }
+      if (!rec.parentCascadeId && (recovered.parentCascadeId || dbMeta.parentCascadeId)) {
+        rec.parentCascadeId = recovered.parentCascadeId || dbMeta.parentCascadeId;
+      }
+      if (!rec.rootCascadeId && (recovered.rootCascadeId || dbMeta.rootCascadeId)) {
+        rec.rootCascadeId = recovered.rootCascadeId || dbMeta.rootCascadeId;
+      }
+      if (!rec.subagentType && (recovered.subagentType || dbMeta.subagentType)) {
+        rec.subagentType = recovered.subagentType || dbMeta.subagentType;
+      }
+    }
+  }
+  return filledCount;
+}
+
+function mergeModelDailyMaps(...maps) {
+  const out = {};
+  for (const m of maps) {
+    if (!m || typeof m !== 'object') continue;
+    for (const [dateKey, modelRecs] of Object.entries(m)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey) || !modelRecs || typeof modelRecs !== 'object') continue;
+      if (!out[dateKey]) out[dateKey] = {};
+      for (const [mKey, rec] of Object.entries(modelRecs)) {
+        if (!rec || typeof rec !== 'object') continue;
+        if (!out[dateKey][mKey]) {
+          out[dateKey][mKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+        }
+        out[dateKey][mKey].total += Number(rec.total) || 0;
+        out[dateKey][mKey].input += Number(rec.input) || 0;
+        out[dateKey][mKey].output += Number(rec.output) || 0;
+        out[dateKey][mKey].cache += Number(rec.cache) || 0;
+        out[dateKey][mKey].steps += Number(rec.steps) || 0;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 基于账本（含 RPC 富化模型）与未匹配 transcript 实时记录构建分来源按日按模型用量分布，
+ * 并严格对齐 dailyMap 权威总额（未能归属模型的差额落入 UNATTRIBUTED_MODEL_KEY）。
+ */
+function buildDailyModelBreakdown(params) {
+  const {
+    recentRequests,
+    finalCallsEntries,
+    matchedTranscriptReqs,
+    matchedLedgerKeys,
+    resolveLedgerCallDate,
+    mergedDesktop,
+    mergedCli,
+    mergedLegacyUnallocated,
+    archiveV2,
+    compactModelConfigs,
+    availableModelDetails
+  } = params;
+
+  const modelMetaByKey = {};
+  const archivedMetaByKey = (archiveV2?.modelMetaByKey && typeof archiveV2.modelMetaByKey === 'object')
+    ? archiveV2.modelMetaByKey
+    : {};
+  const matchedModels = { desktop: {}, cli: {} };
+  const extraModels = { desktop: {}, cli: {} };
+  const bucketMemo = new Map();
+
+  const addModelBucket = (srcMap, dateKey, callObj, inp, cap, outp, tot, steps = 1) => {
+    if (!dateKey || !/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return;
+    if (tot <= 0 && steps <= 0) return;
+    const memoKey = `${callObj.model || ''}\0${callObj.modelExactId || ''}\0${callObj.modelLabel || ''}\0${callObj.effort || ''}`;
+    let bucket = bucketMemo.get(memoKey);
+    if (!bucket) {
+      bucket = resolveModelUsageBucket(callObj, compactModelConfigs, availableModelDetails);
+      if (bucketMemo.size < 2000) bucketMemo.set(memoKey, bucket);
+    }
+    const vKey = bucket.variantKey || UNATTRIBUTED_MODEL_KEY;
+    if (bucket.isAttributed && vKey !== UNATTRIBUTED_MODEL_KEY) {
+      modelMetaByKey[vKey] = {
+        modelKey: bucket.modelKey,
+        modelLabel: bucket.modelLabel,
+        variantKey: vKey,
+        variantLabel: bucket.variantLabel
+      };
+    }
+    if (!srcMap[dateKey]) srcMap[dateKey] = {};
+    if (!srcMap[dateKey][vKey]) {
+      srcMap[dateKey][vKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+    }
+    srcMap[dateKey][vKey].total += tot;
+    srcMap[dateKey][vKey].input += inp;
+    srcMap[dateKey][vKey].output += outp;
+    srcMap[dateKey][vKey].cache += cap;
+    srcMap[dateKey][vKey].steps += steps;
+  };
+
+  for (const [ledgerKey, c] of finalCallsEntries) {
+    if (!c) continue;
+    const effDate = resolveLedgerCallDate(ledgerKey, c);
+    if (!effDate || !/^\d{4}-\d{2}-\d{2}$/.test(effDate)) continue;
+    const srcKey = c.source === 'cli' ? 'cli' : 'desktop';
+    const inp = Number(c.inputTokens ?? c.input_tokens ?? c.input ?? 0) || 0;
+    const cap = Number(c.cacheTokens ?? c.cacheReadTokens ?? c.cache_read_tokens ?? c.cached ?? 0) || 0;
+    const outp = Number(c.outputTokens ?? c.output_tokens ?? c.output ?? 0) || 0;
+    const tot = Number(c.totalTokens) || (inp + cap + outp);
+    addModelBucket(matchedLedgerKeys.has(ledgerKey) ? matchedModels[srcKey] : extraModels[srcKey], effDate, c, inp, cap, outp, tot, 1);
+  }
+
+  for (const r of recentRequests) {
+    if (matchedTranscriptReqs && matchedTranscriptReqs.has(r)) continue;
+    const srcKey = r.source === 'cli' ? 'cli' : 'desktop';
+    const inp = Number(r.inputTokens) || 0;
+    const cap = Number(r.cacheTokens ?? r.cacheReadTokens ?? 0) || 0;
+    const outp = Number(r.outputTokens) || 0;
+    const tot = Number(r.totalTokens) || (inp + cap + outp);
+    addModelBucket(matchedModels[srcKey], r.date, r, inp, cap, outp, tot, 1);
+  }
+
+  const appendScaledDayBuckets = (dayOut, srcDay, authTotal, state) => {
+    if (!srcDay) return;
+    for (const [mKey, rec] of Object.entries(srcDay)) {
+      if (state.sumTot >= authTotal) break;
+      const takeTot = Math.min(rec.total, authTotal - state.sumTot);
+      const ratio = rec.total > 0 ? takeTot / rec.total : 0;
+      if (!dayOut[mKey]) dayOut[mKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+      const addInp = takeTot === rec.total ? rec.input : Math.round(rec.input * ratio);
+      const addOut = takeTot === rec.total ? rec.output : Math.round(rec.output * ratio);
+      const addCap = takeTot === rec.total ? rec.cache : Math.max(0, takeTot - addInp - addOut);
+      dayOut[mKey].total += takeTot;
+      dayOut[mKey].input += addInp;
+      dayOut[mKey].output += addOut;
+      dayOut[mKey].cache += addCap;
+      dayOut[mKey].steps += rec.steps;
+      state.sumTot += takeTot;
+      state.sumInp += addInp;
+      state.sumOut += addOut;
+      state.sumCap += addCap;
+      state.sumSteps += rec.steps;
+    }
+  };
+
+  const reconcileSourceMap = (srcKey, authDailyMap) => {
+    const archivedModels = archiveV2?.dailyModelMapBySource?.[srcKey] || {};
+    const outMap = {};
+    const allDates = new Set([
+      ...Object.keys(authDailyMap || {}),
+      ...Object.keys(matchedModels[srcKey]),
+      ...Object.keys(extraModels[srcKey])
+    ]);
+    for (const dateKey of allDates) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) continue;
+      const authRec = authDailyMap?.[dateKey];
+      if (!authRec || Number(authRec.total) <= 0) continue;
+
+      const dayOut = {};
+      const scanDay = matchedModels[srcKey][dateKey];
+      const extraDay = extraModels[srcKey][dateKey];
+      const state = { sumTot: 0, sumInp: 0, sumOut: 0, sumCap: 0, sumSteps: 0 };
+
+      if (scanDay || extraDay) {
+        appendScaledDayBuckets(dayOut, scanDay, authRec.total, state);
+        appendScaledDayBuckets(dayOut, extraDay, authRec.total, state);
+      } else if (archivedModels[dateKey]) {
+        for (const [mKey, rec] of Object.entries(archivedModels[dateKey])) {
+          if (!rec || typeof rec !== 'object') continue;
+          const addTot = Number(rec.total) || 0;
+          const addInp = Number(rec.input) || 0;
+          const addOut = Number(rec.output) || 0;
+          const addCap = Number(rec.cache) || 0;
+          const addSteps = Number(rec.steps) || 0;
+          let effKey = mKey;
+          if (mKey !== UNATTRIBUTED_MODEL_KEY) {
+            const oldMeta = archivedMetaByKey[mKey] || null;
+            const probeLabel = oldMeta?.variantLabel || oldMeta?.modelLabel || '';
+            const reBucket = resolveModelUsageBucket(
+              { model: mKey, ...(probeLabel ? { modelLabel: probeLabel } : {}) },
+              compactModelConfigs,
+              availableModelDetails
+            );
+            effKey = reBucket.variantKey || mKey;
+            if (reBucket.isAttributed && effKey !== UNATTRIBUTED_MODEL_KEY) {
+              modelMetaByKey[effKey] = {
+                modelKey: reBucket.modelKey,
+                modelLabel: reBucket.modelLabel,
+                variantKey: effKey,
+                variantLabel: reBucket.variantLabel
+              };
+            } else if (oldMeta && !modelMetaByKey[effKey]) {
+              modelMetaByKey[effKey] = oldMeta;
+            }
+          }
+          if (!dayOut[effKey]) dayOut[effKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+          dayOut[effKey].total += addTot;
+          dayOut[effKey].input += addInp;
+          dayOut[effKey].output += addOut;
+          dayOut[effKey].cache += addCap;
+          dayOut[effKey].steps += addSteps;
+          state.sumTot += addTot;
+          state.sumInp += addInp;
+          state.sumOut += addOut;
+          state.sumCap += addCap;
+          state.sumSteps += addSteps;
+        }
+      }
+
+      const diffTot = Math.max(0, (Number(authRec.total) || 0) - state.sumTot);
+      if (diffTot > 0) {
+        if (!dayOut[UNATTRIBUTED_MODEL_KEY]) {
+          dayOut[UNATTRIBUTED_MODEL_KEY] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+        }
+        dayOut[UNATTRIBUTED_MODEL_KEY].total += diffTot;
+        dayOut[UNATTRIBUTED_MODEL_KEY].input += Math.max(0, (Number(authRec.input) || 0) - state.sumInp);
+        dayOut[UNATTRIBUTED_MODEL_KEY].output += Math.max(0, (Number(authRec.output) || 0) - state.sumOut);
+        dayOut[UNATTRIBUTED_MODEL_KEY].cache += Math.max(0, (Number(authRec.cache) || 0) - state.sumCap);
+        dayOut[UNATTRIBUTED_MODEL_KEY].steps += Math.max(0, (Number(authRec.steps) || 0) - state.sumSteps);
+      }
+
+      if (Object.keys(dayOut).length > 0) outMap[dateKey] = dayOut;
+    }
+    return outMap;
+  };
+
+  const desktopModelMap = reconcileSourceMap('desktop', mergedDesktop);
+  const cliModelMap = reconcileSourceMap('cli', mergedCli);
+  const unallocatedModelMap = {};
+  for (const [dateKey, rec] of Object.entries(mergedLegacyUnallocated || {})) {
+    if (!rec || Number(rec.total) <= 0) continue;
+    unallocatedModelMap[dateKey] = { [UNATTRIBUTED_MODEL_KEY]: { ...rec } };
+  }
+  const allModelMap = mergeModelDailyMaps(desktopModelMap, cliModelMap, unallocatedModelMap);
+
+  return {
+    dailyModelMapBySource: {
+      all: allModelMap,
+      desktop: desktopModelMap,
+      cli: cliModelMap
+    },
+    modelMetaByKey
+  };
+}
+
+/**
+ * 历史用量与账本聚合核心逻辑（支持在 Worker 线程或主线程直接运行）
+ * @param {object} options
+ * @param {object} extraContext
+ */
+async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
+  const { home, agDir, agCliDir } = resolvePrimaryGeminiDirs(options);
+
   const archivePathV1 = path.join(agDir, 'token_usage_archive_v1.json');
   const archivePathV2 = path.join(agDir, 'token_usage_archive_v2.json');
 
@@ -2186,7 +4947,7 @@ async function collectTokenHistoryAsync(options = {}) {
     if (readV1.ok && readV1.data && typeof readV1.data === 'object') {
       legacyV1Archive = readV1.data;
       if (!fs.existsSync(bakPathV1)) {
-        try { fs.copyFileSync(archivePathV1, bakPathV1); } catch {}
+        try { fs.copyFileSync(archivePathV1, bakPathV1); } catch { }
       }
     }
   }
@@ -2208,7 +4969,7 @@ async function collectTokenHistoryAsync(options = {}) {
     if (readV2.ok && readV2.data && typeof readV2.data === 'object') {
       archiveV2 = { ...archiveV2, ...readV2.data };
       if (!fs.existsSync(bakPathV2)) {
-        try { fs.copyFileSync(archivePathV2, bakPathV2); } catch {}
+        try { fs.copyFileSync(archivePathV2, bakPathV2); } catch { }
       }
     }
   }
@@ -2220,46 +4981,89 @@ async function collectTokenHistoryAsync(options = {}) {
     }
   };
 
-  // 3. 扫描桌面端与 CLI 会话文件（忽略 -wal/-shm/-journal 等伴生文件）
+  // 3. 扫描桌面端与 CLI 会话文件（含 Windows 异步探测的 WSL 发行版目录，忽略伴生文件并仅对标准 UUID 跨根去重）
+  const extraWsl = await discoverWslGeminiDirsAsync(options);
+  const desktopAgDirs = dedupeScanPaths([
+    agDir,
+    ...(Array.isArray(options.extraAgDirs) ? options.extraAgDirs : []),
+    ...extraWsl.desktopDirs
+  ]);
+  const cliAgDirs = dedupeScanPaths([
+    agCliDir,
+    ...(Array.isArray(options.extraAgCliDirs) ? options.extraAgCliDirs : []),
+    ...extraWsl.cliDirs
+  ]);
+
   let desktopPbCount = 0;
   let cliPbCount = 0;
-  const scanSessionDir = (dir, isCli = false) => {
+  const seenDesktopConvs = new Set();
+  const seenCliConvs = new Set();
+  const nonUuidConvDirsBySource = {
+    desktop: new Map(),
+    cli: new Map()
+  };
+  const UUID_SESSION_FILE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(?:db|pb)$/i;
+  const scanSessionDir = (dir, sourceName, seenSet = null) => {
     let count = 0;
     try {
       if (!fs.existsSync(dir)) return 0;
+      const normDirKey = process.platform === 'win32' ? path.resolve(dir).toLowerCase() : path.resolve(dir);
       for (const name of fs.readdirSync(dir)) {
         if (isCompanionOrTempFile(name)) continue;
         if (!name.endsWith('.pb') && !name.endsWith('.db')) continue;
         const p = path.join(dir, name);
+        const isUuid = UUID_SESSION_FILE_RE.test(name);
+        let dedupeKey;
+        if (isUuid) {
+          dedupeKey = process.platform === 'win32' ? name.toLowerCase() : name;
+        } else {
+          // 非 UUID 会话不仅靠文件名合并，仅在真实路径相同时视作同一个文件，或后续通过共享 responseId 事件确认镜像
+          let realFile = p;
+          try { realFile = fs.realpathSync(p); } catch { }
+          dedupeKey = process.platform === 'win32' ? realFile.toLowerCase() : realFile;
+        }
+        if (seenSet && seenSet.has(dedupeKey)) continue;
         try {
           const st = fs.statSync(p);
           if (st.isFile()) {
+            if (seenSet) seenSet.add(dedupeKey);
             count++;
+            if (!isUuid) {
+              const baseLower = name.replace(/\.(?:db|pb)$/i, '').toLowerCase();
+              const dirMap = nonUuidConvDirsBySource[sourceName];
+              if (dirMap) {
+                if (!dirMap.has(baseLower)) dirMap.set(baseLower, new Set());
+                dirMap.get(baseLower).add(normDirKey);
+              }
+            }
             const ts = st.birthtimeMs && st.birthtimeMs > 946684800000 ? Math.min(st.birthtimeMs, st.mtimeMs) : st.mtimeMs;
             if (ts > 946684800000) registerDate(formatLocalDateKey(new Date(ts)));
           }
-        } catch {}
+        } catch { }
       }
-    } catch {}
+    } catch { }
     return count;
   };
 
-  desktopPbCount = scanSessionDir(convDir, false);
-  if (fs.existsSync(path.join(agCliDir, 'conversations'))) {
-    cliPbCount = scanSessionDir(path.join(agCliDir, 'conversations'), true);
+  for (const dDir of desktopAgDirs) {
+    desktopPbCount += scanSessionDir(path.join(dDir, 'conversations'), 'desktop', seenDesktopConvs);
+  }
+  for (const cDir of cliAgDirs) {
+    cliPbCount += scanSessionDir(path.join(cDir, 'conversations'), 'cli', seenCliConvs);
   }
 
-  // 4. 双目录遍历扫描 transcript.jsonl（跳过 steps/scratch 重型目录，软链接与环路去重）
+  // 4. 多目录遍历扫描 transcript.jsonl（跳过 steps/scratch 重型目录，软链接与环路去重）
   const visitedRealDirs = new Set();
   const transcriptJobs = [];
 
-  const walkTranscripts = (dir, sourceName, depth = 0) => {
+  const walkTranscripts = (dir, sourceName, depth = 0, convDirPath = '') => {
     if (depth > 4) return;
     try {
       if (!fs.existsSync(dir)) return;
       const normDir = path.resolve(dir);
-      if (visitedRealDirs.has(normDir)) return;
-      visitedRealDirs.add(normDir);
+      const normKey = process.platform === 'win32' ? normDir.toLowerCase() : normDir;
+      if (visitedRealDirs.has(normKey)) return;
+      visitedRealDirs.add(normKey);
 
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         if (TRANSCRIPT_SKIP_DIRS.has(entry.name)) continue;
@@ -2267,41 +5071,46 @@ async function collectTokenHistoryAsync(options = {}) {
         if (entry.isSymbolicLink()) {
           try {
             const realTarget = fs.realpathSync(fullPath);
+            const realKey = process.platform === 'win32' ? realTarget.toLowerCase() : realTarget;
             const st = fs.statSync(realTarget);
             if (st.isDirectory()) {
-              if (!visitedRealDirs.has(realTarget)) {
-                walkTranscripts(realTarget, sourceName, depth + 1);
+              if (!visitedRealDirs.has(realKey)) {
+                walkTranscripts(realTarget, sourceName, depth + 1, convDirPath);
               }
             } else if (entry.name === 'transcript.jsonl') {
-              transcriptJobs.push({ path: realTarget, source: sourceName });
+              transcriptJobs.push({ path: realTarget, source: sourceName, convDir: convDirPath });
             }
-          } catch {}
+          } catch { }
         } else if (entry.isDirectory()) {
           if (depth === 0) {
             const stdLogPath = path.join(fullPath, '.system_generated', 'logs', 'transcript.jsonl');
             const directLogPath = path.join(fullPath, 'transcript.jsonl');
             let matchedFast = false;
             if (fs.existsSync(stdLogPath)) {
-              transcriptJobs.push({ path: stdLogPath, source: sourceName });
+              transcriptJobs.push({ path: stdLogPath, source: sourceName, convDir: convDirPath });
               matchedFast = true;
             }
             if (fs.existsSync(directLogPath)) {
-              transcriptJobs.push({ path: directLogPath, source: sourceName });
+              transcriptJobs.push({ path: directLogPath, source: sourceName, convDir: convDirPath });
               matchedFast = true;
             }
             if (matchedFast) continue;
           }
-          walkTranscripts(fullPath, sourceName, depth + 1);
+          walkTranscripts(fullPath, sourceName, depth + 1, convDirPath);
         } else if (entry.name === 'transcript.jsonl') {
-          transcriptJobs.push({ path: fullPath, source: sourceName });
+          transcriptJobs.push({ path: fullPath, source: sourceName, convDir: convDirPath });
         }
       }
-    } catch {}
+    } catch { }
   };
 
-  walkTranscripts(brainDir, 'desktop');
-  if (fs.existsSync(path.join(agCliDir, 'brain'))) {
-    walkTranscripts(path.join(agCliDir, 'brain'), 'cli');
+  for (const dDir of desktopAgDirs) {
+    const bDir = path.join(dDir, 'brain');
+    if (fs.existsSync(bDir)) walkTranscripts(bDir, 'desktop', 0, path.join(dDir, 'conversations'));
+  }
+  for (const cDir of cliAgDirs) {
+    const cbDir = path.join(cDir, 'brain');
+    if (fs.existsSync(cbDir)) walkTranscripts(cbDir, 'cli', 0, path.join(cDir, 'conversations'));
   }
 
   // 5. 结构化 JSON 解析 transcript.jsonl（基于 size+mtimeMs 单文件增量缓存，去重并汇总）
@@ -2309,7 +5118,7 @@ async function collectTokenHistoryAsync(options = {}) {
     desktop: {},
     cli: {}
   };
-  const seenEvents = new Set();
+  const seenEvents = new Map();
   const recentRequests = [];
 
   for (let jIdx = 0; jIdx < transcriptJobs.length; jIdx++) {
@@ -2349,15 +5158,9 @@ async function collectTokenHistoryAsync(options = {}) {
           if (!hasValidCreatedAt) continue;
 
           let inp = 0, outp = 0, cap = 0, thinking = 0;
-          const rawDisplay = String(event.chatModel?.modelDisplayName || event.modelDisplayName || '').trim();
-          const rawIdModel = String(event.chatModel?.model || event.chatModel?.responseModel || event.model || event.modelId || '').trim();
-          const model = (
-            rawDisplay &&
-            !isPlaceholderModel(rawDisplay) &&
-            (getModelPoolKey(rawDisplay) !== 'unknown' || !rawIdModel || isPlaceholderModel(rawIdModel))
-          )
-            ? rawDisplay
-            : (rawIdModel || rawDisplay || '');
+          const model = event.chatModel?.model || event.chatModel?.responseModel || event.model || event.modelId || '';
+          const modelExactId = event.chatModel?.modelId || event.modelId || '';
+          const modelLabel = event.chatModel?.modelDisplayName || '';
 
           if (event.input_tokens != null || event.output_tokens != null || event.cache_read_tokens != null) {
             inp = Number(event.input_tokens || 0);
@@ -2387,6 +5190,8 @@ async function collectTokenHistoryAsync(options = {}) {
               cascadeId,
               stepIndex,
               model,
+              ...(modelExactId ? { modelExactId } : {}),
+              ...(modelLabel ? { modelLabel } : {}),
               inp,
               outp,
               cap,
@@ -2401,6 +5206,7 @@ async function collectTokenHistoryAsync(options = {}) {
             });
           }
         }
+        backfillMissingModelsFromConversationDb(fileRecords, job.convDir, options);
         if (transcriptFileCache.size > 1000) {
           const oldestKey = transcriptFileCache.keys().next().value;
           if (oldestKey) transcriptFileCache.delete(oldestKey);
@@ -2408,6 +5214,7 @@ async function collectTokenHistoryAsync(options = {}) {
         transcriptFileCache.set(job.path, { size: st.size, mtimeMs: st.mtimeMs, records: fileRecords });
       }
 
+      const jobConvNorm = job.convDir ? (process.platform === 'win32' ? path.resolve(job.convDir).toLowerCase() : path.resolve(job.convDir)) : '';
       for (let rIdx = 0; rIdx < fileRecords.length; rIdx++) {
         const rec = fileRecords[rIdx];
         const parsedDate = new Date(rec.created_at);
@@ -2415,8 +5222,41 @@ async function collectTokenHistoryAsync(options = {}) {
         const dateKey = formatLocalDateKey(parsedDate);
         registerDate(dateKey);
         if (!rec.tot || !rec.eventId) continue;
-        if (seenEvents.has(rec.eventId)) continue;
-        seenEvents.add(rec.eventId);
+
+        const existingReq = seenEvents.get(rec.eventId);
+        if (existingReq) {
+          // 跨根重复事件绝不重复累加 Token；仅当新根回填/保留了更优模型标识时就地富化原记录
+          if (getCollectorModelRank(rec.model) > getCollectorModelRank(existingReq.model)) {
+            existingReq.model = rec.model;
+            existingReq.modelKey = normalizeModelId(rec.model);
+            const enrichedCost = calculateRequestApiCost(existingReq);
+            existingReq.isPriced = enrichedCost.isPriced;
+            existingReq.costUSD = enrichedCost.costUSD ?? 0;
+          }
+          if (!existingReq.modelExactId && rec.modelExactId) existingReq.modelExactId = rec.modelExactId;
+          if (!existingReq.modelLabel && rec.modelLabel) existingReq.modelLabel = rec.modelLabel;
+          // 若两个不同 convDir 下的非 UUID 同名会话共享同一真实 responseId（非 step 拼接键），证明是同一镜像会话
+          if (
+            !String(rec.eventId).includes('#') &&
+            existingReq.source === job.source &&
+            existingReq._convDirNorm &&
+            jobConvNorm &&
+            existingReq._convDirNorm !== jobConvNorm &&
+            existingReq.cascadeId &&
+            existingReq.cascadeId === rec.cascadeId &&
+            !UUID_SESSION_FILE_RE.test(`${rec.cascadeId}.db`)
+          ) {
+            const baseLower = String(rec.cascadeId).toLowerCase();
+            const mirrorKey = `${job.source}|${jobConvNorm}|${baseLower}`;
+            const convDirSet = nonUuidConvDirsBySource[job.source]?.get(baseLower);
+            if (convDirSet && convDirSet.has(existingReq._convDirNorm) && convDirSet.has(jobConvNorm) && !seenEvents.has(`__mirror_dedup:${mirrorKey}`)) {
+              seenEvents.set(`__mirror_dedup:${mirrorKey}`, true);
+              if (job.source === 'cli' && cliPbCount > 1) cliPbCount--;
+              else if (job.source === 'desktop' && desktopPbCount > 1) desktopPbCount--;
+            }
+          }
+          continue;
+        }
 
         const srcMap = scannedBySource[job.source] || scannedBySource.desktop;
         if (!srcMap[dateKey]) {
@@ -2432,9 +5272,12 @@ async function collectTokenHistoryAsync(options = {}) {
         const reqObj = {
           callId: rec.eventId,
           source: job.source,
+          _convDirNorm: jobConvNorm,
           cascadeId: rec.cascadeId,
           stepIndex: rec.stepIndex,
           model: rec.model,
+          ...(rec.modelExactId ? { modelExactId: rec.modelExactId } : {}),
+          ...(rec.modelLabel ? { modelLabel: rec.modelLabel } : {}),
           modelKey,
           inputTokens: rec.inp,
           cacheTokens: rec.cap,
@@ -2454,9 +5297,10 @@ async function collectTokenHistoryAsync(options = {}) {
         reqObj.isPriced = costCalc.isPriced;
         reqObj.costUSD = costCalc.costUSD ?? 0;
 
+        seenEvents.set(rec.eventId, reqObj);
         recentRequests.push(reqObj);
       }
-    } catch {}
+    } catch { }
   }
 
   // 6. 与旧归档做差异合并，防止简单相加或 Math.max 抹杀 CLI 增量
@@ -2543,7 +5387,9 @@ async function collectTokenHistoryAsync(options = {}) {
   );
 
   // 8. 自动识别套餐与用户自定义设置合并（实际读取优先于自定义优先于未知）
-  let livePlanStatus = await fetchUserStatusFromHost(options);
+  let livePlanStatus = Object.prototype.hasOwnProperty.call(extraContext, 'livePlanStatus')
+    ? extraContext.livePlanStatus
+    : await fetchUserStatusFromHost(options);
   if (!livePlanStatus) {
     livePlanStatus = archiveV2.planStatus || parseUserPlanStatus(null);
   }
@@ -2556,6 +5402,52 @@ async function collectTokenHistoryAsync(options = {}) {
     cachedLivePlan: archiveV2.planStatus,
     currentEmail: currentAccountKey
   });
+
+  // 加载可用于历史补扫归属校验的账号活跃时段（仅在使用默认宿主目录或显式传入时读取，隔离测试不读宿主真实账号）
+  let sessionWindowsForHistory = Array.isArray(extraContext.accountSessions)
+    ? extraContext.accountSessions
+    : (Array.isArray(options.accountSessions) ? options.accountSessions : null);
+  let hasRealAccountStore = false;
+  if (!sessionWindowsForHistory || !options.skipAutoRepair) {
+    try {
+      const defaultAgDir = path.resolve(path.join(os.homedir(), '.gemini', 'antigravity'));
+      const isDefaultHostAg = path.resolve(agDir) === defaultAgDir;
+      if (isDefaultHostAg || options.stateDir) {
+        const { getStateDir } = require('./asar-engine');
+        const stDir = options.stateDir || getStateDir();
+        const acctStorePath = path.join(stDir, 'accounts_v1.json');
+        if (fs.existsSync(acctStorePath)) {
+          hasRealAccountStore = true;
+          const parsedAcct = JSON.parse(fs.readFileSync(acctStorePath, 'utf8'));
+          if (!sessionWindowsForHistory && Array.isArray(parsedAcct?.accountSessions) && parsedAcct.accountSessions.length > 0) {
+            sessionWindowsForHistory = parsedAcct.accountSessions;
+          }
+        }
+      } else if (Array.isArray(options.accountSessions) && options.accountSessions.length > 0) {
+        hasRealAccountStore = true;
+      }
+    } catch { }
+  }
+
+  // 在任何 transcript 对齐或富化写入覆盖之前，先对未经历最新归属版本校验且带有账号归属的账本执行一次带备份的幂等纠偏
+  if (hasRealAccountStore && !options.skipAutoRepair && (!options.fs || options.fs === fs)) {
+    try {
+      const preRepairCalls = (loadPricingLedger(agDir).calls || {});
+      const needsAttributionRepair = Object.values(preRepairCalls).some(rec =>
+        rec &&
+        typeof rec === 'object' &&
+        rec.attributionRepairVersion !== CURRENT_ATTRIBUTION_REPAIR_VERSION &&
+        isValidAccountScopeKey(rec.accountScopeKey) &&
+        rec.accountAttributionConfidence !== 'unattributed'
+      );
+      if (needsAttributionRepair) {
+        repairAndMigrateAccountLedger({
+          agDir,
+          accountSessions: Array.isArray(sessionWindowsForHistory) ? sessionWindowsForHistory : []
+        });
+      }
+    } catch { }
+  }
 
   // 结合持久化逐请求账本与本次扫描调用：先与既有账本做双阶段 1-to-1 对齐与富化，再仅将未匹配的已计价扫描请求落盘
   const initialCallsMap = loadPricingLedger(agDir).calls || {};
@@ -2679,7 +5571,6 @@ async function collectTokenHistoryAsync(options = {}) {
       for (const stIdx of candSteps) {
         const sKey = `${cSrc}:${cCid}#${stIdx}`;
         const multiRealAtStep = (realLedgerCountByStepKey.get(sKey) || 0) > 1;
-        // 多真实调用同步骤时，仅在非零 Token 分项精确一致时一对一消费对应步骤记录，避免先到调用跨键误吞同步骤其它调用的日志
         if (multiRealAtStep && (uC.inp + uC.cap + uC.out) > 0) {
           matched = takeUnmatchedReq(reqsByStepKey.get(sKey), (item) => {
             if (!canFallbackLink(ledgerKey, c, cidKey, item)) return false;
@@ -2735,7 +5626,6 @@ async function collectTokenHistoryAsync(options = {}) {
     for (const [uKey, ledgerGroup] of ledgerCandsByUsageKey.entries()) {
       const reqCandidates = (reqsByUsageKey.get(uKey) || []).filter(item => !matchedTranscriptReqs.has(item));
       if (!reqCandidates.length) continue;
-      // 仅当账本候选与未匹配 transcript 候选在兼容二分图上互为唯一候选（双边度数均为 1）时才执行绑定，消除遍历顺序依赖
       const reqToCompatibleLedgers = new Map();
       const ledgerToCompatibleReqs = new Map();
       for (const lEntry of ledgerGroup) {
@@ -2767,13 +5657,32 @@ async function collectTokenHistoryAsync(options = {}) {
   const unmatchedPricedTranscriptReqs = recentRequests.filter(r => !matchedTranscriptReqs.has(r) && r.isPriced && r.callId);
   const ledgerUpdates = [...ledgerEnrichmentCalls, ...unmatchedPricedTranscriptReqs];
   if (ledgerUpdates.length) {
-    recordModelCalls(ledgerUpdates, { agDir, trustTranscriptDate: true });
+    recordModelCalls(ledgerUpdates, {
+      agDir,
+      trustTranscriptDate: true,
+      ...(sessionWindowsForHistory ? { accountSessions: sessionWindowsForHistory } : {})
+    });
   }
 
   const effectiveCallsMap = { ...(loadPricingLedger(agDir).calls || {}) };
   for (const [origKey, { targetCallId, merged }] of inMemoryEnrichments.entries()) {
     if (effectiveCallsMap[targetCallId]) {
-      effectiveCallsMap[targetCallId] = mergeSameCallRecords(effectiveCallsMap[targetCallId], merged, targetCallId, merged.stepIndex, false, true);
+      const diskRec = effectiveCallsMap[targetCallId];
+      const nextMerged = mergeSameCallRecords(diskRec, merged, targetCallId, merged.stepIndex, false, true);
+      if (diskRec.attributionRepairVersion === CURRENT_ATTRIBUTION_REPAIR_VERSION) {
+        nextMerged.attributionRepairVersion = diskRec.attributionRepairVersion;
+        if (diskRec.accountAttributionConfidence === 'unattributed') {
+          delete nextMerged.accountScopeKey;
+          delete nextMerged.accountAttributionEvidence;
+          nextMerged.accountAttributionConfidence = 'unattributed';
+          if (diskRec.unattributedReason) nextMerged.unattributedReason = diskRec.unattributedReason;
+        } else if (isValidAccountScopeKey(diskRec.accountScopeKey)) {
+          nextMerged.accountScopeKey = diskRec.accountScopeKey;
+          nextMerged.accountAttributionConfidence = diskRec.accountAttributionConfidence;
+          if (diskRec.accountAttributionEvidence) nextMerged.accountAttributionEvidence = diskRec.accountAttributionEvidence;
+        }
+      }
+      effectiveCallsMap[targetCallId] = nextMerged;
     } else if (effectiveCallsMap[origKey]) {
       if (targetCallId !== origKey) delete effectiveCallsMap[origKey];
       effectiveCallsMap[targetCallId] = merged;
@@ -3027,55 +5936,146 @@ async function collectTokenHistoryAsync(options = {}) {
     ? livePlanStatus.cascadeModelConfigs.map(sanitizeCascadeModelConfig).filter(Boolean)
     : [];
 
-  // 汇总最近 8 天各规范化模型配额池的真实 Token 消耗事件（供配额余量约数校准使用）
+  // 汇总最近 8 天各共享额度池真实消耗事件（供 5h / weekly 双周期剩余 Token 约数校准使用）
+  // 统计口径：原始 inputTokens + cacheReadTokens + outputTokens 之和；同时计算全历史最小已知调用时间戳以判断周期起点覆盖完整性
   const quotaNowMs = Date.now();
   const quotaCutoffMs = quotaNowMs - 8 * 86400000;
   const quotaRecentCutoffMs = quotaNowMs - 86400000;
   const seenQuotaCallIds = new Set();
   const recentModelUsage = [];
-  const olderBuckets = new Map();
+  const olderQuotaBuckets = new Map();
+  let allKnownCallsMinTs = null;
   const pushQuotaUsageCall = (call) => {
     if (!call || typeof call !== 'object') return;
     if (call.callId && seenQuotaCallIds.has(call.callId)) return;
-    const rawTs = call.timestamp ?? (call.created_at ? new Date(call.created_at).getTime() : NaN);
+    const rawTs = getCallSortTimestamp(call) ?? call.timestamp ?? (call.created_at ? new Date(call.created_at).getTime() : NaN);
     const ts = Number(rawTs);
-    if (!Number.isFinite(ts) || ts < quotaCutoffMs || ts > quotaNowMs + 60000) return;
-    const rawModel = extractModelString(call);
-    const fallbackLabel = call.modelLabel || call.modelExactId || '';
-    let poolKey = getModelPoolKey ? getModelPoolKey(rawModel, fallbackLabel) : 'unknown';
-    if ((!poolKey || poolKey === 'unknown') && fallbackLabel && getModelPoolKey) {
-      poolKey = getModelPoolKey(fallbackLabel);
+    if (!Number.isFinite(ts) || ts <= 0 || ts > quotaNowMs + 60000) return;
+    if (allKnownCallsMinTs === null || ts < allKnownCallsMinTs) {
+      allKnownCallsMinTs = ts;
     }
-    if (!poolKey || poolKey === 'unknown') return;
-    const tok = Number(call.totalTokens ?? ((Number(call.inputTokens || 0)) + (Number(call.cacheTokens ?? call.cacheReadTokens ?? 0)) + (Number(call.outputTokens || 0))));
-    if (!Number.isFinite(tok) || tok <= 0) return;
+    if (ts < quotaCutoffMs) return;
+    const rawModel = call.modelExactId || extractModelString(call) || call.model || '';
+    const poolKey = typeof getModelPoolKey === 'function' ? getModelPoolKey(rawModel, call.modelLabel || '') : 'unknown';
+    const sharedGroupKey = typeof getSharedQuotaGroupKey === 'function' ? getSharedQuotaGroupKey(rawModel || poolKey) : 'unknown';
+    if ((!poolKey || poolKey === 'unknown') && (!sharedGroupKey || sharedGroupKey === 'unknown')) return;
+    const inp = Math.max(0, Number(call.inputTokens || 0));
+    const cache = Math.max(0, Number(call.cacheTokens ?? call.cacheReadTokens ?? 0));
+    const outp = Math.max(0, Number(call.outputTokens || 0));
+    const sumParts = inp + cache + outp;
+    const totalTokens = Number(call.totalTokens ?? sumParts);
+    if (!Number.isFinite(totalTokens) || totalTokens <= 0) return;
     if (call.callId) seenQuotaCallIds.add(call.callId);
     if (ts >= quotaRecentCutoffMs) {
-      recentModelUsage.push({ id: call.callId || null, poolKey, ts, tok });
+      recentModelUsage.push({
+        id: call.callId || null,
+        poolKey,
+        sharedGroupKey,
+        ts,
+        inputTokens: inp,
+        cacheTokens: cache,
+        outputTokens: outp,
+        totalTokens
+      });
     } else {
       const bTs = Math.floor(ts / 900000) * 900000;
-      const bKey = `${poolKey}:${bTs}`;
-      const existingB = olderBuckets.get(bKey);
-      if (existingB) existingB.tok += tok;
-      else olderBuckets.set(bKey, { poolKey, ts: bTs, tok });
+      const bKey = `${sharedGroupKey}:${poolKey}:${bTs}`;
+      const existingB = olderQuotaBuckets.get(bKey);
+      if (existingB) {
+        existingB.inputTokens += inp;
+        existingB.cacheTokens += cache;
+        existingB.outputTokens += outp;
+        existingB.totalTokens += totalTokens;
+      } else {
+        olderQuotaBuckets.set(bKey, {
+          poolKey,
+          sharedGroupKey,
+          ts: bTs,
+          inputTokens: inp,
+          cacheTokens: cache,
+          outputTokens: outp,
+          totalTokens
+        });
+      }
     }
   };
   for (const c of mergedCalls) pushQuotaUsageCall(c);
   for (const c of recentRequests) pushQuotaUsageCall(c);
-  for (const b of olderBuckets.values()) recentModelUsage.push(b);
+  for (const b of olderQuotaBuckets.values()) recentModelUsage.push(b);
+  const quotaUsageCoverageStartMs = allKnownCallsMinTs !== null ? Math.max(quotaCutoffMs, allKnownCallsMinTs) : null;
 
+  const modelBreakdown = buildDailyModelBreakdown({
+    recentRequests,
+    finalCallsEntries,
+    matchedTranscriptReqs,
+    matchedLedgerKeys,
+    resolveLedgerCallDate,
+    mergedDesktop,
+    mergedCli,
+    mergedLegacyUnallocated,
+    archiveV2,
+    compactModelConfigs,
+    availableModelDetails: livePlanStatus?.availableModelDetails || null
+  });
+
+  const cacheReadStatsAll = summarizeDailyMapCacheStats(dailyMapAll);
+  const cacheReadStatsDesktop = summarizeDailyMapCacheStats(mergedDesktop);
+  const cacheReadStatsCli = summarizeDailyMapCacheStats(mergedCli);
+  const currentMonthCacheReadStatsAll = summarizeDailyMapCacheStats(dailyMapAll, monthPrefix);
+  const currentMonthCacheReadStatsDesktop = summarizeDailyMapCacheStats(mergedDesktop, monthPrefix);
+  const currentMonthCacheReadStatsCli = summarizeDailyMapCacheStats(mergedCli, monthPrefix);
+
+  const prevAccountEmail = Object.prototype.hasOwnProperty.call(extraContext, 'prevAccountEmail')
+    ? extraContext.prevAccountEmail
+    : (collectTokenHistoryAsync._lastAccountEmail || null);
+  const accountUsageBreakdown = buildAccountUsageBreakdown({
+    finalCallsEntries,
+    resolveLedgerCallDate,
+    dailyMapAll,
+    mergedDesktop,
+    mergedCli,
+    mergedLegacyUnallocated,
+    dailyModelMapBySource: modelBreakdown.dailyModelMapBySource,
+    modelMetaByKey: modelBreakdown.modelMetaByKey,
+    compactModelConfigs,
+    availableModelDetails: livePlanStatus?.availableModelDetails || null,
+    totalConversationsAll: totalConversations,
+    unpricedSummaryBySource: {
+      all: { count: totalUnpricedCount, reasons: totalUnpricedReasons, tokens: totalUnpricedTokens },
+      desktop: deskUnpriced,
+      cli: cliUnpriced,
+      currentMonth: monthUnpriced
+    },
+    now
+  });
   const out = {
-    schemaVersion: '0.8.3',
-    version: '0.8.3',
+    schemaVersion: PROJECT_VERSION,
+    version: PROJECT_VERSION,
+    accountScopeKey: currentAccountKey ? buildAccountScopeKey(currentAccountKey) : null,
+    currentAccountEmail: currentAccountKey || null,
+    usageByAccount: accountUsageBreakdown.byAccount,
+    unattributedUsage: accountUsageBreakdown.unattributed,
+    attributionPolicy: {
+      historicalFilesAttributed: false,
+      description: '仅带有可靠账号归属证据的请求计入对应账号；未携带账号依据的历史会话及离线日志统一保留在未归属账本，绝不默认算给当前登录账号。'
+    },
+    isAccountSwitched: Boolean(
+      currentAccountKey &&
+      prevAccountEmail &&
+      String(prevAccountEmail).toLowerCase() !== String(currentAccountKey).toLowerCase()
+    ),
     updatedAt: `${todayKey} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`,
     firstUseDate: earliestDate,
+    quotaUsageCoverageStartMs,
+    quotaUsageAccounting: 'raw_input_cache_output',
     recentModelUsage,
     speedRecords,
     cascadeModelConfigs: compactModelConfigs,
     modelCapabilitiesById: livePlanStatus?.availableModelDetails || null,
     currentPeriod: {
       key: monthPrefix,
-      label: `${monthPrefix} (自然月)`,
+      periodType: 'calendar_month',
+      label: monthPrefix,
       isCurrentMonth: true
     },
     sources: {
@@ -3084,9 +6084,15 @@ async function collectTokenHistoryAsync(options = {}) {
         transcriptsCount: transcriptJobs.filter(j => j.source === 'desktop').length
       },
       cli: {
-        dirExists: fs.existsSync(agCliDir),
+        dirExists: cliAgDirs.some(d => fs.existsSync(d)),
         conversationsCount: cliPbCount,
         transcriptsCount: transcriptJobs.filter(j => j.source === 'cli').length
+      },
+      wsl: {
+        distros: extraWsl.distros,
+        desktopDirsCount: extraWsl.desktopDirs.length,
+        cliDirsCount: extraWsl.cliDirs.length,
+        skippedRoots: Array.isArray(extraWsl.skippedRoots) ? extraWsl.skippedRoots : []
       }
     },
     planStatus: effectivePlanStatus,
@@ -3099,6 +6105,16 @@ async function collectTokenHistoryAsync(options = {}) {
       all: costEstimateAll,
       desktop: costEstimateDesktop,
       cli: costEstimateCli
+    },
+    cacheReadStatsBySource: {
+      all: cacheReadStatsAll,
+      desktop: cacheReadStatsDesktop,
+      cli: cacheReadStatsCli
+    },
+    currentMonthCacheReadStatsBySource: {
+      all: currentMonthCacheReadStatsAll,
+      desktop: currentMonthCacheReadStatsDesktop,
+      cli: currentMonthCacheReadStatsCli
     },
     referenceCost: {
       all: referenceCostAll,
@@ -3117,6 +6133,8 @@ async function collectTokenHistoryAsync(options = {}) {
       currentMonthInput,
       currentMonthOutput,
       currentMonthCache,
+      cacheReadStats: cacheReadStatsAll,
+      currentMonthCacheReadStats: currentMonthCacheReadStatsAll,
       totalSteps,
       totalConversations,
       firstUseDate: earliestDate,
@@ -3136,20 +6154,29 @@ async function collectTokenHistoryAsync(options = {}) {
       desktop: mergedDesktop,
       cli: mergedCli,
       legacyUnallocated: mergedLegacyUnallocated
-    }
+    },
+    dailyModelMapBySource: modelBreakdown.dailyModelMapBySource,
+    modelMetaByKey: modelBreakdown.modelMetaByKey
   };
 
-  // 检查是否已被后续强制并发采集超越：若已过时，放弃写盘与更新全局缓存
-  if (!options.agDir && thisScanSeq !== currentScanSequence) {
-    return out;
+  const unattributedModelTokens = Object.values(modelBreakdown.dailyModelMapBySource?.all || {}).reduce(
+    (acc, dayRec) => acc + (Number(dayRec?.[UNATTRIBUTED_MODEL_KEY]?.total) || 0),
+    0
+  );
+  const modelMetaSig = Object.keys(modelBreakdown.modelMetaByKey).sort().join(',');
+  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|m:${modelMetaSig}|u:${unattributedModelTokens}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.tierId || ''}|${effectivePlanStatus?.teamsTier || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
+  const isStaleCheck = typeof extraContext.isStale === 'function' ? extraContext.isStale : null;
+  if (isStaleCheck && isStaleCheck()) {
+    return { out, archiveSig: null, accountKey: currentAccountKey || null, stale: true };
   }
 
   // 持久化保存到 v2 与 v1 归档（仅在数据变化或文件不存在时原子写入，减少高频磁盘 I/O）
+  const prevArchiveSig = Object.prototype.hasOwnProperty.call(extraContext, 'prevArchiveSig')
+    ? extraContext.prevArchiveSig
+    : collectTokenHistoryAsync._lastArchiveSig;
   try {
-    const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
-    const shouldWriteArchive = options.agDir || archiveSig !== collectTokenHistoryAsync._lastArchiveSig || !fs.existsSync(archivePathV2) || !fs.existsSync(archivePathV1);
+    const shouldWriteArchive = options.agDir || archiveSig !== prevArchiveSig || !fs.existsSync(archivePathV2) || !fs.existsSync(archivePathV1);
     if (shouldWriteArchive) {
-      collectTokenHistoryAsync._lastArchiveSig = archiveSig;
       const v2Payload = {
         version: '2.0.0',
         firstUseDate: earliestDate,
@@ -3159,7 +6186,9 @@ async function collectTokenHistoryAsync(options = {}) {
         costEstimate,
         costEstimateCurrentMonth,
         referenceCost: out.referenceCost,
-        dailyMapBySource: out.dailyMapBySource
+        dailyMapBySource: out.dailyMapBySource,
+        dailyModelMapBySource: modelBreakdown.dailyModelMapBySource,
+        modelMetaByKey: modelBreakdown.modelMetaByKey
       };
       safeWriteJsonSync(archivePathV2, v2Payload);
 
@@ -3172,14 +6201,71 @@ async function collectTokenHistoryAsync(options = {}) {
       };
       safeWriteJsonSync(archivePathV1, v1Payload);
     }
-  } catch {}
+  } catch { }
 
-  if (!options.agDir) {
-    cachedTokenHistory = out;
-    cachedTokenHistoryScope = scopeKey;
-    cachedTokenHistoryAt = Date.now();
+  return {
+    out,
+    archiveSig,
+    accountKey: currentAccountKey ? String(currentAccountKey) : null,
+    stale: false
+  };
+}
+
+/**
+ * 异步收集历史 Token 用量与成本汇总（优先后台 Worker 线程执行，避免阻塞宿主主进程事件循环）
+ * @param {object} options
+ */
+async function collectTokenHistoryAsync(options = {}) {
+  const scopeKey = getEffectiveScanScopeKey(options);
+  const canCacheByScope = !options.fs && !options.hostFetcher && !options.customPlan;
+  if (!options.force && canCacheByScope && cachedTokenHistory && cachedTokenHistoryScope === scopeKey && Date.now() - cachedTokenHistoryAt < 15000) {
+    return cachedTokenHistory;
   }
-  return out;
+  if (!options.force && !options.agDir && activeScanPromise && activeScanScope === scopeKey) {
+    return activeScanPromise;
+  }
+
+  const thisScanSeq = ++currentScanSequence;
+  const runner = (async () => {
+    const livePlanStatus = await fetchUserStatusFromHost(options);
+    const prevAccountEmail = collectTokenHistoryAsync._lastAccountEmail || null;
+    const prevArchiveSig = collectTokenHistoryAsync._lastArchiveSig || null;
+
+    let result = null;
+    if (canUseHistoryWorker(options)) {
+      const workerResp = await runHistoryWorkerTask({
+        options: cloneCollectorOptionsForWorker(options),
+        livePlanStatus,
+        prevAccountEmail,
+        prevArchiveSig
+      }, 'collectTokenHistory', options);
+      if (workerResp && workerResp._workerHandled && workerResp.result && workerResp.result.out) {
+        result = workerResp.result;
+      }
+    }
+
+    if (!result) {
+      result = await collectTokenHistoryCoreAsync(options, {
+        livePlanStatus,
+        prevAccountEmail,
+        prevArchiveSig,
+        isStale: () => !options.agDir && thisScanSeq !== currentScanSequence
+      });
+    }
+
+    if (!options.agDir && thisScanSeq !== currentScanSequence) {
+      return result.out;
+    }
+    if (result.archiveSig) {
+      collectTokenHistoryAsync._lastArchiveSig = result.archiveSig;
+    }
+    if (canCacheByScope) {
+      if (!options.agDir && result.accountKey) collectTokenHistoryAsync._lastAccountEmail = result.accountKey;
+      cachedTokenHistory = result.out;
+      cachedTokenHistoryScope = scopeKey;
+      cachedTokenHistoryAt = Date.now();
+    }
+    return result.out;
   })();
 
   if (!options.agDir) {
@@ -3196,23 +6282,477 @@ async function collectTokenHistoryAsync(options = {}) {
   return runner;
 }
 
+/**
+ * 从单个 transcript.jsonl 提取用户轮次标记、模型调用记录与可验证的子代理调用关联。
+ */
+function parseTranscriptForSessionTimeline(transcriptPath, cascadeId, convDir, sourceName = 'desktop', extraOpts = {}) {
+  const turns = [];
+  const calls = [];
+  const subagentLinks = [];
+  const uuidExtractRe = /"conversationId"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi;
+
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) {
+    return { turns, calls, subagentLinks };
+  }
+
+  let content = '';
+  try {
+    content = fs.readFileSync(transcriptPath, 'utf8');
+  } catch {
+    return { turns, calls, subagentLinks };
+  }
+
+  const dbMeta = convDir && !extraOpts.fs && !isFsMonkeyPatched()
+    ? loadConversationDbMeta(path.join(convDir, `${cascadeId}.db`), cascadeId)
+    : null;
+
+  const lines = content.split(/\r?\n/);
+  const explicitUserTurns = [];
+  const fallbackUserTurns = [];
+  const pendingInvokes = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+    let event = null;
+    try { event = JSON.parse(line); } catch { continue; }
+
+    const rawStep = event.step_index ?? event.stepIndex;
+    const parsedStep = rawStep !== undefined && rawStep !== null && rawStep !== '' ? Number(rawStep) : NaN;
+    const stepIndex = Number.isInteger(parsedStep) && parsedStep >= 0 ? parsedStep : null;
+    const createdAt = event.created_at || event.createdAt || null;
+    const ts = createdAt ? Date.parse(createdAt) : NaN;
+    const validTs = Number.isFinite(ts) && ts > 0 ? ts : null;
+
+    if (event.type === 'USER_INPUT' || event.type === 'user' || event.role === 'user') {
+      const textBody = typeof event.content === 'string' ? event.content : (typeof event.text === 'string' ? event.text : '');
+      const rawPreview = sanitizeTurnPreviewText(textBody, 120);
+      const turnEntry = {
+        stepIndex,
+        timestamp: validTs,
+        created_at: createdAt,
+        source: event.source || 'USER_EXPLICIT',
+        preview: rawPreview
+      };
+      if (event.source === 'SYSTEM_SDK') {
+        fallbackUserTurns.push(turnEntry);
+      } else {
+        explicitUserTurns.push(turnEntry);
+      }
+      continue;
+    }
+
+    if (Array.isArray(event.tool_calls)) {
+      for (const tc of event.tool_calls) {
+        if (!tc || !tc.name) continue;
+        if (tc.name === 'invoke_subagent' || tc.name === 'send_message') {
+          const cleanArg = (v) => (typeof v === 'string' ? v.replace(/^"|"$/g, '').trim() : '');
+          pendingInvokes.push({
+            stepIndex,
+            toolName: tc.name,
+            role: cleanArg(tc.args?.Role),
+            typeName: cleanArg(tc.args?.TypeName),
+            recipient: cleanArg(tc.args?.Recipient)
+          });
+        }
+      }
+    }
+
+    if (typeof event.content === 'string' && event.content.includes('conversationId')) {
+      let m;
+      uuidExtractRe.lastIndex = 0;
+      while ((m = uuidExtractRe.exec(event.content)) !== null) {
+        const childCid = m[1];
+        if (!childCid || childCid.toLowerCase() === String(cascadeId).toLowerCase()) continue;
+        // 寻找紧邻前文的 invoke_subagent 调用以定位准确父步骤和 Role/TypeName
+        let matchedInvoke = null;
+        for (let pIdx = pendingInvokes.length - 1; pIdx >= 0; pIdx--) {
+          const inv = pendingInvokes[pIdx];
+          if (inv.toolName === 'invoke_subagent' && (stepIndex === null || inv.stepIndex === null || Math.abs(stepIndex - inv.stepIndex) <= 15)) {
+            matchedInvoke = inv;
+            break;
+          }
+        }
+        const alreadyLinked = subagentLinks.find(l => l.childCid.toLowerCase() === childCid.toLowerCase());
+        if (!alreadyLinked) {
+          subagentLinks.push({
+            childCid,
+            parentCascadeId: cascadeId,
+            parentStepIndex: matchedInvoke?.stepIndex ?? stepIndex,
+            subagentRole: matchedInvoke?.role || '',
+            subagentType: matchedInvoke?.typeName || '',
+            confidence: 'verified_tool_output'
+          });
+        }
+      }
+    }
+
+    const u = event.chatModel?.usage || null;
+    const hasTokenFields = event.input_tokens != null || event.output_tokens != null || event.cache_read_tokens != null || u != null;
+    if (!hasTokenFields && !event.error && event.type !== 'PLANNER_RESPONSE') continue;
+
+    const inp = event.input_tokens != null ? Number(event.input_tokens || 0) : (u?.inputTokens != null ? Number(u.inputTokens || 0) : null);
+    const outp = event.output_tokens != null ? Number(event.output_tokens || 0) : (u?.outputTokens != null ? Number(u.outputTokens || 0) : null);
+    const cap = event.cache_read_tokens != null ? Number(event.cache_read_tokens || 0) : (u?.cacheReadTokens != null ? Number(u.cacheReadTokens || 0) : null);
+    const thinking = event.thinking_output_tokens != null ? Number(event.thinking_output_tokens || 0) : (u?.thinkingOutputTokens != null ? Number(u.thinkingOutputTokens || 0) : 0);
+
+    const dbStep = (dbMeta && stepIndex !== null) ? dbMeta.stepMetaMap.get(stepIndex) : null;
+    const model = event.chatModel?.model || event.chatModel?.responseModel || event.model || event.modelId || dbStep?.model || '';
+    const modelExactId = event.chatModel?.modelId || event.modelId || dbStep?.modelExactId || '';
+    const modelLabel = event.chatModel?.modelDisplayName || dbStep?.modelLabel || '';
+
+    const callId = dbStep?.responseId || extractCallId(event, cascadeId, stepIndex ?? i);
+    if (!callId) continue;
+
+    const hasUsageNums = inp !== null || cap !== null || outp !== null;
+    if (!hasUsageNums && !event.error) continue;
+
+    calls.push({
+      callId,
+      cascadeId,
+      source: sourceName,
+      stepIndex,
+      model,
+      ...(modelExactId ? { modelExactId } : {}),
+      ...(modelLabel ? { modelLabel } : {}),
+      inputTokens: inp,
+      cacheReadTokens: cap,
+      cacheTokens: cap,
+      outputTokens: outp,
+      thinkingTokens: thinking,
+      totalTokens: hasUsageNums ? ((inp || 0) + (cap || 0) + (outp || 0)) : null,
+      hasInputCacheFields: inp !== null || cap !== null,
+      ttftSec: dbStep?.ttftSec ?? null,
+      streamingSec: dbStep?.streamingSec ?? null,
+      status: event.status === 'RUNNING' ? 'streaming' : 'final',
+      ...(event.error ? { error: String(event.error) } : {}),
+      date: validTs ? formatLocalDateKey(new Date(validTs)) : null,
+      dateSource: 'transcript',
+      dateIsProvisional: false,
+      created_at: createdAt,
+      timestamp: validTs
+    });
+  }
+
+  const chosenTurns = explicitUserTurns.length ? explicitUserTurns : fallbackUserTurns;
+  for (const t of chosenTurns) turns.push(t);
+  return { turns, calls, subagentLinks, dbMeta };
+}
+
+const subagentParentIndexCache = { dirMtimesKey: '', byParent: new Map(), at: 0 };
+
+/**
+ * 基于目录签名缓存扫描所有可用根目录 conversations/*.db，查找显式记录了 parentCascadeId / rootCascadeId 的子代理会话。
+ */
+function findSubagentChildrenFromConvDirs(parentCascadeId, convDirs = [], options = {}) {
+  if (!parentCascadeId || options.fs || isFsMonkeyPatched()) return [];
+  const normParent = String(parentCascadeId).trim().toLowerCase();
+  const dirSigParts = [];
+  const uniqueConvDirs = dedupeScanPaths(convDirs);
+  for (const d of uniqueConvDirs) {
+    try {
+      if (origFsMethods.existsSync(d)) {
+        const st = origFsMethods.statSync(d);
+        dirSigParts.push(`${d}:${st.mtimeMs}`);
+      }
+    } catch { }
+  }
+  const dirKey = dirSigParts.join('|');
+  if (subagentParentIndexCache.dirMtimesKey !== dirKey || (Date.now() - subagentParentIndexCache.at) > 60000) {
+    const nextByParent = new Map();
+    for (const cDir of uniqueConvDirs) {
+      try {
+        if (!origFsMethods.existsSync(cDir)) continue;
+        for (const name of origFsMethods.readdirSync(cDir)) {
+          if (!name.endsWith('.db')) continue;
+          const cid = name.slice(0, -3);
+          const dbMeta = loadConversationDbMeta(path.join(cDir, name), cid);
+          const pRaw = String(dbMeta.parentCascadeId || '').trim();
+          const rRaw = String(dbMeta.rootCascadeId || '').trim();
+          const parentKeys = new Set([pRaw.toLowerCase(), rRaw.toLowerCase()].filter(k => k && k !== cid.toLowerCase()));
+          for (const pk of parentKeys) {
+            let list = nextByParent.get(pk);
+            if (!list) { list = []; nextByParent.set(pk, list); }
+            if (!list.some(item => item.childCid === cid && item.convDir === cDir)) {
+              list.push({
+                childCid: cid,
+                parentCascadeId: pRaw || rRaw,
+                rootCascadeId: rRaw || pRaw,
+                subagentType: dbMeta.subagentType || '',
+                subagentRole: dbMeta.subagentRole || '',
+                convDir: cDir
+              });
+            }
+          }
+        }
+      } catch { }
+    }
+    subagentParentIndexCache.dirMtimesKey = dirKey;
+    subagentParentIndexCache.byParent = nextByParent;
+    subagentParentIndexCache.at = Date.now();
+  }
+  return subagentParentIndexCache.byParent.get(normParent) || [];
+}
+
+/**
+ * 聚合指定会话的按用户轮次请求时间线与可验证子代理调用（仅只读访问，复用现有本地目录与账本）。
+ */
+async function collectSessionTimelineCoreAsync(cascadeId, options = {}) {
+  const cid = String(cascadeId || '').trim();
+  if (!cid || cid.includes('..') || cid.includes('/') || cid.includes('\\')) {
+    return { cascadeId: cid, turns: [], unlinkedSubagentCalls: [], totalCalls: 0, mainCallsCount: 0, subagentCallsCount: 0, cacheSummary: summarizeCacheReadStats([]), latestCall: null, subagentLinks: [] };
+  }
+
+  const { agDir, agCliDir } = resolvePrimaryGeminiDirs(options);
+  const extraWsl = await discoverWslGeminiDirsAsync(options);
+
+  const rootEntries = [
+    ...dedupeScanPaths([agDir, ...(Array.isArray(options.extraAgDirs) ? options.extraAgDirs : []), ...extraWsl.desktopDirs]).map(d => ({ dir: d, source: 'desktop' })),
+    ...dedupeScanPaths([agCliDir, ...(Array.isArray(options.extraAgCliDirs) ? options.extraAgCliDirs : []), ...extraWsl.cliDirs]).map(d => ({ dir: d, source: 'cli' }))
+  ];
+
+  const allTurns = [];
+  const allCalls = [];
+  const subagentMap = new Map();
+  let mainDbMeta = null;
+
+  const findTranscriptForCid = (targetCid) => {
+    for (const r of rootEntries) {
+      const candidates = [
+        path.join(r.dir, 'brain', targetCid, '.system_generated', 'logs', 'transcript.jsonl'),
+        path.join(r.dir, 'brain', targetCid, 'transcript.jsonl')
+      ];
+      for (const tp of candidates) {
+        if (fs.existsSync(tp)) {
+          return { path: tp, convDir: path.join(r.dir, 'conversations'), source: r.source };
+        }
+      }
+    }
+    return null;
+  };
+
+  // 1. 解析主会话自身 transcript + .db
+  const mainFile = findTranscriptForCid(cid);
+  if (mainFile) {
+    const parsed = parseTranscriptForSessionTimeline(mainFile.path, cid, mainFile.convDir, mainFile.source, options);
+    allTurns.push(...parsed.turns);
+    allCalls.push(...parsed.calls);
+    if (parsed.dbMeta) mainDbMeta = parsed.dbMeta;
+    for (const link of parsed.subagentLinks) {
+      subagentMap.set(link.childCid.toLowerCase(), link);
+    }
+  } else if (!options.fs && !isFsMonkeyPatched()) {
+    for (const r of rootEntries) {
+      const dbP = path.join(r.dir, 'conversations', `${cid}.db`);
+      if (fs.existsSync(dbP)) {
+        mainDbMeta = loadConversationDbMeta(dbP, cid);
+        break;
+      }
+    }
+  }
+
+  // 2. 合并前端 / RPC 传入的 liveSteps（识别当前尚未写入磁盘的最新轮次与 invoke_subagent 调用）
+  if (Array.isArray(options.liveSteps) && options.liveSteps.length) {
+    for (let idx = 0; idx < options.liveSteps.length; idx++) {
+      const s = options.liveSteps[idx];
+      if (!s || typeof s !== 'object') continue;
+      const stepIndex = Number.isInteger(Number(s.stepIndex ?? s.idx)) ? Number(s.stepIndex ?? s.idx) : idx;
+      if (s.userInput) {
+        const u = s.userInput;
+        const rawText = String(u.userResponse || (u.items || []).map(item => item.text || '').join(' ') || '');
+        const rawPreview = sanitizeTurnPreviewText(rawText, 120);
+        const already = allTurns.some(t => t.stepIndex === stepIndex);
+        if (!already) {
+          allTurns.push({
+            stepIndex,
+            timestamp: s.timestamp || (s.createdAt ? Date.parse(s.createdAt) : null),
+            created_at: s.createdAt || null,
+            source: u.source || 'USER_EXPLICIT',
+            preview: rawPreview
+          });
+        }
+      }
+    }
+  }
+
+  // 3. 合并来自当前会话 RPC / 前端传来的 liveCalls
+  const cascadeConfigs = Array.isArray(options.cascadeModelConfigs) ? options.cascadeModelConfigs : [];
+  if (Array.isArray(options.liveCalls)) {
+    for (const c of options.liveCalls) {
+      if (!c || typeof c !== 'object') continue;
+      if (c.cascadeId && String(c.cascadeId).toLowerCase() !== cid.toLowerCase()) continue;
+      const dbStep = (mainDbMeta && Number.isInteger(Number(c.stepIndex)))
+        ? mainDbMeta.stepMetaMap.get(Number(c.stepIndex))
+        : null;
+      allCalls.push({
+        ...c,
+        cascadeId: c.cascadeId || cid,
+        modelExactId: c.modelExactId || dbStep?.modelExactId || resolveStableModelId(c, cascadeConfigs) || undefined,
+        modelLabel: c.modelLabel || dbStep?.modelLabel || undefined
+      });
+    }
+  }
+
+  // 4. 合并本地 pricing_ledger_v1.json 中当前会话（及其子代理）的持久化记录
+  const ledger = loadPricingLedger(agDir, options.fs ? { fs: options.fs } : undefined);
+  const ledgerCalls = ledger && ledger.calls && typeof ledger.calls === 'object' ? Object.values(ledger.calls) : [];
+  const normCid = cid.toLowerCase();
+  for (const lc of ledgerCalls) {
+    if (!lc || !lc.cascadeId) continue;
+    if (String(lc.cascadeId).toLowerCase() === normCid) {
+      allCalls.push(lc);
+    }
+  }
+
+  // 5. 发现基于 .db parent_cascade_id / root_cascade_id 的可验证子代理会话
+  const dbChildren = findSubagentChildrenFromConvDirs(cid, rootEntries.map(r => path.join(r.dir, 'conversations')), options);
+  for (const dc of dbChildren) {
+    const k = dc.childCid.toLowerCase();
+    const existing = subagentMap.get(k);
+    if (!existing) {
+      subagentMap.set(k, {
+        childCid: dc.childCid,
+        parentCascadeId: dc.parentCascadeId || cid,
+        parentStepIndex: null,
+        subagentRole: dc.subagentRole || '',
+        subagentType: dc.subagentType || '',
+        confidence: 'verified_db_meta'
+      });
+    } else if (!existing.subagentType && dc.subagentType) {
+      existing.subagentType = dc.subagentType;
+    }
+  }
+
+  // 6. 读取所有已验证关联子代理的 transcript + .db + ledger 调用
+  const subagentLinks = Array.from(subagentMap.values());
+  for (const link of subagentLinks) {
+    const childFile = findTranscriptForCid(link.childCid);
+    const childNorm = link.childCid.toLowerCase();
+    if (childFile) {
+      const childParsed = parseTranscriptForSessionTimeline(childFile.path, link.childCid, childFile.convDir, childFile.source, options);
+      for (const cc of childParsed.calls) {
+        allCalls.push({
+          ...cc,
+          agentRole: 'subagent',
+          parentCascadeId: link.parentCascadeId || cid,
+          parentStepIndex: link.parentStepIndex ?? null,
+          subagentType: link.subagentType || childParsed.dbMeta?.subagentType || '',
+          subagentRole: link.subagentRole || childParsed.dbMeta?.subagentRole || '',
+          attributionConfidence: link.confidence
+        });
+      }
+    }
+    for (const lc of ledgerCalls) {
+      if (!lc || !lc.cascadeId) continue;
+      if (String(lc.cascadeId).toLowerCase() === childNorm) {
+        allCalls.push({
+          ...lc,
+          agentRole: 'subagent',
+          parentCascadeId: link.parentCascadeId || cid,
+          parentStepIndex: link.parentStepIndex ?? null,
+          subagentType: link.subagentType || '',
+          subagentRole: link.subagentRole || '',
+          attributionConfidence: link.confidence
+        });
+      }
+    }
+  }
+
+  const grouped = groupSessionCallsByTurns(allTurns, allCalls, {
+    cascadeId: cid,
+    cascadeModelConfigs: cascadeConfigs,
+    userStatus: options.userStatus || null
+  });
+  return {
+    ...grouped,
+    subagentLinks,
+    subagentNote: mainDbMeta?.skippedReason ? `db_${mainDbMeta.skippedReason}` : null
+  };
+}
+
+async function collectSessionTimelineAsync(cascadeId, options = {}) {
+  if (canUseHistoryWorker(options)) {
+    const workerResp = await runHistoryWorkerTask({
+      cascadeId,
+      options: cloneCollectorOptionsForWorker(options)
+    }, 'collectSessionTimeline', options);
+    if (workerResp && workerResp._workerHandled && workerResp.result) {
+      return workerResp.result;
+    }
+  }
+  return collectSessionTimelineCoreAsync(cascadeId, options);
+}
+
+if (!isMainThread && workerData && workerData.agCollectorHistoryWorker && parentPort) {
+  parentPort.on('message', async (msg) => {
+    const { id, cmd, payload, env } = msg || {};
+    const prevEnv = {};
+    if (env && typeof env === 'object') {
+      for (const [k, v] of Object.entries(env)) {
+        prevEnv[k] = process.env[k];
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+    try {
+      if (cmd === 'collectTokenHistory') {
+        const opts = { ...(payload?.options || {}), _inWorker: true };
+        const result = await collectTokenHistoryCoreAsync(opts, {
+          livePlanStatus: payload?.livePlanStatus ?? null,
+          prevAccountEmail: payload?.prevAccountEmail ?? null,
+          prevArchiveSig: payload?.prevArchiveSig ?? null
+        });
+        parentPort.postMessage({ id, ok: true, result });
+      } else if (cmd === 'recordModelCalls') {
+        const opts = { ...(payload?.options || {}), _inWorker: true };
+        const result = recordModelCalls(payload?.newCalls || [], opts);
+        // createRecordResult 附带 valueOf 函数，跨 Worker 边界时须剥离函数属性避免 StructuredClone 抛 DataCloneError
+        const plainResult = {
+          ok: result ? result.ok !== false : false,
+          changed: Boolean(result && result.changed),
+          ...(result?.error ? { error: result.error } : {}),
+          ...(result?.phase ? { phase: result.phase } : {}),
+          ...(result?.code ? { code: result.code } : {})
+        };
+        parentPort.postMessage({ id, ok: true, result: plainResult });
+      } else if (cmd === 'collectSessionTimeline') {
+        const opts = { ...(payload?.options || {}), _inWorker: true };
+        const result = await collectSessionTimelineCoreAsync(payload?.cascadeId || '', opts);
+        parentPort.postMessage({ id, ok: true, result });
+      } else {
+        throw new Error(`Unknown collector worker command: ${cmd}`);
+      }
+    } catch (err) {
+      parentPort.postMessage({ id, ok: false, error: err?.message || String(err) });
+    } finally {
+      for (const [k, oldV] of Object.entries(prevEnv)) {
+        if (oldV === undefined) delete process.env[k];
+        else process.env[k] = oldV;
+      }
+    }
+  });
+}
+
 function collectTokenHistory(options = {}) {
   const scopeKey = getEffectiveScanScopeKey(options);
+  const canCacheByScope = !options.fs && !options.hostFetcher && !options.customPlan;
   // 同步封装：如果缓存可用直接返回，否则启动异步刷新并返回缓存或空壳
-  if (!options.force && !options.agDir && cachedTokenHistory && cachedTokenHistoryScope === scopeKey && Date.now() - cachedTokenHistoryAt < 15000) {
+  if (!options.force && canCacheByScope && cachedTokenHistory && cachedTokenHistoryScope === scopeKey && Date.now() - cachedTokenHistoryAt < 15000) {
     return cachedTokenHistory;
   }
   // 触发异步更新
   void collectTokenHistoryAsync(options);
   return (cachedTokenHistory && cachedTokenHistoryScope === scopeKey) ? cachedTokenHistory : {
-    schemaVersion: '0.8.3',
-    version: '0.8.3',
+    schemaVersion: PROJECT_VERSION,
+    version: PROJECT_VERSION,
     loading: true,
     updatedAt: '',
     firstUseDate: null,
     planStatus: parseUserPlanStatus(null),
     costEstimate: { pricedCostUSD: 0, coveragePercent: 0, byModel: {} },
     summary: { grandTotalTokens: 0, todayTokens: 0, monthTokens: 0, yearTokens: 0, totalConversations: 0, activeDaysCount: 0 },
+    quotaUsageCoverageStartMs: null,
+    quotaUsageAccounting: 'raw_input_cache_output',
     recentModelUsage: [],
     dailyMap: {},
     dailyMapBySource: { all: {}, desktop: {}, cli: {} }
@@ -3229,18 +6769,25 @@ function collectTokenHistory(options = {}) {
 
 const OFFICIAL_REPO = 'elviscjn-cjn/antigravity-context-viewer';
 const OFFICIAL_RELEASES_API = `https://api.github.com/repos/${OFFICIAL_REPO}/releases`;
+const OFFICIAL_RELEASES_WEB_BASE = `https://github.com/${OFFICIAL_REPO}/releases`;
+const OFFICIAL_RELEASES_ATOM = `${OFFICIAL_RELEASES_WEB_BASE}.atom`;
+const OFFICIAL_RELEASES_LATEST = `${OFFICIAL_RELEASES_WEB_BASE}/latest`;
+const MAX_GITHUB_TEXT_BYTES = 4 * 1024 * 1024;
+const MAX_GITHUB_STREAM_BYTES = 100 * 1024 * 1024;
 
 let cachedUpdateCheck = null;
 let cachedUpdateCheckAt = 0;
 let isApplyingUpdate = false;
 
 /**
- * 校验下载重定向地址是否属于受信任的 GitHub / 官方资产 CDN
+ * 校验下载重定向地址是否属于受信任的 GitHub / 官方资产 CDN（支持相对路径按 baseUrl 解析）
  */
-function isAllowedDownloadRedirectUrl(targetUrlStr) {
+function isAllowedDownloadRedirectUrl(targetUrlStr, baseUrlStr = null) {
   try {
-    const u = new URL(targetUrlStr);
+    if (!targetUrlStr || typeof targetUrlStr !== 'string') return false;
+    const u = baseUrlStr ? new URL(targetUrlStr, baseUrlStr) : new URL(targetUrlStr);
     if (u.protocol !== 'https:') return false;
+    if (u.username || u.password) return false;
     const host = u.hostname.toLowerCase();
     if (host === 'github.com' || host.endsWith('.github.com')) return true;
     if (host === 'objects.githubusercontent.com' || host.endsWith('.githubusercontent.com')) return true;
@@ -3252,16 +6799,23 @@ function isAllowedDownloadRedirectUrl(targetUrlStr) {
 }
 
 /**
- * 严格校验资产下载地址是否归属于官方仓库发布路径
+ * 严格校验资产下载地址是否归属于官方仓库发布路径，禁止路径穿越与外站跳转
  */
-function isOfficialAssetDownloadUrl(urlStr, filename) {
+function isOfficialAssetDownloadUrl(urlStr, filename, expectedTag = null) {
   if (!urlStr || typeof urlStr !== 'string') return false;
+  if (urlStr.includes('\\') || urlStr.includes('..') || /%2e%2e|%2f|%5c/i.test(urlStr)) return false;
   try {
     const u = new URL(urlStr);
     if (u.protocol !== 'https:' || u.hostname !== 'github.com') return false;
+    if (u.username || u.password || u.search || u.hash) return false;
     const expectedPrefix = `/${OFFICIAL_REPO}/releases/download/`;
     if (!u.pathname.startsWith(expectedPrefix)) return false;
-    if (filename && !u.pathname.endsWith('/' + filename)) return false;
+    const rest = u.pathname.slice(expectedPrefix.length);
+    const segments = rest.split('/');
+    if (segments.length !== 2 || !segments[0] || !segments[1]) return false;
+    if (segments.some(seg => seg === '.' || seg === '..' || seg.includes('..'))) return false;
+    if (expectedTag && decodeURIComponent(segments[0]) !== expectedTag && segments[0] !== expectedTag) return false;
+    if (filename && segments[1] !== filename) return false;
     return true;
   } catch {
     return false;
@@ -3291,104 +6845,360 @@ function resolveNodeRuntime() {
   };
 }
 
+// 隧道建立与超时分类助手已统一收敛至 meter-proxy.js 导出并在本文件顶部引入复用。
+
+
 function requestGithubUrl(rawUrl, options = {}) {
   return new Promise((resolve, reject) => {
     try {
+      const startMs = Date.now();
       const timeoutMs = options.timeout || 8000;
       const redirectCount = options.redirectCount || 0;
       const parsedUrl = new URL(rawUrl);
-      const headers = Object.assign({
-        'User-Agent': 'AntigravityContextMeter/0.8.3',
-        'Accept': 'application/vnd.github.v3+json'
-      }, options.headers || {});
+      const isApiHost = parsedUrl.hostname.toLowerCase() === 'api.github.com';
+      const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0
+        ? options.maxBytes
+        : (options.streamTo ? MAX_GITHUB_STREAM_BYTES : MAX_GITHUB_TEXT_BYTES);
+      const phase = options.phase || (isApiHost ? 'release_query' : (options.streamTo ? 'download_asset' : 'request'));
+      const hopTrace = Array.isArray(options._hopTrace) ? options._hopTrace : [];
 
-      const proxyInfo = detectProxyConfig();
-      if (proxyInfo && proxyInfo.enabled && proxyInfo.httpProxy) {
-        try {
-          const proxyUrl = new URL(proxyInfo.httpProxy);
-          const http = require('http');
-          const connectReq = http.request({
-            host: proxyUrl.hostname,
-            port: Number(proxyUrl.port) || 80,
-            method: 'CONNECT',
-            path: `${parsedUrl.hostname}:${parsedUrl.port || 443}`
-          });
-          connectReq.on('connect', (res, socket) => {
-            if (res.statusCode === 200) {
-              const httpsAgent = new https.Agent({ socket });
-              doRequest(httpsAgent);
-            } else {
-              doRequest(undefined);
-            }
-          });
-          connectReq.on('error', () => doRequest(undefined));
-          connectReq.setTimeout(timeoutMs, () => {
-            connectReq.destroy();
-            doRequest(undefined);
-          });
-          connectReq.end();
-          return;
-        } catch {
-          doRequest(undefined);
-          return;
+      // 认证信息仅允许发送至 api.github.com，绝不透传给网页、重定向目标或外部 CDN
+      const rawHeaders = Object.assign({}, options.headers || {});
+      for (const hKey of Object.keys(rawHeaders)) {
+        if (!isApiHost && hKey.toLowerCase() === 'authorization') {
+          delete rawHeaders[hKey];
         }
       }
+      const headers = Object.assign({
+        'User-Agent': `AntigravityContextMeter/${PROJECT_VERSION}`,
+        'Accept': isApiHost ? 'application/vnd.github.v3+json' : (options.accept || '*/*')
+      }, rawHeaders);
+      const token = options.token || process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+      if (isApiHost && token && !Object.keys(headers).some(k => k.toLowerCase() === 'authorization')) {
+        headers.Authorization = `Bearer ${String(token).trim()}`;
+      }
 
-      doRequest(undefined);
+      const proxyInfo = options.useProxy === false
+        ? null
+        : detectProxyConfig(options.proxyConfigOptions || {});
+      const pluginProxyConfigured = Boolean(proxyInfo && proxyInfo.enabled && proxyInfo.httpProxy);
+      const bypassMatched = pluginProxyConfigured
+        ? Boolean(matchesNoProxy(parsedUrl.hostname, proxyInfo.noProxy))
+        : false;
+      const parsedProxy = pluginProxyConfigured && !bypassMatched
+        ? parseAndValidateProxyUrl(proxyInfo.httpProxy)
+        : null;
+      const willUseProxyTunnel = Boolean(pluginProxyConfigured && !bypassMatched);
+      const hopEntry = {
+        phase,
+        hop: redirectCount + 1,
+        host: parsedUrl.hostname,
+        port: Number(parsedUrl.port) || 443,
+        proxySource: willUseProxyTunnel
+          ? 'plugin_config'
+          : (bypassMatched ? 'plugin_bypass' : (options.useProxy === false ? 'disabled' : 'direct')),
+        proxyProtocol: parsedProxy?.ok ? parsedProxy.protocol : 'direct',
+        proxyEndpoint: (pluginProxyConfigured && !bypassMatched) ? redactProxyUrl(proxyInfo.httpProxy) : null,
+        bypassMatched,
+        outcome: 'pending',
+        timeoutPhase: null,
+        durationMs: 0,
+        error: null
+      };
+      hopTrace.push(hopEntry);
 
-      function doRequest(customAgent) {
+      let settledOuter = false;
+      const finishResolve = val => {
+        if (settledOuter) return;
+        settledOuter = true;
+        hopEntry.durationMs = Date.now() - startMs;
+        if (hopEntry.outcome === 'pending') hopEntry.outcome = 'ok';
+        resolve(val);
+      };
+      const finishReject = err => {
+        if (settledOuter) return;
+        settledOuter = true;
+        hopEntry.durationMs = Date.now() - startMs;
+        hopEntry.outcome = 'error';
+        hopEntry.timeoutPhase = hopEntry.timeoutPhase || classifyRequestTimeoutPhase(err, willUseProxyTunnel);
+        hopEntry.error = sanitizeDiagnosticErrorText(err);
+        if (err && typeof err === 'object' && !err.diagnostics) {
+          err.diagnostics = {
+            phase,
+            targetHost: hopEntry.host,
+            targetPort: hopEntry.port,
+            proxySource: hopEntry.proxySource,
+            proxyProtocol: hopEntry.proxyProtocol,
+            proxyEndpoint: hopEntry.proxyEndpoint,
+            bypassMatched: hopEntry.bypassMatched,
+            timeoutPhase: hopEntry.timeoutPhase,
+            hops: hopTrace.map(h => ({ ...h }))
+          };
+        }
+        try {
+          console.warn('[Update Diagnostics]', JSON.stringify({
+            phase: hopEntry.phase,
+            hop: hopEntry.hop,
+            host: hopEntry.host,
+            port: hopEntry.port,
+            proxySource: hopEntry.proxySource,
+            proxyProtocol: hopEntry.proxyProtocol,
+            proxyEndpoint: hopEntry.proxyEndpoint,
+            bypassMatched: hopEntry.bypassMatched,
+            timeoutPhase: hopEntry.timeoutPhase,
+            durationMs: hopEntry.durationMs,
+            error: hopEntry.error
+          }));
+        } catch { }
+        reject(err);
+      };
+
+      if (willUseProxyTunnel) {
+        if (!parsedProxy || !parsedProxy.ok) {
+          return finishReject(new Error(`代理配置无效: ${parsedProxy?.error || '无法解析代理地址'}`));
+        }
+        const targetPort = Number(parsedUrl.port) || 443;
+        const tunnelPromise = (parsedProxy.protocol === 'socks5:' || parsedProxy.protocol === 'socks5h:')
+          ? openSocks5Tunnel(parsedProxy, parsedUrl.hostname, targetPort, timeoutMs)
+          : openHttpConnectTunnel(parsedProxy, parsedUrl.hostname, targetPort, timeoutMs, {
+            ca: options.proxyCa || options.ca,
+            rejectUnauthorized: options.proxyRejectUnauthorized
+          });
+        // 代理已启用且未命中绕过规则时，隧道失败必须立即报错，绝不静默改走直连
+        tunnelPromise.then(
+          socket => doRequest(socket),
+          err => {
+            hopEntry.timeoutPhase = 'proxy_tunnel_connect';
+            finishReject(err);
+          }
+        );
+        return;
+      }
+
+      doRequest(null);
+
+      function doRequest(tunnelSocket) {
+        let tunnelConsumed = false;
+        const releaseUnusedTunnel = () => {
+          if (tunnelSocket && !tunnelConsumed && !tunnelSocket.destroyed) {
+            try { tunnelSocket.destroy(); } catch { }
+          }
+        };
+        const settleResolve = val => {
+          releaseUnusedTunnel();
+          finishResolve(val);
+        };
+        const settleReject = err => {
+          releaseUnusedTunnel();
+          finishReject(err);
+        };
         const reqOpts = {
           hostname: parsedUrl.hostname,
           port: parsedUrl.port || 443,
           path: parsedUrl.pathname + parsedUrl.search,
           method: options.method || 'GET',
-          headers,
-          agent: customAgent
+          headers
         };
+        if (options.ca) reqOpts.ca = options.ca;
+        if (typeof options.rejectUnauthorized === 'boolean') {
+          reqOpts.rejectUnauthorized = options.rejectUnauthorized;
+        }
+        if (tunnelSocket) {
+          const tls = require('tls');
+          // Node https.request 在 agent:false 时会忽略 reqOpts.createConnection，必须绑定带 createConnection 的专属 Agent
+          const tunnelAgent = new https.Agent({ keepAlive: false });
+          tunnelAgent.createConnection = () => {
+            tunnelConsumed = true;
+            const tlsOpts = { socket: tunnelSocket, servername: parsedUrl.hostname };
+            if (options.ca) tlsOpts.ca = options.ca;
+            if (typeof options.rejectUnauthorized === 'boolean') {
+              tlsOpts.rejectUnauthorized = options.rejectUnauthorized;
+            }
+            return tls.connect(tlsOpts);
+          };
+          reqOpts.agent = tunnelAgent;
+        }
 
         const req = https.request(reqOpts, res => {
           if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            const nextLocation = res.headers.location;
+            const rawLocation = String(res.headers.location);
+            let nextUrlStr = null;
+            try {
+              nextUrlStr = new URL(rawLocation, parsedUrl).toString();
+            } catch {
+              nextUrlStr = null;
+            }
+            res.resume();
             if (redirectCount >= 5) {
-              if (options.streamTo) { try { options.streamTo.destroy(); } catch {} }
-              return reject(new Error('GitHub 请求重定向次数过多 (>5)'));
+              if (options.streamTo) { try { options.streamTo.destroy(); } catch { } }
+              return settleReject(new Error('GitHub 请求重定向次数过多 (>5)'));
             }
-            if (!isAllowedDownloadRedirectUrl(nextLocation)) {
-              if (options.streamTo) { try { options.streamTo.destroy(); } catch {} }
-              return reject(new Error(`下载重定向地址不受信任或协议不安全: ${nextLocation}`));
+            const redirectOk = typeof options._isAllowedRedirectUrl === 'function'
+              ? options._isAllowedRedirectUrl(nextUrlStr, parsedUrl.toString())
+              : isAllowedDownloadRedirectUrl(nextUrlStr, parsedUrl.toString());
+            if (!nextUrlStr || !redirectOk) {
+              if (options.streamTo) { try { options.streamTo.destroy(); } catch { } }
+              return settleReject(new Error(`下载重定向地址不受信任或协议不安全: ${rawLocation}`));
             }
-            const nextOptions = Object.assign({}, options, { redirectCount: redirectCount + 1 });
-            return requestGithubUrl(nextLocation, nextOptions).then(resolve, reject);
+            // 剥离旧 headers 与 Authorization，按新目标域名重新决定是否附带凭据与代理绕过
+            hopEntry.outcome = 'redirect';
+            hopEntry.durationMs = Date.now() - startMs;
+            try { hopEntry.redirectToHost = new URL(nextUrlStr).hostname; } catch {}
+            const nextHeaders = Object.assign({}, options.headers || {});
+            for (const hKey of Object.keys(nextHeaders)) {
+              if (hKey.toLowerCase() === 'authorization') delete nextHeaders[hKey];
+            }
+            const nextOptions = Object.assign({}, options, {
+              headers: nextHeaders,
+              redirectCount: redirectCount + 1,
+              phase,
+              _hopTrace: hopTrace
+            });
+            releaseUnusedTunnel();
+            return requestGithubUrl(nextUrlStr, nextOptions).then(finishResolve, finishReject);
           }
           if (res.statusCode !== 200) {
-            if (options.streamTo) { try { options.streamTo.destroy(); } catch {} }
+            if (options.streamTo) { try { options.streamTo.destroy(); } catch { } }
             let errBody = '';
-            res.on('data', c => errBody += c);
-            res.on('end', () => reject(new Error(`GitHub API HTTP ${res.statusCode}: ${errBody.slice(0, 150)}`)));
+            res.on('data', c => {
+              if (errBody.length < 1024) errBody += c;
+            });
+            res.on('end', () => {
+              const err = new Error(`GitHub HTTP ${res.statusCode}: ${errBody.slice(0, 150)}`);
+              err.statusCode = res.statusCode;
+              err.responseBody = errBody;
+              settleReject(err);
+            });
             return;
           }
+          let totalBytes = 0;
+          let abortedOrInvalid = false;
+          const rawContentLen = !res.headers['content-encoding'] ? res.headers['content-length'] : null;
+          const expectedContentLen = (rawContentLen != null && /^\d+$/.test(String(rawContentLen).trim()))
+            ? Number(String(rawContentLen).trim())
+            : null;
+
+          const validateResponseComplete = () => {
+            if (res.complete === false || res.aborted) {
+              return new Error('响应流未完整结束，连接可能已提前中断');
+            }
+            if (expectedContentLen !== null && totalBytes !== expectedContentLen) {
+              return new Error(`响应长度不完整 (期望 ${expectedContentLen} 字节，实际接收 ${totalBytes} 字节)`);
+            }
+            return null;
+          };
+
           if (options.streamTo) {
-            res.pipe(options.streamTo);
-            options.streamTo.on('finish', () => resolve());
-            options.streamTo.on('error', reject);
-            res.on('error', err => {
-              try { options.streamTo.destroy(err); } catch {}
-              reject(err);
+            let resEnded = false;
+            let streamFinished = false;
+            const tryResolveStream = () => {
+              if (abortedOrInvalid || !resEnded || !streamFinished) return;
+              const integrityErr = validateResponseComplete();
+              if (integrityErr) {
+                abortedOrInvalid = true;
+                try { options.streamTo.destroy(integrityErr); } catch { }
+                return settleReject(integrityErr);
+              }
+              settleResolve();
+            };
+
+            res.on('data', chunk => {
+              totalBytes += chunk.length;
+              if (totalBytes > maxBytes && !abortedOrInvalid) {
+                abortedOrInvalid = true;
+                const err = new Error(`响应体超出大小限制 (>${maxBytes} 字节)`);
+                err.code = 'RESPONSE_TOO_LARGE';
+                if (typeof res.destroy === 'function') res.destroy(err);
+                try { options.streamTo.destroy(err); } catch { }
+                settleReject(err);
+              }
             });
+            res.on('aborted', () => {
+              if (abortedOrInvalid) return;
+              abortedOrInvalid = true;
+              const err = new Error('下载响应流意外中断 (aborted)');
+              try { options.streamTo.destroy(err); } catch { }
+              settleReject(err);
+            });
+            res.on('end', () => {
+              resEnded = true;
+              tryResolveStream();
+            });
+            res.on('close', () => {
+              if (!resEnded && !abortedOrInvalid && !res.complete) {
+                abortedOrInvalid = true;
+                const err = new Error('下载连接未完整结束即关闭');
+                try { options.streamTo.destroy(err); } catch { }
+                settleReject(err);
+              }
+            });
+            res.on('error', err => {
+              abortedOrInvalid = true;
+              try { options.streamTo.destroy(err); } catch { }
+              settleReject(err);
+            });
+            options.streamTo.on('finish', () => {
+              streamFinished = true;
+              tryResolveStream();
+            });
+            options.streamTo.on('error', err => {
+              abortedOrInvalid = true;
+              settleReject(err);
+            });
+            res.pipe(options.streamTo);
           } else {
-            let data = '';
-            res.on('data', chunk => data += chunk);
-            res.on('end', () => resolve(data));
+            const chunks = [];
+            res.on('data', chunk => {
+              const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              totalBytes += buf.length;
+              if (totalBytes > maxBytes) {
+                abortedOrInvalid = true;
+                const err = new Error(`响应体超出大小限制 (>${maxBytes} 字节)`);
+                err.code = 'RESPONSE_TOO_LARGE';
+                if (typeof res.destroy === 'function') res.destroy(err);
+                settleReject(err);
+                return;
+              }
+              chunks.push(buf);
+            });
+            res.on('aborted', () => {
+              if (abortedOrInvalid) return;
+              abortedOrInvalid = true;
+              settleReject(new Error('响应流意外中断 (aborted)'));
+            });
+            res.on('end', () => {
+              if (abortedOrInvalid) return;
+              const integrityErr = validateResponseComplete();
+              if (integrityErr) {
+                abortedOrInvalid = true;
+                return settleReject(integrityErr);
+              }
+              const data = Buffer.concat(chunks).toString('utf8');
+              if (options.resolveWithMeta) {
+                settleResolve({ data, finalUrl: parsedUrl.toString(), statusCode: res.statusCode });
+              } else {
+                settleResolve(data);
+              }
+            });
+            res.on('close', () => {
+              if (!abortedOrInvalid && !res.complete) {
+                abortedOrInvalid = true;
+                settleReject(new Error('响应连接未完整结束即关闭'));
+              }
+            });
+            res.on('error', err => {
+              if (!abortedOrInvalid) settleReject(err);
+            });
           }
         });
 
         req.setTimeout(timeoutMs, () => {
-          if (options.streamTo) { try { options.streamTo.destroy(); } catch {} }
+          if (options.streamTo) { try { options.streamTo.destroy(); } catch { } }
           req.destroy(new Error(`请求超时 (${timeoutMs}ms)`));
         });
         req.on('error', err => {
-          if (options.streamTo) { try { options.streamTo.destroy(); } catch {} }
-          reject(err);
+          if (options.streamTo) { try { options.streamTo.destroy(); } catch { } }
+          settleReject(err);
         });
         if (options.body) req.write(options.body);
         req.end();
@@ -3408,7 +7218,7 @@ function getInstalledMeterVersion(options = {}) {
     let targetAsar = null;
     try {
       targetAsar = options.asarPath || findAsarPath(options.customPath || null);
-    } catch {}
+    } catch { }
 
     const candidatePaths = [
       options && options.installationJsonPath,
@@ -3439,12 +7249,270 @@ function getInstalledMeterVersion(options = {}) {
         }
       }
     }
-  } catch {}
+  } catch { }
   return null;
 }
 
+function decodeHtmlEntities(str) {
+  return String(str || '')
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&#(\d+);/g, (_, dec) => {
+      const code = Number(dec);
+      return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isInteger(code) && code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : '';
+    })
+    .replace(/&amp;/g, '&');
+}
+
+function stripHtmlToPlainText(rawHtml) {
+  const decoded = decodeHtmlEntities(rawHtml);
+  return decoded
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\/\s*(?:p|div|li|h[1-6]|tr)\s*>/gi, '\n')
+    .replace(/<\s*li[^>]*>/gi, '- ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function parseReleasesAtom(xmlText) {
+  if (!xmlText || typeof xmlText !== 'string' || !/<feed\b/i.test(xmlText) || !/<entry\b/i.test(xmlText)) {
+    throw new Error('releases.atom 响应结构异常，未能解析版本条目');
+  }
+  const releases = [];
+  const entryRegex = /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi;
+  let match;
+  while ((match = entryRegex.exec(xmlText)) !== null) {
+    const entryXml = match[1];
+    const linkMatch = entryXml.match(/<link\b[^>]*href=["']([^"']+)["'][^>]*>/i);
+    const titleMatch = entryXml.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+    const idMatch = entryXml.match(/<id\b[^>]*>([\s\S]*?)<\/id>/i);
+    const updatedMatch = entryXml.match(/<updated\b[^>]*>([\s\S]*?)<\/updated>/i);
+    const contentMatch = entryXml.match(/<content\b[^>]*>([\s\S]*?)<\/content>/i);
+
+    let tagName = '';
+    let htmlUrl = '';
+    if (linkMatch) {
+      try {
+        const u = new URL(decodeHtmlEntities(linkMatch[1]), 'https://github.com');
+        const expectedPrefix = `/${OFFICIAL_REPO}/releases/tag/`;
+        if (u.protocol === 'https:' && u.hostname === 'github.com' && u.pathname.startsWith(expectedPrefix)) {
+          tagName = decodeURIComponent(u.pathname.slice(expectedPrefix.length).split('/')[0] || '').trim();
+          htmlUrl = `${OFFICIAL_RELEASES_WEB_BASE}/tag/${encodeURIComponent(tagName)}`;
+        }
+      } catch { }
+    }
+    if (!tagName && idMatch) {
+      const idText = decodeHtmlEntities(idMatch[1]).trim();
+      const parts = idText.split('/');
+      const cand = parts[parts.length - 1]?.trim();
+      if (cand && /^v?\d+\.\d+\.\d+/.test(cand)) tagName = cand;
+    }
+    if (!tagName && titleMatch) {
+      const titleText = decodeHtmlEntities(titleMatch[1]).trim();
+      const verToken = titleText.match(/\bv?\d+\.\d+\.\d+\b/);
+      if (verToken) tagName = verToken[0];
+    }
+    if (!tagName) continue;
+    if (!htmlUrl) htmlUrl = `${OFFICIAL_RELEASES_WEB_BASE}/tag/${encodeURIComponent(tagName)}`;
+
+    const title = titleMatch ? decodeHtmlEntities(titleMatch[1]).trim() : tagName;
+    const body = contentMatch ? stripHtmlToPlainText(contentMatch[1]) : '';
+    const publishedAt = updatedMatch ? decodeHtmlEntities(updatedMatch[1]).trim() : '';
+    const isPre = /alpha|beta|rc|pre-?release|draft/i.test(tagName) || /pre-?release/i.test(title);
+    releases.push({
+      tag_name: tagName,
+      name: title,
+      html_url: htmlUrl,
+      body,
+      published_at: publishedAt,
+      draft: false,
+      prerelease: isPre,
+      assets: []
+    });
+  }
+  if (!releases.length) {
+    throw new Error('releases.atom 未包含有效的官方版本条目');
+  }
+  return releases;
+}
+
+function parseLatestReleaseHtml(htmlText, finalUrl = '') {
+  const candidates = [];
+  if (finalUrl) candidates.push(String(finalUrl));
+  if (htmlText && typeof htmlText === 'string') {
+    const canonicalMatch = htmlText.match(/<link\b[^>]*rel=["']canonical["'][^>]*href=["']([^"']+)["']/i);
+    if (canonicalMatch) candidates.push(decodeHtmlEntities(canonicalMatch[1]));
+    const ogMatch = htmlText.match(/<meta\b[^>]*property=["']og:url["'][^>]*content=["']([^"']+)["']/i);
+    if (ogMatch) candidates.push(decodeHtmlEntities(ogMatch[1]));
+    const tagLinkRegex = new RegExp(`href=["'](?:https://github\\.com)?/${OFFICIAL_REPO}/releases/tag/([^"'?#\\s]+)["']`, 'i');
+    const tagLinkMatch = htmlText.match(tagLinkRegex);
+    if (tagLinkMatch) candidates.push(`https://github.com/${OFFICIAL_REPO}/releases/tag/${tagLinkMatch[1]}`);
+  }
+  const expectedPrefix = `/${OFFICIAL_REPO}/releases/tag/`;
+  for (const cand of candidates) {
+    try {
+      const u = new URL(cand, 'https://github.com');
+      if (u.protocol === 'https:' && u.hostname === 'github.com' && u.pathname.startsWith(expectedPrefix)) {
+        const rawTag = u.pathname.slice(expectedPrefix.length).split('/')[0];
+        const tagName = decodeURIComponent(rawTag || '').trim();
+        if (tagName && !tagName.includes('..') && tagName !== 'latest') {
+          return [{
+            tag_name: tagName,
+            name: tagName,
+            html_url: `${OFFICIAL_RELEASES_WEB_BASE}/tag/${encodeURIComponent(tagName)}`,
+            body: '',
+            published_at: '',
+            draft: false,
+            prerelease: /alpha|beta|rc|pre-?release/i.test(tagName),
+            assets: []
+          }];
+        }
+      }
+    } catch { }
+  }
+  throw new Error('releases/latest 页面结构异常，未能解析最新版本号');
+}
+
+function parseExpandedAssetsHtml(htmlText, tagName) {
+  if (!htmlText || typeof htmlText !== 'string' || !tagName) {
+    throw new Error('expanded_assets 响应为空或缺少版本标签');
+  }
+  const assets = [];
+  const seen = new Set();
+  const hrefRegex = /<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>/gi;
+  let match;
+  while ((match = hrefRegex.exec(htmlText)) !== null) {
+    const rawHref = decodeHtmlEntities(match[1]).trim();
+    if (!rawHref) continue;
+    let absUrl;
+    try {
+      absUrl = new URL(rawHref, 'https://github.com').toString();
+    } catch {
+      continue;
+    }
+    const u = new URL(absUrl);
+    if (u.protocol !== 'https:' || u.hostname !== 'github.com') continue;
+    const expectedPrefix = `/${OFFICIAL_REPO}/releases/download/`;
+    if (!u.pathname.startsWith(expectedPrefix)) continue;
+    const rest = u.pathname.slice(expectedPrefix.length);
+    const segments = rest.split('/');
+    if (segments.length !== 2) continue;
+    const fileName = segments[1];
+    if (!isOfficialAssetDownloadUrl(absUrl, fileName, tagName)) continue;
+    if (seen.has(absUrl)) continue;
+    seen.add(absUrl);
+    assets.push({
+      name: fileName,
+      browser_download_url: absUrl
+    });
+  }
+  return assets;
+}
+
+function shouldUseWebFallback(err, rawData) {
+  if (err) {
+    if (err.statusCode === 403 || err.statusCode === 429) return true;
+    if (/403|429|rate limit|HTTP (?:403|429|5\d\d)|ENOTFOUND|ECONN|ETIMEDOUT|超时/i.test(String(err.message || ''))) {
+      return true;
+    }
+    return true;
+  }
+  try {
+    const parsed = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+    return !Array.isArray(parsed);
+  } catch {
+    return true;
+  }
+}
+
+async function fetchOfficialReleasesWithFallback(options = {}) {
+  const effectiveCurrentVersion = options.currentVersion || PROJECT_VERSION;
+  const fetcher = options._requestGithubUrl || requestGithubUrl;
+  const timeout = options.timeout || 8000;
+  let primaryErr = null;
+  let usedSource = 'api';
+  let releasesList = null;
+
+  try {
+    const rawData = await fetcher(OFFICIAL_RELEASES_API, { timeout });
+    const parsed = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+    if (Array.isArray(parsed)) {
+      releasesList = parsed;
+    } else {
+      primaryErr = new Error(parsed?.message ? `GitHub API 返回异常: ${parsed.message}` : 'GitHub API 未返回版本列表');
+    }
+  } catch (err) {
+    primaryErr = err;
+  }
+
+  if (!releasesList && shouldUseWebFallback(primaryErr)) {
+    const fallbackErrors = [];
+    try {
+      const atomXml = await fetcher(OFFICIAL_RELEASES_ATOM, { timeout, accept: 'application/atom+xml, application/xml, text/xml, */*' });
+      const atomText = typeof atomXml === 'object' && atomXml?.data ? atomXml.data : atomXml;
+      releasesList = parseReleasesAtom(atomText);
+      usedSource = 'atom';
+    } catch (atomErr) {
+      fallbackErrors.push(`releases.atom: ${atomErr.message}`);
+    }
+
+    if (!releasesList) {
+      try {
+        const latestRes = await fetcher(OFFICIAL_RELEASES_LATEST, {
+          timeout,
+          accept: 'text/html, */*',
+          resolveWithMeta: true
+        });
+        const htmlBody = typeof latestRes === 'object' && latestRes !== null ? (latestRes.data || '') : latestRes;
+        const finalUrl = typeof latestRes === 'object' && latestRes !== null ? (latestRes.finalUrl || '') : '';
+        releasesList = parseLatestReleaseHtml(htmlBody, finalUrl);
+        usedSource = 'latest';
+      } catch (latestErr) {
+        fallbackErrors.push(`releases/latest: ${latestErr.message}`);
+      }
+    }
+
+    if (!releasesList) {
+      const primaryMsg = primaryErr ? primaryErr.message : 'GitHub REST API 不可用';
+      throw new Error(`${primaryMsg}（官方网页通道回退亦失败: ${fallbackErrors.join('; ')}；请前往发布页手动下载）`);
+    }
+  } else if (!releasesList) {
+    throw primaryErr || new Error('未能获取有效的官方版本列表');
+  }
+
+  const valid = filterReleases(releasesList, effectiveCurrentVersion);
+  return {
+    releases: valid,
+    source: usedSource,
+    rawCount: Array.isArray(releasesList) ? releasesList.length : 0
+  };
+}
+
+async function resolveAssetsForWebRelease(targetRelease, fetcher, timeout = 8000) {
+  if (!targetRelease || !targetRelease.tagName) return targetRelease;
+  if (Array.isArray(targetRelease.assets) && targetRelease.assets.length > 0) return targetRelease;
+  const assetsUrl = `${OFFICIAL_RELEASES_WEB_BASE}/expanded_assets/${encodeURIComponent(targetRelease.tagName)}`;
+  const rawHtml = await fetcher(assetsUrl, { timeout, accept: 'text/html, */*' });
+  const htmlBody = typeof rawHtml === 'object' && rawHtml?.data ? rawHtml.data : rawHtml;
+  const parsedAssets = parseExpandedAssetsHtml(htmlBody, targetRelease.tagName);
+  if (!parsedAssets.length) {
+    throw new Error(`发布页资产列表解析为空或结构异常 (${targetRelease.tagName})，请前往官方发布页手动下载`);
+  }
+  return Object.assign({}, targetRelease, { assets: parsedAssets });
+}
+
 async function checkUpdateAsync(options = {}) {
-  const runtimeVersion = options.currentVersion || '0.8.3';
+  const runtimeVersion = options.currentVersion || PROJECT_VERSION;
   const diskVersion = getInstalledMeterVersion(options);
   const effectiveCurrentVersion = (diskVersion && compareVersions(diskVersion, runtimeVersion) > 0)
     ? diskVersion
@@ -3471,14 +7539,23 @@ async function checkUpdateAsync(options = {}) {
     }
   }
 
-  const releasesApiUrl = OFFICIAL_RELEASES_API;
   try {
     const fetcher = options._requestGithubUrl || requestGithubUrl;
-    const rawData = await fetcher(releasesApiUrl, { timeout: 8000 });
-    const releasesList = JSON.parse(rawData);
-    const valid = filterReleases(releasesList, effectiveCurrentVersion);
+    const { releases: valid, source } = await fetchOfficialReleasesWithFallback({
+      currentVersion: effectiveCurrentVersion,
+      _requestGithubUrl: fetcher,
+      timeout: 8000
+    });
     if (valid.length > 0) {
-      const latest = valid[0];
+      let latest = valid[0];
+      let assetsWarning = null;
+      if (source !== 'api' && (!latest.assets || latest.assets.length === 0)) {
+        try {
+          latest = await resolveAssetsForWebRelease(latest, fetcher, 8000);
+        } catch (assetErr) {
+          assetsWarning = assetErr.message;
+        }
+      }
       const bodyLines = (latest.body || '').split(/\r?\n/).slice(0, 8).join('\n');
       cachedUpdateCheck = {
         ok: true,
@@ -3488,9 +7565,11 @@ async function checkUpdateAsync(options = {}) {
         latestVersion: latest.version,
         tagName: latest.tagName,
         releaseNotes: bodyLines,
-        htmlUrl: latest.htmlUrl,
+        htmlUrl: latest.htmlUrl || `${OFFICIAL_RELEASES_WEB_BASE}/tag/${encodeURIComponent(latest.tagName)}`,
         publishedAt: latest.publishedAt,
-        assets: latest.assets
+        assets: latest.assets,
+        source,
+        ...(assetsWarning ? { assetsWarning } : {})
       };
       cachedUpdateCheckAt = now;
       return cachedUpdateCheck;
@@ -3501,7 +7580,8 @@ async function checkUpdateAsync(options = {}) {
       currentVersion: runtimeVersion,
       installedVersion,
       latestVersion: effectiveCurrentVersion,
-      diskPendingRestart: compareVersions(installedVersion, runtimeVersion) > 0
+      diskPendingRestart: compareVersions(installedVersion, runtimeVersion) > 0,
+      source
     };
     cachedUpdateCheckAt = now;
     return cachedUpdateCheck;
@@ -3511,7 +7591,9 @@ async function checkUpdateAsync(options = {}) {
       hasUpdate: false,
       currentVersion: runtimeVersion,
       installedVersion,
-      error: err.message
+      htmlUrl: OFFICIAL_RELEASES_WEB_BASE,
+      error: sanitizeDiagnosticErrorText(err),
+      ...(err?.diagnostics ? { diagnostics: err.diagnostics } : {})
     };
   }
 }
@@ -3540,13 +7622,218 @@ function safeCloseStream(stream) {
   });
 }
 
+/**
+ * 等待可写文件流完成刷盘与自动关闭，避免测试替身或自定义下载器提前返回导致读取竞态。
+ * @param {import('fs').WriteStream} stream
+ * @returns {Promise<void>}
+ */
+function waitWritableStreamClose(stream) {
+  return new Promise((resolve, reject) => {
+    if (!stream || stream.closed || stream.destroyed) {
+      return resolve();
+    }
+    const onClose = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, 3000);
+    function cleanup() {
+      clearTimeout(timer);
+      stream.removeListener('close', onClose);
+      stream.removeListener('error', onError);
+    }
+    stream.once('close', onClose);
+    stream.once('error', onError);
+    if (stream.writableFinished && !stream.closed) {
+      // writableFinished 为 true 时 autoClose 会紧接着 emit close
+    }
+  });
+}
+
+const LIVE_RUNTIME_FILES = [
+  'package.json',
+  'cli.js',
+  'install.js',
+  'restore.js',
+  'live-host.js',
+  'local-api.js',
+  'meter-main.js',
+  'meter-core.js',
+  'meter-renderer.js',
+  'meter-collector.js',
+  'meter-storage.js',
+  'meter-proxy.js',
+  'meter-cli-launcher.js',
+  'meter-context-unlock.js',
+  'meter-enhance.js',
+  'meter-accounts.js',
+  'macos-binary-utils.js',
+  'attachment_scan.py',
+  'asar-engine.js',
+  'modules-config.js',
+  'modular-installer.js',
+  'i18n/zh-CN.json',
+  'i18n/i18n-runtime.js'
+];
+
+function getLiveRuntimeDir(customStateDir = null) {
+  const { getStateDir } = require('./asar-engine');
+  const stateDir = customStateDir || getStateDir();
+  return path.join(stateDir, 'live-runtime');
+}
+
+/**
+ * 将运行外置 live-host 所需的纯 JS/配置运行时文件原子同步至 stateDir/live-runtime。
+ * 保证在线更新清理临时目录或安装目录变动后，热加载后台进程仍能稳定运行至客户端重启。
+ */
+function syncLiveRuntimeBundle(sourceDir, options = {}) {
+  try {
+    if (!sourceDir || !fs.existsSync(path.join(sourceDir, 'live-host.js')) || !fs.existsSync(path.join(sourceDir, 'meter-core.js'))) {
+      return null;
+    }
+    const { getStateDir } = require('./asar-engine');
+    const stateDir = options.stateDir || getStateDir();
+    if ((process.env.AG_METER_TEST_MODE === '1' || process.env.NODE_ENV === 'test') && !options.stateDir) {
+      const lowerState = stateDir.toLowerCase();
+      const lowerTmp = os.tmpdir().toLowerCase();
+      if (!lowerState.includes(lowerTmp)) {
+        return null;
+      }
+    }
+    const targetDir = getLiveRuntimeDir(stateDir);
+    fs.mkdirSync(targetDir, { recursive: true });
+    let copiedCount = 0;
+    for (const rel of LIVE_RUNTIME_FILES) {
+      const src = path.join(sourceDir, rel);
+      if (!fs.existsSync(src)) continue;
+      const dst = path.join(targetDir, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      const tmpDst = `${dst}.tmp-${process.pid}-${Date.now()}`;
+      fs.copyFileSync(src, tmpDst);
+      fs.renameSync(tmpDst, dst);
+      copiedCount++;
+    }
+    let pkgVersion = options.version || null;
+    try {
+      if (!pkgVersion && fs.existsSync(path.join(sourceDir, 'package.json'))) {
+        pkgVersion = JSON.parse(fs.readFileSync(path.join(sourceDir, 'package.json'), 'utf8')).version || null;
+      }
+    } catch {}
+    safeWriteJsonSync(path.join(targetDir, '.runtime-manifest.json'), {
+      version: pkgVersion || PROJECT_VERSION,
+      copiedCount,
+      updatedAt: new Date().toISOString()
+    });
+    return targetDir;
+  } catch {
+    return null;
+  }
+}
+
+function parseInstallStdoutMeta(stdout = '') {
+  try {
+    const lines = String(stdout || '').split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const idx = lines[i].indexOf('__AG_INSTALL_META__=');
+      if (idx >= 0) {
+        const jsonPart = lines[i].slice(idx + '__AG_INSTALL_META__='.length).trim();
+        return JSON.parse(jsonPart);
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function isTransientUpdateDownloadError(err) {
+  const msg = String(err?.message || err || '');
+  const code = String(err?.code || '').toUpperCase();
+  if (/代理配置无效|认证失败|不受信任|协议不安全|checksums|sha-?256|拒绝安装/i.test(msg)) {
+    return false;
+  }
+  const statusCode = Number(err?.statusCode);
+  if ([400, 401, 403, 404, 410, 451].includes(statusCode)) {
+    return false;
+  }
+  if ([429, 500, 502, 503, 504].includes(statusCode)) {
+    return true;
+  }
+  return ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ECONNRESET', 'EPIPE', 'EAI_AGAIN'].includes(code) ||
+    /ETIMEDOUT|ECONNRESET|EPIPE|ESOCKETTIMEDOUT|请求超时|意外中断|意外关闭|未完整结束|长度不完整|socket hang up/i.test(msg);
+}
+
+async function downloadAssetFileWithRetry(url, filePath, fetcher, options = {}) {
+  const maxRetries = Number.isInteger(options.maxRetries) ? Math.max(0, options.maxRetries) : 2;
+  const baseRetryDelayMs = Number.isFinite(Number(options.retryDelayMs))
+    ? Number(options.retryDelayMs)
+    : ((process.env.NODE_ENV === 'test' || process.env.AG_METER_TEST_MODE === '1') ? 10 : 600);
+  const attempts = [];
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch { }
+    const stream = fs.createWriteStream(filePath);
+    stream.on('error', () => { });
+    const hopTrace = [];
+    try {
+      await fetcher(url, {
+        timeout: options.timeout || 15000,
+        streamTo: stream,
+        phase: options.phase || 'download_asset',
+        _hopTrace: hopTrace,
+        ...(options.proxyConfigOptions ? { proxyConfigOptions: options.proxyConfigOptions } : {})
+      });
+      await waitWritableStreamClose(stream);
+      return {
+        stream,
+        attemptsCount: attempt + 1,
+        diagnostics: {
+          phase: options.phase || 'download_asset',
+          attemptsCount: attempt + 1,
+          hops: hopTrace
+        }
+      };
+    } catch (err) {
+      lastErr = err;
+      await safeCloseStream(stream).catch(() => { });
+      try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch { }
+      attempts.push({
+        attempt: attempt + 1,
+        error: sanitizeDiagnosticErrorText(err),
+        diagnostics: err?.diagnostics || (hopTrace.length ? { phase: options.phase, hops: hopTrace } : null)
+      });
+      if (attempt < maxRetries && isTransientUpdateDownloadError(err)) {
+        const delayMs = baseRetryDelayMs * (attempt + 1);
+        if (delayMs > 0) await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      if (lastErr && typeof lastErr === 'object') {
+        lastErr.diagnostics = {
+          ...(lastErr.diagnostics || {}),
+          phase: options.phase || lastErr.diagnostics?.phase || 'download_asset',
+          attemptsCount: attempt + 1,
+          attempts
+        };
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr;
+}
+
 async function applyUpdateAsync(options = {}) {
   if (isApplyingUpdate) {
     return { ok: false, error: '更新任务正在执行中，请勿重复操作' };
   }
   isApplyingUpdate = true;
 
-  const currentVersion = options.currentVersion || '0.8.3';
+  const currentVersion = options.currentVersion || PROJECT_VERSION;
   let tmpDir = null;
   let checksumStream = null;
   let zipStream = null;
@@ -3558,33 +7845,42 @@ async function applyUpdateAsync(options = {}) {
       : (options?.version || options?.release?.latestVersion || null);
 
     const fetcher = options._requestGithubUrl || requestGithubUrl;
-    let rawReleases;
+    let releaseQuery;
     try {
-      rawReleases = await fetcher(OFFICIAL_RELEASES_API, { timeout: 10000 });
+      releaseQuery = await fetchOfficialReleasesWithFallback({
+        currentVersion,
+        _requestGithubUrl: fetcher,
+        timeout: 10000
+      });
     } catch (e) {
-      return { ok: false, error: `查询官方发布信息失败: ${e.message}`, htmlUrl: `https://github.com/${OFFICIAL_REPO}/releases` };
+      return { ok: false, error: `查询官方发布信息失败: ${e.message}`, htmlUrl: OFFICIAL_RELEASES_WEB_BASE };
     }
 
-    let releasesList;
-    try {
-      releasesList = typeof rawReleases === 'string' ? JSON.parse(rawReleases) : rawReleases;
-    } catch (e) {
-      return { ok: false, error: '解析官方发布信息失败', htmlUrl: `https://github.com/${OFFICIAL_REPO}/releases` };
-    }
-
-    const validReleases = filterReleases(releasesList, currentVersion);
+    const validReleases = releaseQuery.releases;
     if (!validReleases || validReleases.length === 0) {
-      return { ok: false, error: '未获取到可用的官方发布版本', htmlUrl: `https://github.com/${OFFICIAL_REPO}/releases` };
+      return { ok: false, error: '未获取到可用的官方发布版本', htmlUrl: OFFICIAL_RELEASES_WEB_BASE };
     }
 
     let targetRelease = null;
     if (requestedVersion) {
       targetRelease = validReleases.find(r => r.version === requestedVersion || r.tagName === requestedVersion || r.tagName === `v${requestedVersion}`);
       if (!targetRelease) {
-        return { ok: false, error: `未在官方仓库中找到版本 ${requestedVersion}`, htmlUrl: `https://github.com/${OFFICIAL_REPO}/releases` };
+        return { ok: false, error: `未在官方仓库中找到版本 ${requestedVersion}`, htmlUrl: OFFICIAL_RELEASES_WEB_BASE };
       }
     } else {
       targetRelease = validReleases[0];
+    }
+
+    if (releaseQuery.source !== 'api' && (!targetRelease.assets || targetRelease.assets.length === 0)) {
+      try {
+        targetRelease = await resolveAssetsForWebRelease(targetRelease, fetcher, 10000);
+      } catch (assetErr) {
+        return {
+          ok: false,
+          error: assetErr.message,
+          htmlUrl: targetRelease.htmlUrl || OFFICIAL_RELEASES_WEB_BASE
+        };
+      }
     }
 
     const effectivePlatform = options.platform || options._platform || process.platform;
@@ -3622,13 +7918,33 @@ async function applyUpdateAsync(options = {}) {
     const checksumPath = path.join(tmpDir, 'checksums.txt');
     const extractDir = path.join(tmpDir, 'extracted');
 
-    checksumStream = fs.createWriteStream(checksumPath);
-    checksumStream.on('error', () => {});
-    await fetcher(checksumAsset.browser_download_url, { timeout: 15000, streamTo: checksumStream });
+    const checksumDl = await downloadAssetFileWithRetry(
+      checksumAsset.browser_download_url,
+      checksumPath,
+      fetcher,
+      {
+        timeout: options._checksumTimeoutMs || 15000,
+        phase: 'download_checksums',
+        maxRetries: options._maxDownloadRetries,
+        retryDelayMs: options._retryDelayMs,
+        proxyConfigOptions: options.proxyConfigOptions
+      }
+    );
+    checksumStream = checksumDl.stream;
 
-    zipStream = fs.createWriteStream(zipPath);
-    zipStream.on('error', () => {});
-    await fetcher(packageAsset.browser_download_url, { timeout: 60000, streamTo: zipStream });
+    const packageDl = await downloadAssetFileWithRetry(
+      packageAsset.browser_download_url,
+      zipPath,
+      fetcher,
+      {
+        timeout: options._packageTimeoutMs || 60000,
+        phase: 'download_package',
+        maxRetries: options._maxDownloadRetries,
+        retryDelayMs: options._retryDelayMs,
+        proxyConfigOptions: options.proxyConfigOptions
+      }
+    );
+    zipStream = packageDl.stream;
 
     const checksumContent = fs.readFileSync(checksumPath, 'utf8');
     const lines = checksumContent.split(/\r?\n/);
@@ -3663,7 +7979,7 @@ async function applyUpdateAsync(options = {}) {
         extractRes = { status: 1, error: err };
       }
     } else if (process.platform === 'win32') {
-      extractRes = spawnSync('tar', ['-xf', zipPath, '-C', extractDir], { stdio: 'ignore' });
+      extractRes = spawnSync('tar', ['-xf', zipPath, '-C', extractDir], { stdio: 'ignore', windowsHide: true });
     } else {
       extractRes = spawnSync('unzip', ['-q', zipPath, '-d', extractDir], { stdio: 'ignore' });
     }
@@ -3699,7 +8015,7 @@ async function applyUpdateAsync(options = {}) {
             }
           }
         }
-      } catch {}
+      } catch { }
     }
     if (recordedInstalledPath && typeof recordedInstalledPath === 'string') {
       subArgs.push('--path', recordedInstalledPath);
@@ -3715,7 +8031,7 @@ async function applyUpdateAsync(options = {}) {
       const timer = setTimeout(() => {
         timedOut = true;
         if (child) {
-          try { child.kill('SIGKILL'); } catch {}
+          try { child.kill('SIGKILL'); } catch { }
           const closeGraceTimer = setTimeout(() => {
             reject(new Error(`更新安装子进程执行超时 (${timeoutMs}ms)`));
           }, 3000);
@@ -3731,7 +8047,7 @@ async function applyUpdateAsync(options = {}) {
       try {
         child = spawner(runtimeInfo.runtime, subArgs, {
           cwd: extractDir,
-          env: runtimeInfo.env,
+          env: { ...(runtimeInfo.env || {}), AG_EMIT_INSTALL_META: '1' },
           stdio: ['ignore', 'pipe', 'pipe'],
           windowsHide: true
         });
@@ -3761,17 +8077,39 @@ async function applyUpdateAsync(options = {}) {
     cachedUpdateCheck = null;
     cachedUpdateCheckAt = 0;
 
-    const liveInjected = execRes.stdout.includes('已即时生效（无需重启）') || execRes.stdout.includes('"liveInjected": true');
+    const liveRuntimeDir = syncLiveRuntimeBundle(extractDir, {
+      version: targetRelease.version,
+      stateDir: options.stateDir
+    });
+    const installMeta = parseInstallStdoutMeta(execRes.stdout);
+    const liveInjected = Boolean(
+      installMeta?.liveInjected === true ||
+      execRes.stdout.includes('已即时生效（无需重启）') ||
+      execRes.stdout.includes('"liveInjected": true')
+    );
     const finalInstalledVer = getInstalledMeterVersion(options) || targetRelease.version;
     return {
       ok: true,
       diskInstalled: true,
-      liveInjected: Boolean(liveInjected),
+      liveInjected,
+      backendHotReloaded: Boolean(installMeta?.backendHotReloaded),
+      backendVersion: installMeta?.backendVersion || null,
+      backendSource: installMeta?.backendSource || null,
+      hotReloadReport: installMeta || null,
+      liveRuntimeDir: liveRuntimeDir || null,
       version: targetRelease.version,
-      installedVersion: finalInstalledVer
+      installedVersion: finalInstalledVer,
+      diagnostics: {
+        checksums: checksumDl.diagnostics,
+        package: packageDl.diagnostics
+      }
     };
   } catch (err) {
-    return { ok: false, error: `更新安装异常: ${err.message}` };
+    return {
+      ok: false,
+      error: `更新安装异常: ${sanitizeDiagnosticErrorText(err)}`,
+      ...(err?.diagnostics ? { diagnostics: err.diagnostics } : {})
+    };
   } finally {
     isApplyingUpdate = false;
     try {
@@ -3780,7 +8118,7 @@ async function applyUpdateAsync(options = {}) {
       if (tmpDir && fs.existsSync(tmpDir)) {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
-    } catch {}
+    } catch { }
   }
 }
 
@@ -3790,15 +8128,42 @@ module.exports = {
   extractObservedModelInfoFromSteps,
   mergeModelCapabilitiesIntoConfigs,
   fetchUserStatusFromHost,
+  fetchQuotaSnapshotFromHost,
+  buildAccountScopeKey,
+  resetQuotaHostCacheForTest,
   collect,
   collectTokenHistory,
   collectTokenHistoryAsync,
+  parseLxssRegistryOutput,
+  listRegisteredWslDistros,
+  resolveWslDistroUncRoot,
+  collectGeminiDirsFromLinuxRoot,
+  discoverWslGeminiDirs,
+  discoverWslGeminiDirsAsync,
+  getEffectiveScanScopeKey,
+  buildSqliteImmutableUri,
+  extractStepModelsFromGenMetadataBlob,
+  extractStepMetaFromGenMetadataBlob,
+  extractTrajectoryBlobMeta,
+  loadConversationDbMeta,
+  loadStepModelMapFromSqlite,
+  needsDbLabelEnrichment,
+  backfillMissingModelsFromConversationDb,
+  buildDailyModelBreakdown,
+  collectSessionTimelineCoreAsync,
+  collectSessionTimelineAsync,
   scanFiles,
   pythonScan,
   resolvePython,
   isCompanionOrTempFile,
   formatLocalDateKey,
   recordModelCalls,
+  recordModelCallsAsync,
+  resolveCallAccountAttribution,
+  syncAccountLedgerPartitions,
+  buildAccountUsageBreakdown,
+  summarizeAccountWindowUsage,
+  repairAndMigrateAccountLedger,
   loadPricingLedger,
   savePricingLedger,
   getPricingLedgerPath,
@@ -3822,13 +8187,27 @@ module.exports = {
   SUBSCRIPTION_ACQUISITION_PRESETS,
   checkUpdateAsync,
   applyUpdateAsync,
+  LIVE_RUNTIME_FILES,
+  getLiveRuntimeDir,
+  syncLiveRuntimeBundle,
+  parseReleasesAtom,
+  parseLatestReleaseHtml,
+  parseExpandedAssetsHtml,
   requestGithubUrl,
   isAllowedDownloadRedirectUrl,
   isOfficialAssetDownloadUrl,
+  OFFICIAL_RELEASES_API,
+  OFFICIAL_RELEASES_ATOM,
+  OFFICIAL_RELEASES_LATEST,
+  OFFICIAL_RELEASES_WEB_BASE,
   resolveNodeRuntime,
   OFFICIAL_REPO,
+  openHttpConnectTunnel,
+  openSocks5Tunnel,
   getContextUnlockStatus,
   applyContextUnlock,
+  applyContextUnlockAsync,
   restoreContextUnlock,
+  restoreContextUnlockAsync,
   CONTEXT_UNLOCK_AUTHOR
 };

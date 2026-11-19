@@ -66,7 +66,7 @@ def _translate_shared_formula_fallback(original, origin_ref, target_ref):
     drow = tgt_row - orig_row
     if dcol == 0 and drow == 0:
         return original
-    # Match double-quoted string literals, single-quoted sheet names, or cell references
+    # 匹配双引号字符串、单引号工作表名或单元格引用（源自 PR #14 @nokiy）
     token_re = re.compile(
         r'"(?:""|[^"])*"'
         r"|'(?:''|[^'])*'!"

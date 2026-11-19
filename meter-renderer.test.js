@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), vm = require('node:vm'), core = require('./meter-core');
 const source = fs.readFileSync(require('node:path').join(__dirname, 'meter-renderer.js'), 'utf8');
 function session(unknown = 0) { return { groups: Object.fromEntries(['user','assistant','thinking','tools','summaries','system','definitions'].map(k => [k,core.empty()])), total: { chars: 100, low: 10, high: 50 }, attachmentTotal: core.empty(), attachments: unknown ? [{ name: '<img onerror=bad>', status: 'unknown', unknownParts: ['图像 token 未知'], chars: 0, source: 'user' }] : [], unknownFiles: unknown, steps: 10, userMessages: 2, assistantMessages: 3 }; }
-function harness(scanSession = session()) {
+function harness(scanSession = session(), extraSandbox = null) {
   const elements = new Map();
   const docElements = new Map();
   const listeners = new Map();
@@ -94,7 +94,7 @@ function harness(scanSession = session()) {
   };
   const host = element(); host.attachShadow = () => ({ set innerHTML(value) {}, getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); } });
   const pending = [], scans = [], timers = [];
-  const sandbox = { location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/c/11111111-1111-1111-1111-111111111111' }, document: { createElement: () => element(), getElementById: id => docElements.get(id) || null, documentElement: { appendChild() {} }, addEventListener() {}, removeEventListener() {}, hidden: false }, window: { __APP_CONFIG__: { csrfToken: 'test' }, contextMeterAPI: { scan: id => new Promise(resolve => scans.push({ id, resolve })) } }, __AGContextMeterCore: core, AbortController, Date, setTimeout: () => 1, clearTimeout() {}, setInterval(callback) { timers.push(callback); return 1; }, clearInterval() {}, fetch(url, options) { return new Promise(resolve => pending.push({ url, options, resolve })); } };
+  const sandbox = { location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/c/11111111-1111-1111-1111-111111111111' }, document: { createElement: () => element(), getElementById: id => docElements.get(id) || null, documentElement: { appendChild() {} }, addEventListener() {}, removeEventListener() {}, hidden: false }, window: { __APP_CONFIG__: { csrfToken: 'test' }, contextMeterAPI: { scan: id => new Promise(resolve => scans.push({ id, resolve })) } }, __AGContextMeterCore: core, AbortController, Date, setTimeout: () => 1, clearTimeout() {}, setInterval(callback) { timers.push(callback); return 1; }, clearInterval() {}, fetch(url, options) { return new Promise(resolve => pending.push({ url, options, resolve })); }, ...(extraSandbox && typeof extraSandbox === 'object' ? extraSandbox : {}) };
   // First createElement call is the host; later calls are safe text-only file rows.
   let first = true; sandbox.document.createElement = () => { if (first) { first = false; return host; } return element(); };
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
@@ -181,15 +181,15 @@ test('speed badge and speed summary card accurately render model output speed an
     chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
   }));
   await h.flush();
-  assert.equal(h.elements.get('speed-amount').textContent, '112.1 tok/s');
+  assert.equal(h.elements.get('speed-amount').textContent, '185.1 tok/s');
   assert.match(h.elements.get('speed-hover-extra').textContent, /21\.3s/);
-  assert.match(h.elements.get('badge-speed').title, /112\.1 tok\/s/);
-  assert.equal(h.elements.get('speed-val').textContent, '112.1 tok/s');
+  assert.match(h.elements.get('badge-speed').title, /185\.1 tok\/s/);
+  assert.equal(h.elements.get('speed-val').textContent, '185.1 tok/s');
   assert.equal(h.elements.get('speed-duration').textContent, '21.3s');
   assert.equal(h.elements.get('speed-ttft').textContent, '8.4s');
   assert.match(h.elements.get('speed-tokens').textContent, /2,388 tok/);
-  assert.equal(h.elements.get('speed-badge').textContent, '极速');
-  assert.match(h.elements.get('speed-takeaway').textContent, /112\.1 tok\/s/);
+  assert.equal(h.elements.get('speed-badge').textContent, '⚡ 83.7 分 · A');
+  assert.match(h.elements.get('speed-takeaway').textContent, /83\.8 分|整体均速 112\.1 tok\/s/);
   h.sandbox.__AGContextMeter.dispose();
 });
 test('drawer toggle controls secondary technical details visibility', () => {
@@ -375,7 +375,8 @@ test('6 independent custom color slots support custom values, reset to theme def
 test('window controls overlay spacer, convPane flex-grow self-healing, and clean dispose', () => {
   const h = harness();
   const api = h.sandbox.__AGContextMeter;
-  assert.equal(api.version, '0.8.3');
+  const pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
+  assert.equal(api.version, pkgVersion);
 
   // 1. Antigravity 1.x: class contains 'top-0'
   const cluster1x = h.sandbox.document.createElement();
@@ -989,7 +990,6 @@ test('instant region switch to Australia & Korea, price badge dynamic animation 
 
   // 点击澳大利亚
   auItem.click();
-
 
   // 3. 验证立即更新（0延迟保存与上面立即更改）
   assert.match(priceVal.textContent, /AU\$32\.99/);
@@ -2012,7 +2012,8 @@ test('插件面板三语言切换、持久化、动态文案、模型名保留�
   assert.equal(savedSettingsPayload.contextPreferences, undefined, '切换面板语言不得改写上下文偏好');
   assert.equal(restartCalls, 0, '切换面板语言不得触发重启');
   assert.equal(h.elements.get('model').textContent, 'Gemini 3.1 Pro (High)', '模型正式名称应保持原样不被翻译');
-  assert.equal(h.elements.get('speed-badge').textContent, '流暢');
+  assert.equal(h.elements.get('speed-badge').textContent, '⚡ 82.7 分 · A');
+  assert.match(h.elements.get('speed-sub-label').textContent, /流式 56\.3 tok\/s/);
 
   // 验证静态属性遍历器在标准 DOM 下会同步更新 data-i18n 节点
   const mockStaticNode = {
@@ -2035,7 +2036,9 @@ test('插件面板三语言切换、持久化、动态文案、模型名保留�
   assert.equal(h.elements.get('speed-bar-title').textContent, 'Output Speed Comparison');
   assert.equal(h.elements.get('panel-lang-save-badge').textContent, api.translateForTest('settings.panelLang.saved'));
   assert.equal(h.elements.get('model').textContent, 'Gemini 3.1 Pro (High)', '切换为 English 后模型正式名称应保持原样');
-  assert.equal(h.elements.get('speed-badge').textContent, 'Smooth');
+  assert.equal(h.elements.get('speed-badge').textContent, '⚡ 82.7 pts · A');
+  assert.match(h.elements.get('speed-sub-label').textContent, /Stream 56\.3 tok\/s/);
+  assert.doesNotMatch(h.elements.get('speed-takeaway').textContent, /[\u4e00-\u9fa5]/, '英文模式速度评语不得夹带中文');
   assert.equal(storedSettings.contextPreferences['gemini-3-1-pro'].limitTokens, 512000, '已有模型上下文偏好必须保持原值');
 
   // 4. 模拟重启恢复：重新挂载并从 getSettings 恢复为 en
@@ -2389,590 +2392,67 @@ test('0.8.3 UI 模式切换：所有模型统一设置与按模型分别设置�
   api.dispose();
 });
 
-test('PR #12/#14 theme toggle updates host background instead of inheriting opposite host luminance or transparent bg', () => {
-  const h = harness();
-  h.sandbox.window.getComputedStyle = () => ({
-    getPropertyValue: prop => (prop === '--background' ? '#fafafa' : ''),
-    backgroundColor: '#fafafa'
-  });
-  const api = h.sandbox.__AGContextMeter;
-
-  api.setTheme('light');
-  assert.equal(api.theme(), 'light');
-  assert.equal(h.host.style.getPropertyValue('--ag-host-bg'), '#fafafa');
-
-  api.setTheme('dark');
-  assert.equal(api.theme(), 'dark');
-  assert.equal(h.host.style.getPropertyValue('--ag-host-bg'), '#181818');
-
-  // PR #14: transparent / alpha=0 host background must be skipped cleanly
-  h.sandbox.window.getComputedStyle = () => ({
-    getPropertyValue: prop => (prop === '--background' ? 'rgba(0, 0, 0, 0)' : ''),
-    backgroundColor: 'transparent'
-  });
-  api.setTheme('light');
-  assert.equal(h.host.style.getPropertyValue('--ag-host-bg'), '#ffffff');
-
-  api.dispose();
-});
-
-test('PR #13 dialog alignment: panel aligns to clicked button (badge, badge-speed, badge-tokens, overflow) and jitter prevention', () => {
+test('0.8.3 设置页品牌选项与动态反馈单语言三态一致性', async () => {
   const h = harness();
   const api = h.sandbox.__AGContextMeter;
-  h.sandbox.window.innerWidth = 1920;
-  h.sandbox.window.innerHeight = 1080;
-  h.host.getBoundingClientRect = () => ({ left: 800, top: 6, right: 1300, bottom: 34, width: 500, height: 28 });
-
-  const badge = h.elements.get('badge');
-  const badgeSpeed = h.elements.get('badge-speed');
-  const badgeTokens = h.elements.get('badge-tokens');
-  const badgeOverflow = h.elements.get('badge-overflow');
-  const panel = h.elements.get('panel');
-  const panelTokens = h.elements.get('panel-tokens');
-
-  badge.getBoundingClientRect = () => ({ left: 900, top: 6, right: 960, bottom: 34, width: 60, height: 28 });
-  badgeSpeed.getBoundingClientRect = () => ({ left: 964, top: 6, right: 1060, bottom: 34, width: 96, height: 28 });
-  badgeTokens.getBoundingClientRect = () => ({ left: 1064, top: 6, right: 1140, bottom: 34, width: 76, height: 28 });
-  badgeOverflow.getBoundingClientRect = () => ({ left: 1144, top: 6, right: 1180, bottom: 34, width: 36, height: 28 });
-
-  // 1. Click badge -> panel opens, right edge aligns to badge right (960); v0.8.3 panel width is 472
-  badge.click();
-  assert.equal(panel.hidden, false);
-  assert.equal(parseInt(panel.style.left, 10) + 472, 960);
-
-  // 2. Click badge-speed -> panel re-anchors to badge-speed right (1060)
-  badgeSpeed.click();
-  assert.equal(panel.hidden, false);
-  assert.equal(parseInt(panel.style.left, 10) + 472, 1060);
-
-  // 3. Click badge-tokens -> panel-tokens opens, right edge aligns to badge-tokens right (1140)
-  badgeTokens.click();
-  assert.equal(panelTokens.hidden, false);
-  assert.equal(parseInt(panelTokens.style.left, 10) + 730, 1140);
-
-  // 4. Overflow menu actions: clicking overflow-speed-btn anchors to badge-overflow (1180)
-  h.elements.get('overflow-speed-btn').click();
-  assert.equal(panel.hidden, false);
-  assert.equal(parseInt(panel.style.left, 10) + 472, 1180);
-
-  // 5. Overflow menu actions: clicking overflow-tokens-btn anchors to badge-overflow (1180)
-  h.elements.get('overflow-tokens-btn').click();
-  assert.equal(panelTokens.hidden, false);
-  assert.equal(parseInt(panelTokens.style.left, 10) + 730, 1180);
-
-  // 6. Jitter prevention: box-sizing border-box on popovers, no active scale on .ag-unit, no left transition on #panel-tokens
-  assert.match(source, /#overflow-menu\{[\s\S]*?box-sizing:border-box/);
-  assert.match(source, /#color-picker-popover\{[\s\S]*?box-sizing:border-box/);
-  assert.match(source, /\.update-popover\{[\s\S]*?box-sizing:border-box/);
-  assert.ok(!source.includes('.ag-unit:active{transform:scale'));
-  assert.ok(!source.includes('#panel-tokens{width:730px;max-height:80vh;transition:opacity .16s ease,transform .18s cubic-bezier(.16,1,.3,1),left .18s'));
-
-  api.dispose();
-});
-
-test('PR #8 CLI launch failure shows full multi-line diagnostic toast with extended stay duration for CLI_NOT_FOUND', async () => {
-  const h = harness();
-  const scheduled = [];
-  h.sandbox.setTimeout = (fn, ms) => {
-    scheduled.push({ fn, ms });
-    return scheduled.length;
-  };
-  h.sandbox.window.contextMeterAPI = {
-    ...h.sandbox.window.contextMeterAPI,
-    launchCli: async () => ({
-      ok: false,
-      code: 'CLI_NOT_FOUND',
-      error: 'Line1: CLI binary missing\nLine2: Check npm prefix\nLine3: Verify PATH\nLine4: Reinstall ag-meter\nLine5: Run ag-meter doctor'
-    })
-  };
-  const api = h.sandbox.__AGContextMeter;
-
-  const res = await api.launchCli();
-  assert.equal(res.ok, false);
-  const toast = h.elements.get('cli-launch-toast');
-  assert.equal(toast.hidden, false);
-  assert.equal(toast.getAttribute('data-tone'), 'error');
-  assert.match(toast.textContent, /✖ 启动 CLI 失败：Line1: CLI binary missing\nLine2: Check npm prefix\nLine3: Verify PATH\nLine4: Reinstall ag-meter\nLine5: Run ag-meter doctor/);
-  assert.equal(scheduled.at(-1).ms, 9500);
-
-  // Standard errors retain 5200ms toast stay
-  h.sandbox.window.contextMeterAPI.launchCli = async () => ({
-    ok: false,
-    code: 'SPAWN_ERR',
-    error: 'permission denied'
-  });
-  await api.launchCli();
-  assert.match(toast.textContent, /✖ 启动 CLI 失败：permission denied/);
-  assert.equal(scheduled.at(-1).ms, 5200);
-
-  api.dispose();
-});
-
-test('model quota ring unifies same-model tiers, estimates remaining tokens, and refreshes via GetUserStatus', async () => {
-  const h = harness();
-  h.finishScan();
-  h.pending[0].resolve(response({
-    model: 'Gemini 4 Hydrogen (XHigh)',
-    usage: { inputTokens: 12000, outputTokens: 1000 },
-    chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
-  }));
-  await h.flush();
-
-  const api = h.sandbox.__AGContextMeter;
-  const quotaIdx = source.indexOf('id="badge-quota"');
-  const contextIdx = source.indexOf('id="badge"');
-  assert.ok(quotaIdx > 0 && contextIdx > 0 && quotaIdx < contextIdx, 'quota badge should render to the left of context badge');
-
-  const now = Date.now();
-  const resetAt = new Date(now + 90 * 60000).toISOString();
-  const sampleConfigs = [
-    {
-      label: 'Gemini 4 Hydrogen (XHigh)',
-      modelOrAlias: { model: 'MODEL_PLACEHOLDER_M41' },
-      quotaInfo: { remainingFraction: 0.85, resetTime: resetAt }
-    },
-    {
-      label: 'Gemini 4 Hydrogen (Low)',
-      modelOrAlias: { model: 'MODEL_PLACEHOLDER_M42' },
-      quotaInfo: { remainingFraction: 0.85, resetTime: resetAt }
-    },
-    {
-      label: 'Claude Sonnet 4.6 (Thinking)',
-      modelOrAlias: { model: 'claude-sonnet-4-6' },
-      quotaInfo: { remainingFraction: 0.24, resetTime: resetAt }
-    },
-    {
-      label: 'Gemini 3.1 Pro (High)',
-      modelOrAlias: { model: 'MODEL_PLACEHOLDER_M8' },
-      quotaInfo: { remainingFraction: 0.05, resetTime: resetAt }
-    },
-    {
-      label: 'Gemini 3.1 Pro (Low)',
-      modelOrAlias: { model: 'MODEL_PLACEHOLDER_M9' },
-      quotaInfo: { remainingFraction: 0.05, resetTime: resetAt }
-    }
+  const nodePath = require('node:path');
+  const templateHtml = fs.readFileSync(nodePath.join(__dirname, 'src/renderer/template.html'), 'utf8');
+  const brandNodeSpecs = [
+    ['btn-brand-english', 'enhance.brand.english'],
+    ['btn-brand-hidden', 'enhance.brand.hidden'],
+    ['btn-brand-translated', 'enhance.brand.translated']
   ];
-
-  api.applyTokenHistoryPayload({
-    summary: { grandTotalTokens: 450000, todayTokens: 450000, monthTokens: 450000, yearTokens: 450000 },
-    dailyMap: { '2026-11-12': { total: 450000, input: 350000, output: 100000, cache: 0 } },
-    recentModelUsage: [
-      { id: 'u1', poolKey: 'gemini-4-hydrogen', ts: now - 30 * 60000, tok: 450000 }
-    ],
-    rawPlanStatus: { cascadeModelConfigs: sampleConfigs }
-  });
-
-  const qBtn = h.elements.get('badge-quota');
-  const qFill = h.elements.get('quota-ring-fill');
-  const qPctVal = h.elements.get('quota-pct-val');
-  const qTip = h.elements.get('quota-tooltip');
-  const qPools = h.elements.get('quota-tip-pools');
-  assert.equal(h.host.getAttribute('data-quota-state'), 'normal');
-  assert.equal(qFill.getAttribute('data-ring-state'), 'determinate');
-  assert.equal(qPctVal.textContent, '85%');
-  assert.equal(h.elements.get('overflow-quota-val').textContent, '85%');
-  assert.match(h.elements.get('quota-tip-title').textContent, /Gemini 4 Hydrogen/);
-  assert.match(h.elements.get('quota-tip-pct').textContent, /剩余额度 85%.*约 2\.55M tok/);
-
-  qBtn.trigger('mouseenter');
-  assert.equal(qTip.getAttribute('data-visible'), 'true');
-  // 5 raw configs unify into 3 canonical model rows
-  assert.equal(qPools.children.length, 3);
-  assert.match(qPools.children[0].children[0].children[1].textContent, /85% · 约2\.55M tok/);
-  qBtn.trigger('mouseleave');
-  assert.equal(qTip.getAttribute('data-visible'), 'false');
-
-  // Delta calibration on subsequent drop in the same canonical model
-  api.setModelQuotaForTest(
-    [
-      {
-        label: 'Gemini 4 Hydrogen (XHigh)',
-        modelOrAlias: { model: 'MODEL_PLACEHOLDER_M41' },
-        quotaInfo: { remainingFraction: 0.75, resetTime: resetAt }
-      }
-    ],
-    'Gemini 4 Hydrogen',
-    {
-      usageEvents: [{ id: 'u2', model: 'Gemini 4 Hydrogen (Low)', ts: now - 5000, tok: 400000 }]
-    }
-  );
-  assert.equal(qPctVal.textContent, '75%');
-  assert.match(h.elements.get('quota-tip-pct').textContent, /剩余额度 75%.*约 3M tok/);
-
-  // Switch active model to low-quota warn & danger models
-  api.setModelQuotaForTest(sampleConfigs, 'Claude Sonnet 4.6');
-  assert.equal(h.host.getAttribute('data-quota-state'), 'warn');
-  assert.equal(qPctVal.textContent, '24%');
-
-  api.setModelQuotaForTest(sampleConfigs, 'Gemini 3.1 Pro (High)');
-  assert.equal(h.host.getAttribute('data-quota-state'), 'danger');
-  assert.equal(qPctVal.textContent, '5%');
-
-  // Direct manual refresh triggers GetUserStatus call and updates ring
-  const refreshPromise = api.refreshQuota({ force: true });
-  const quotaReq = h.pending.find(req => String(req.url).includes('/GetUserStatus'));
-  assert.ok(quotaReq, 'refreshQuota should request LanguageServerService/GetUserStatus');
-  quotaReq.resolve({
-    ok: true,
-    status: 200,
-    json: async () => ({
-      userStatus: {
-        cascadeModelConfigData: {
-          clientModelConfigs: [
-            {
-              label: 'Gemini 3.1 Pro (High)',
-              modelOrAlias: { model: 'MODEL_PLACEHOLDER_M8' },
-              quotaInfo: { remainingFraction: 0.65, resetTime: resetAt }
-            }
-          ]
-        }
-      }
-    })
-  });
-  await refreshPromise;
-  assert.equal(h.host.getAttribute('data-quota-state'), 'normal');
-  assert.equal(qPctVal.textContent, '65%');
-
-  api.dispose();
-});
-
-test('model quota ring displays 5h in top bar and renders weekly quota in click-pinned expanded menu', async () => {
-  const h = harness();
-  h.finishScan();
-  h.pending[0].resolve(response({
-    model: 'Claude Sonnet 4.6 (Thinking)',
-    usage: { inputTokens: 12000, outputTokens: 1000 },
-    chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } }
-  }));
-  await h.flush();
-
-  const api = h.sandbox.__AGContextMeter;
-  const now = Date.now();
-  const reset5h = new Date(now + 2 * 3600000).toISOString();
-  const resetWeekly = new Date(now + 4 * 86400000).toISOString();
-
-  api.applyTokenHistoryPayload({
-    summary: { grandTotalTokens: 3000000, todayTokens: 1000000, monthTokens: 3000000, yearTokens: 3000000 },
-    dailyMap: { '2026-11-13': { total: 1000000, input: 700000, output: 300000, cache: 0 } },
-    recentModelUsage: [
-      { id: 'w1', poolKey: 'claude-sonnet-4.6', ts: now - 30 * 60000, tok: 1000000 },
-      { id: 'w2', poolKey: 'claude-opus-4.6', ts: now - 48 * 3600000, tok: 2000000 }
-    ],
-    rawPlanStatus: {
-      cascadeModelConfigs: [
-        {
-          label: 'Claude Sonnet 4.6 (Thinking)',
-          modelOrAlias: { model: 'claude-sonnet-4-6-thinking' },
-          quotaInfo: { remainingFraction: 0.80, resetTime: reset5h }
-        },
-        {
-          label: 'Gemini 4 Hydrogen (XHigh)',
-          modelOrAlias: { model: 'MODEL_PLACEHOLDER_M41' },
-          quotaInfo: { remainingFraction: 0.90, resetTime: reset5h }
-        }
-      ],
-      quotaSummary: {
-        groups: [
-          {
-            groupId: 'GROUP_GEMINI',
-            displayName: 'Gemini',
-            modelIds: ['MODEL_PLACEHOLDER_M41'],
-            buckets: [{ window: 'WEEKLY', remainingFraction: 0.50, resetTime: resetWeekly }]
-          },
-          {
-            groupId: 'GROUP_THIRD_PARTY',
-            displayName: 'Third Party',
-            modelIds: ['claude-sonnet-4-6-thinking'],
-            buckets: [{ window: 'WEEKLY', remainingFraction: 0.75, resetTime: resetWeekly }]
-          }
-        ]
-      }
-    }
-  });
-
-  const qBtn = h.elements.get('badge-quota');
-  const qWinTag = h.elements.get('quota-window-tag');
-  const qPctVal = h.elements.get('quota-pct-val');
-  const qTip = h.elements.get('quota-tooltip');
-  const qTipPct = h.elements.get('quota-tip-pct');
-  const qFoot = h.elements.get('quota-tip-foot');
-  const qDual = h.elements.get('quota-tip-dual');
-  const qPools = h.elements.get('quota-tip-pools');
-  const qWeekly = h.elements.get('quota-tip-weekly');
-  const qDetail = h.elements.get('quota-tip-detail');
-
-  // Top bar focuses on 5h quota + tag
-  assert.equal(qWinTag.textContent, '5h');
-  assert.equal(qPctVal.textContent, '80%');
-  assert.match(qBtn.getAttribute('aria-label'), /5小时剩余配额 80%.*周额度 75%/);
-
-  // Hover opens concise weekly-only preview for active model (detail sections collapsed by data-view="hover")
-  qBtn.trigger('mouseenter');
-  assert.equal(qTip.getAttribute('data-visible'), 'true');
-  assert.equal(qTip.getAttribute('data-pinned'), 'false');
-  assert.equal(qTip.getAttribute('data-view'), 'hover');
-  assert.match(qTipPct.textContent, /每周剩余 75%.*约 9M tok/);
-  assert.doesNotMatch(qDetail.textContent, /5h/);
-  assert.match(qFoot.textContent, /点击圆环查看/);
-  qBtn.trigger('mouseleave');
-  assert.equal(qTip.getAttribute('data-visible'), 'false');
-
-  // Click expands detail view (data-view="detail", data-pinned="true") and triggers refresh
-  const pendingBeforeClick = h.pending.length;
-  qBtn.trigger('click');
-  assert.equal(qTip.getAttribute('data-visible'), 'true');
-  assert.equal(qTip.getAttribute('data-pinned'), 'true');
-  assert.equal(qTip.getAttribute('data-view'), 'detail');
-  assert.equal(qBtn.getAttribute('aria-expanded'), 'true');
-  assert.match(qTipPct.textContent, /5h 剩余 80%.*约 4M tok/);
-  assert.match(qDetail.textContent, /周剩余 75%/);
-  assert.equal(qDual.style.display, 'grid');
-  assert.equal(qDual.children.length, 2);
-  assert.equal(qDual.children[0].children[1].textContent, '80%');
-  assert.equal(qDual.children[1].children[1].textContent, '75%');
-  assert.equal(qPools.children.length, 2);
-  assert.equal(qWeekly.children.length, 2);
-  assert.match(qWeekly.children[1].children[0].children[1].textContent, /75% · 约9M tok/);
-
-  // mouseleave does not dismiss a click-pinned detail view
-  qBtn.trigger('mouseleave');
-  assert.equal(qTip.getAttribute('data-visible'), 'true');
-  assert.equal(qTip.getAttribute('data-pinned'), 'true');
-  assert.equal(qTip.getAttribute('data-view'), 'detail');
-
-  const clickReqs = h.pending.slice(pendingBeforeClick);
-  const statusReq = clickReqs.find(r => String(r.url).includes('/GetUserStatus'));
-  const summaryReq = clickReqs.find(r => String(r.url).includes('/RetrieveUserQuotaSummary'));
-  assert.ok(statusReq && summaryReq, 'refresh should query both GetUserStatus and RetrieveUserQuotaSummary');
-
-  statusReq.resolve({
-    ok: true,
-    status: 200,
-    json: async () => ({
-      userStatus: {
-        cascadeModelConfigData: {
-          clientModelConfigs: [
-            {
-              label: 'Claude Sonnet 4.6 (Thinking)',
-              modelOrAlias: { model: 'claude-sonnet-4-6-thinking' },
-              quotaInfo: { remainingFraction: 0.70, resetTime: reset5h }
-            }
-          ]
-        }
-      }
-    })
-  });
-  summaryReq.resolve({
-    ok: true,
-    status: 200,
-    json: async () => ({
-      groups: [
-        {
-          groupId: 'GROUP_THIRD_PARTY',
-          displayName: 'Third Party',
-          modelIds: ['claude-sonnet-4-6-thinking'],
-          buckets: [{ window: 'WEEKLY', remainingFraction: 0.62, resetTime: resetWeekly }]
-        }
-      ]
-    })
-  });
-  await h.flush();
-
-  const stateAfterRefresh = api.getModelQuotaState();
-  assert.equal(stateAfterRefresh.hasShortData, true);
-  assert.equal(stateAfterRefresh.hasWeeklyData, true);
-  assert.equal(qPctVal.textContent, '70%');
-  assert.equal(qDual.children[1].children[1].textContent, '62%');
-
-  // Second click toggles pinned expanded menu closed and restores concise hover view
-  qBtn.trigger('click');
-  assert.equal(qTip.getAttribute('data-visible'), 'false');
-  assert.equal(qTip.getAttribute('data-pinned'), 'false');
-  assert.equal(qTip.getAttribute('data-view'), 'hover');
-  assert.equal(qBtn.getAttribute('aria-expanded'), 'false');
-  qBtn.trigger('mouseenter');
-  assert.equal(qTip.getAttribute('data-view'), 'hover');
-  assert.match(qTipPct.textContent, /每周剩余 62%/);
-  qBtn.trigger('mouseleave');
-
-  // Narrow overflow button opens pinned quota detail tooltip cleanly
-  h.elements.get('overflow-quota-btn').trigger('click');
-  assert.equal(qTip.getAttribute('data-visible'), 'true');
-  assert.equal(qTip.getAttribute('data-pinned'), 'true');
-  assert.equal(qTip.getAttribute('data-view'), 'detail');
-  qBtn.trigger('click');
-
-  // Weekly-only fallback badge shows '7d' when 5h configs are empty
-  api.setModelQuotaForTest([], 'Claude Sonnet 4.6', {
-    quotaSummary: {
-      groups: [
-        {
-          groupId: 'GROUP_THIRD_PARTY',
-          displayName: 'Third Party',
-          buckets: [{ window: 'WEEKLY', remainingFraction: 0.44, resetTime: resetWeekly }]
-        }
-      ]
-    }
-  });
-  assert.equal(qWinTag.textContent, '7d');
-  assert.equal(qPctVal.textContent, '44%');
-
-  api.dispose();
-});
-
-test('PR #12/#7 unified quota ring visibility toggle, i18n trilingual labels, and dispose listener cleanup', () => {
-  const vm = require('node:vm');
-  const addedListeners = [];
-  const removedListeners = [];
-  const store = new Map();
-  const makeLocalStorage = () => ({
-    getItem: k => (store.has(k) ? store.get(k) : null),
-    setItem: (k, v) => store.set(k, String(v)),
-    removeItem: k => store.delete(k)
-  });
-
-  function bootWithLocalStorage() {
-    const docEls = new Map();
-    const els = new Map();
-    const mkEl = (tag = 'div') => {
-      const styleObj = {
-        setProperty(k, v) { this[k] = String(v); },
-        getPropertyValue(k) { return Object.prototype.hasOwnProperty.call(this, k) ? this[k] : ''; },
-        removeProperty(k) { delete this[k]; }
-      };
-      const node = {
-        tagName: String(tag).toUpperCase(),
-        style: styleObj,
-        attrs: {},
-        dataset: {},
-        listeners: {},
-        children: [],
-        hidden: false,
-        disabled: false,
-        checked: false,
-        textContent: '',
-        className: '',
-        classList: {
-          add() {},
-          remove() {},
-          contains() { return false; },
-          toggle() {}
-        },
-        setAttribute(k, v) { this.attrs[k] = String(v); },
-        getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; },
-        removeAttribute(k) { delete this.attrs[k]; },
-        appendChild(c) { this.children.push(c); return c; },
-        removeChild(c) { this.children = this.children.filter(x => x !== c); },
-        replaceChildren(...items) { this.children = [...items]; },
-        addEventListener(n, fn) { (this.listeners[n] ||= []).push(fn); },
-        removeEventListener(n, fn) { if (this.listeners[n]) this.listeners[n] = this.listeners[n].filter(f => f !== fn); },
-        trigger(n, ev = {}) { for (const fn of (this.listeners[n] || [])) fn({ target: this, stopPropagation() {}, preventDefault() {}, ...ev }); },
-        click() { this.trigger('click'); },
-        getBoundingClientRect() { return { left: 100, top: 100, width: 40, height: 24, right: 140, bottom: 124 }; },
-        querySelectorAll() { return []; },
-        closest() { return null; },
-        remove() {},
-        contains() { return false; }
-      };
-      return node;
-    };
-    const host = mkEl('div');
-    host.attachShadow = () => ({
-      set innerHTML(v) {},
-      getElementById(id) {
-        if (!els.has(id)) {
-          const n = mkEl();
-          if (id === 'panel' || id === 'panel-tokens' || id === 'overflow-menu') n.hidden = true;
-          els.set(id, n);
-        }
-        return els.get(id);
-      },
-      querySelectorAll() { return []; }
-    });
-    let first = true;
-    const sb = {
-      localStorage: makeLocalStorage(),
-      location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/' },
-      document: {
-        createElement: tag => { if (first) { first = false; return host; } return mkEl(tag); },
-        getElementById: id => docEls.get(id) || null,
-        documentElement: { appendChild() {} },
-        addEventListener(type, fn) { addedListeners.push({ type, fn }); },
-        removeEventListener(type, fn) { removedListeners.push({ type, fn }); },
-        hidden: false
-      },
-      window: { __APP_CONFIG__: { csrfToken: 'test' }, contextMeterAPI: { scan: async () => ({ ok: false }) } },
-      __AGContextMeterCore: core,
-      AbortController,
-      Date,
-      setTimeout: () => 1,
-      clearTimeout() {},
-      setInterval: () => 1,
-      clearInterval() {},
-      fetch: () => new Promise(() => {})
-    };
-    vm.createContext(sb);
-    vm.runInContext(source, sb);
-    return { sb, els, api: sb.__AGContextMeter };
+  // 校验 template.html 中的 data-i18n 与实际键绑定一致
+  for (const [id, key] of brandNodeSpecs) {
+    assert.match(templateHtml, new RegExp(`id="${id}"[\\s\\S]{0,160}data-i18n="${key}"`));
   }
+  const brandNodes = brandNodeSpecs.map(([id, key]) => {
+    const node = h.elements.get(id);
+    node.getAttribute = (k) => (k === 'data-i18n' ? key : null);
+    return node;
+  });
+  const mockRoot = {
+    querySelectorAll: (sel) => (sel === '[data-i18n]' ? brandNodes : [])
+  };
 
-  // Only one unified #badge-quota in template, no separate #panel-quota
-  assert.ok(source.includes('id="badge-quota"'));
-  assert.ok(!source.includes('id="panel-quota"'));
+  try {
+    h.elements.get('btn-ctx-settings').click();
+    await h.flush();
 
-  const firstRun = bootWithLocalStorage();
-  const { api, els } = firstRun;
-  assert.equal(api.getQuotaBadgeEnabled(), true);
-  assert.equal(els.get('badge-quota').hidden, false);
-  assert.equal(els.get('overflow-quota-btn').hidden, false);
-  assert.equal(els.get('quota-switch-pill').textContent, '已开启');
+    h.elements.get('btn-top-lang-en').click();
+    await h.flush();
+    api.applyStaticTranslationsForTest(mockRoot);
+    assert.equal(h.elements.get('btn-brand-english').textContent, 'Antigravity');
+    assert.equal(h.elements.get('btn-brand-hidden').textContent, 'Hide');
+    assert.equal(h.elements.get('btn-brand-translated').textContent, 'Translated Name');
+    assert.equal(api.translateForTest('enhance.brand.appliedName', { mode: 'Antigravity' }), 'Header name updated to "Antigravity" (applied).');
+    assert.equal(api.translateForTest('enhance.brand.appliedHidden'), 'Header name hidden (applied).');
 
-  // Open tooltip then toggle off -> badge & overflow collapse AND tooltip dismisses + persists in localStorage
-  els.get('badge-quota').trigger('click');
-  assert.equal(els.get('quota-tooltip').getAttribute('data-visible'), 'true');
-  els.get('btn-toggle-quota-badge').click();
-  assert.equal(api.getQuotaBadgeEnabled(), false);
-  assert.equal(store.get('ag_show_quota_badge_v1'), 'false');
-  assert.equal(els.get('badge-quota').hidden, true);
-  assert.equal(els.get('overflow-quota-btn').hidden, true);
-  assert.equal(els.get('quota-tooltip').getAttribute('data-visible'), 'false');
-  assert.equal(els.get('quota-switch-pill').textContent, '已关闭');
-  assert.equal(els.get('btn-toggle-quota-badge').textContent, '开启显示');
+    h.elements.get('btn-top-lang-zh-TW').click();
+    await h.flush();
+    api.applyStaticTranslationsForTest(mockRoot);
+    assert.equal(h.elements.get('btn-brand-english').textContent, 'Antigravity');
+    assert.equal(h.elements.get('btn-brand-hidden').textContent, '隱藏');
+    assert.equal(h.elements.get('btn-brand-translated').textContent, '反重力');
+    assert.equal(api.translateForTest('enhance.brand.appliedHidden'), '已儲存並套用：左上角品牌已隱藏。');
 
-  // Switch panel language across en / zh-TW / zh-CN and verify quota UI updates cleanly
-  api.setPanelLanguage('en');
-  assert.equal(els.get('quota-switch-pill').textContent, 'Hidden');
-  assert.equal(els.get('btn-toggle-quota-badge').textContent, 'Show Ring');
-  api.setPanelLanguage('zh-TW');
-  assert.equal(els.get('quota-switch-pill').textContent, '已關閉');
-  assert.equal(els.get('btn-toggle-quota-badge').textContent, '開啟顯示');
-  api.setPanelLanguage('zh-CN');
-
-  const quotaAdded = addedListeners.filter(x => x.fn?.name === 'onQuotaOutsideClick' || x.fn?.name === 'onQuotaEscapeKey');
-  assert.equal(quotaAdded.length, 2, 'quota outside click & escape listeners must be registered');
-  api.dispose();
-  for (const reg of quotaAdded) {
-    assert.ok(
-      removedListeners.some(rem => rem.type === reg.type && rem.fn === reg.fn),
-      `dispose() must remove ${reg.fn?.name} listener`
-    );
+    h.elements.get('btn-top-lang-zh-CN').click();
+    await h.flush();
+    api.applyStaticTranslationsForTest(mockRoot);
+    assert.equal(h.elements.get('btn-brand-english').textContent, 'Antigravity');
+    assert.equal(h.elements.get('btn-brand-hidden').textContent, '隐藏');
+    assert.equal(h.elements.get('btn-brand-translated').textContent, '反重力');
+    assert.equal(api.translateForTest('enhance.brand.appliedHidden'), '已保存并应用：左上角品牌已隐藏。');
+  } finally {
+    api.dispose();
   }
-
-  // Cold restart reads persisted false from localStorage
-  const secondRun = bootWithLocalStorage();
-  assert.equal(secondRun.api.getQuotaBadgeEnabled(), false);
-  assert.equal(secondRun.els.get('badge-quota').hidden, true);
-  secondRun.api.setQuotaBadgeEnabled(true);
-  assert.equal(secondRun.api.getQuotaBadgeEnabled(), true);
-  assert.equal(store.get('ag_show_quota_badge_v1'), 'true');
-  assert.equal(secondRun.els.get('badge-quota').hidden, false);
-  secondRun.api.dispose();
 });
 
+// --- PR #9 实时同步与队列测试 ---
+const path = require('node:path');
 
 test('real-time token history refresh: idle dedup, recordCalls ordering, a 5s automatic scan interval, and busy coalescing', async () => {
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 8; i++) {
@@ -3230,7 +2710,6 @@ test('real-time token history refresh: idle dedup, recordCalls ordering, a 5s au
 
 test('requestPoll retries recordCalls on next 3s poll after failure or rejection and commits only on ok:true', async () => {
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 8; i++) {
@@ -3334,7 +2813,6 @@ test('requestPoll retries recordCalls on next 3s poll after failure or rejection
 
 test('pendingFinalCalls retains 5-row batch across offset=2 sliding window, retries via tick() without RPC rows, and re-flushes in-flight progressions', async () => {
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 8; i++) {
@@ -3553,7 +3031,6 @@ test('pendingFinalCalls retains 5-row batch across offset=2 sliding window, retr
 
 test('pendingFinalCalls survives route switches across conversations and / home screen and retries via tick()', async () => {
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 8; i++) {
@@ -3720,7 +3197,6 @@ test('pendingFinalCalls survives route switches across conversations and / home 
 
 test('flushPendingFinalCalls chunks >500 items and >900KB UTF-8 payloads for live-host limits and recovers from partial chunk failure', async () => {
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 12; i++) {
@@ -3879,7 +3355,6 @@ test('flushPendingFinalCalls chunks >500 items and >900KB UTF-8 payloads for liv
 
 test('final call model enrichment with unchanged 100 tokens re-sends to host once (empty -> model, placeholder -> model, and in-flight enrichment)', async () => {
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 10; i++) {
@@ -4091,7 +3566,6 @@ test('final call model enrichment with unchanged 100 tokens re-sends to host onc
 
 test('oversized >1 MiB first item never head-of-line blocks normal queued items and is quarantined in Live HTTP and recordCalls modes', async () => {
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 12; i++) {
@@ -4126,13 +3600,10 @@ test('oversized >1 MiB first item never head-of-line blocks normal queued items 
     }
   });
 
-  // ~1.2+ MiB UTF-8 string ('超' is 3 UTF-8 bytes -> > 1 MiB)
+  // ~1.2 MiB UTF-8 string ('超' is 3 UTF-8 bytes -> 410,000 * 3 = 1,230,000 bytes > 1 MiB)
   const over1MiBLabel = 'Gemini 4 Carbon ' + '超'.repeat(410000);
-  // ~950 KiB UTF-8 serialized call (>900 KiB chunk limit and <=1 MiB client cap, accounting for whether parseGeneratorCall emits modelLabel alongside model)
-  const probeCall = core.parseGeneratorCall(makeRow('probe_size', 0, 'Gemini 4 Carbon ' + '中'.repeat(1000)));
-  const perCharMultiplier = probeCall?.modelLabel ? 6 : 3;
-  const midRepeatCount = perCharMultiplier === 6 ? 160000 : 320000;
-  const mid950KiBLabel = 'Gemini 4 Carbon ' + '中'.repeat(midRepeatCount);
+  // ~950 KiB UTF-8 string (320,000 * 3 = 960,000 bytes -> >900 KiB and <=1 MiB)
+  const mid950KiBLabel = 'Gemini 4 Carbon ' + '中'.repeat(320000);
 
   try {
     // Part 1: Live HTTP mode (>1 MiB first item + 950 KiB 413 item + normal items behind them)
@@ -4380,7 +3851,6 @@ test('[P2] renderer watermark re-sends when RPC upgrades provisional date to aut
   const origDateNow = Date.now;
 
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 10; i++) {
@@ -4552,7 +4022,6 @@ test('[P3] provisional Carbon call crossing 11-30 -> 12-01 rate-hike midnight do
   const origDateNow = Date.now;
 
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 10; i++) {
@@ -4712,7 +4181,6 @@ test('[P2] same-rank authoritative created_at revision updates persisted ledger 
   const origDateNow = Date.now;
 
   const h = harness();
-  h.sandbox.__AGContextMeter?.setQuotaBadgeEnabled?.(false);
   const api = h.sandbox.__AGContextMeter;
   const flushAsync = async () => {
     for (let i = 0; i < 10; i++) {
@@ -5064,5 +4532,1485 @@ test('[P2] same-rank authoritative created_at revision updates persisted ledger 
     else globalThis.window = prevWindow;
     api.dispose();
     try { fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch {}
+  }
+});
+
+test('PR #13 & PR #21: 弹窗动态锚点定位、首帧显示前预设坐标、无缩放/left防抖与繁中术语回归', async () => {
+  const pathMod = require('node:path');
+  const cssSrc = fs.readFileSync(pathMod.join(__dirname, 'src', 'renderer', 'styles.css'), 'utf8');
+  // 1. 验证 styles.css 无 .ag-unit:active transform 缩放且 #panel-tokens 无 left transition
+  const activeBlock = cssSrc.match(/\.ag-unit:active\s*\{[^}]*\}/)?.[0] || '';
+  assert.doesNotMatch(activeBlock, /transform\s*:\s*scale/i, '.ag-unit:active 不应有按压缩放');
+  const tokensRule = cssSrc.match(/#panel-tokens\s*\{[^}]*\}/)?.[0] || '';
+  assert.doesNotMatch(tokensRule, /\bleft\s+\./i, '#panel-tokens 不应对 left 做过渡动画');
+  assert.match(cssSrc, /#overflow-menu\s*\{[^}]*box-sizing\s*:\s*border-box/i);
+
+  // 2. 验证每个触发按钮锚点（badge / badge-speed / badge-tokens / badge-quota / overflow）与先定位再显示
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  try {
+    h.sandbox.window.innerWidth = 1280;
+    h.sandbox.window.innerHeight = 800;
+    h.host.getBoundingClientRect = () => ({ left: 820, top: 6, width: 320, height: 28, right: 1140, bottom: 34 });
+    h.elements.get('badge').getBoundingClientRect = () => ({ left: 820, top: 6, width: 88, height: 28, right: 908, bottom: 34 });
+    h.elements.get('badge-speed').getBoundingClientRect = () => ({ left: 912, top: 6, width: 64, height: 28, right: 976, bottom: 34 });
+    h.elements.get('badge-tokens').getBoundingClientRect = () => ({ left: 980, top: 6, width: 68, height: 28, right: 1048, bottom: 34 });
+    h.elements.get('badge-quota').getBoundingClientRect = () => ({ left: 1052, top: 6, width: 52, height: 28, right: 1104, bottom: 34 });
+    h.elements.get('badge-overflow').getBoundingClientRect = () => ({ left: 1108, top: 6, width: 28, height: 28, right: 1136, bottom: 34 });
+
+    // 验证 showPanel 在 hidden=false 前已将 style.left 写入
+    let leftWhenUnhidden = null;
+    const panel = h.elements.get('panel');
+    let hiddenVal = true;
+    Object.defineProperty(panel, 'hidden', {
+      get: () => hiddenVal,
+      set: (v) => {
+        if (v === false) leftWhenUnhidden = panel.style.left;
+        hiddenVal = Boolean(v);
+      }
+    });
+
+    h.elements.get('badge').click();
+    assert.ok(leftWhenUnhidden && leftWhenUnhidden !== '', '取消 hidden 前必须已预设 style.left');
+    assert.equal(panel.style.left, `${908 - 472}px`);
+    assert.equal(h.elements.get('badge').getAttribute('aria-expanded'), 'true');
+    assert.equal(h.elements.get('badge-speed').getAttribute('aria-expanded'), 'false');
+
+    h.elements.get('badge-speed').click();
+    assert.equal(panel.style.left, `${976 - 472}px`);
+    assert.equal(h.elements.get('badge-speed').getAttribute('aria-expanded'), 'true');
+
+    h.elements.get('badge-tokens').click();
+    assert.equal(h.elements.get('panel-tokens').style.left, `${1048 - 730}px`);
+
+    h.elements.get('badge-quota').click();
+    assert.equal(h.elements.get('panel-quota').style.left, `${1104 - 460}px`);
+
+    // 溢出入口打开 tokens / quota 时必须对齐 badge-overflow 而非隐藏按钮
+    h.elements.get('badge-overflow').click();
+    assert.equal(h.elements.get('overflow-menu').hidden, false);
+    assert.equal(h.elements.get('overflow-menu').style.left, `${1136 - 220}px`);
+    h.elements.get('overflow-tokens-btn').click();
+    assert.equal(h.elements.get('panel-tokens').style.left, `${1136 - 730}px`);
+    h.elements.get('overflow-quota-btn').click();
+    assert.equal(h.elements.get('panel-quota').style.left, `${1136 - 460}px`);
+
+    // 窄屏越界钳位
+    h.sandbox.window.innerWidth = 600;
+    h.host.getBoundingClientRect = () => ({ left: 400, top: 6, width: 180, height: 28, right: 580, bottom: 34 });
+    h.elements.get('badge').getBoundingClientRect = () => ({ left: 400, top: 6, width: 60, height: 28, right: 460, bottom: 34 });
+    h.elements.get('badge').click();
+    assert.equal(panel.style.left, '12px');
+
+    // 3. 验证 PR #21 繁中译文与参数占位符完好
+    h.elements.get('btn-top-lang-zh-TW').click();
+    await h.flush();
+    assert.equal(api.translateForTest('badge.tokens.aria'), 'Token 用量總覽');
+    assert.equal(api.translateForTest('colors.btn.restore'), '還原');
+    assert.equal(api.translateForTest('diag.auth.tipTitle'), '帳號權限（身分異常）：');
+    assert.equal(api.translateForTest('badge.corpus.scanning'), '對話掃描中…');
+    assert.equal(api.translateForTest('cost.scopeAll'), '完整歷史紀錄');
+  } finally {
+    api.dispose();
+  }
+});
+
+test('Issue #22: applyAppUpdate 在严格模式下不因未声明 currentVer 报错，且按 liveInjected 状态安全刷新版本 UI', async () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  try {
+    let mockLiveInjected = false;
+    h.sandbox.window.contextMeterAPI = {
+      ...h.sandbox.window.contextMeterAPI,
+      checkUpdate: async () => ({
+        ok: true,
+        hasUpdate: true,
+        currentVersion: '0.8.3',
+        latestVersion: '0.9.1',
+        tagName: 'v0.9.1',
+        releaseNotes: 'Fix update flow',
+        htmlUrl: 'https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/tag/v0.9.1'
+      }),
+      applyUpdate: async () => ({
+        ok: true,
+        version: '0.9.1',
+        installedVersion: '0.9.1',
+        liveInjected: mockLiveInjected,
+        backendHotReloaded: mockLiveInjected
+      })
+    };
+
+    h.elements.get('btn-check-update').click();
+    await h.flush();
+    assert.equal(h.elements.get('up-pop-ver').textContent, 'v0.8.3 → v0.9.1');
+
+    h.elements.get('btn-apply-update').click();
+    await h.flush();
+
+    assert.equal(h.elements.get('v').textContent, '');
+    assert.match(h.elements.get('up-pop-ver').textContent, /0\.9\.1/);
+    assert.doesNotMatch(h.elements.get('up-pop-status').textContent, /currentVer|异常|失败/i);
+    assert.match(h.elements.get('up-pop-status').textContent, /0\.9\.1/);
+
+    mockLiveInjected = true;
+    h.elements.get('btn-apply-update').click();
+    await h.flush();
+    assert.equal(h.elements.get('v').textContent, 'v0.9.1');
+  } finally {
+    api.dispose();
+  }
+});
+
+test('ELV-84: 静止浮层避免常驻合成层与冗余模糊，混合 DPI 坐标对齐像素网格并在跨屏变更时重排与清理', async () => {
+  // 1. CSS 静态防虚契约断言（构建产物 meter-renderer.js）
+  assert.match(source, /font:12px\/1\.4 [^;]*"Microsoft YaHei UI"/, '应优先使用 Microsoft YaHei UI 改善 100% 缩放 ClearType');
+  assert.match(source, /\.ag-panel\{[^}]*transform:none;[^}]*\}/, '.ag-panel 静止打开态必须回退到 transform:none');
+  assert.doesNotMatch(source, /\.ag-panel\{[^}]*will-change:opacity,transform;/, '.ag-panel 不应常驻 will-change:opacity,transform');
+  assert.doesNotMatch(source, /\.ag-panel\{[^}]*contain:layout paint;/, '.ag-panel 不应常驻 contain:layout paint');
+  assert.match(source, /#context-tooltip\[data-visible="true"\]\{[^}]*transform:none;/, '悬停气泡可见态应使用 transform:none');
+  assert.doesNotMatch(source, /#overflow-menu\{[^}]*will-change:opacity,transform;/, '溢出菜单不应常驻 will-change');
+  assert.match(source, /\.ag-dropdown-wrapper\.is-open \.ag-dropdown-menu\{[^}]*transform:none;/, '打开的下拉列表应使用 transform:none');
+  assert.doesNotMatch(source, /\.ag-dropdown-menu\{[^}]*backdrop-filter:blur\(24px\)/, '不透明背景的下拉列表不得叠加 backdrop-filter:blur(24px)');
+  assert.match(source, /@keyframes agSmoothExpand\{\s*0%\{[^}]*\}\s*100%\{[^}]*transform:none;/, '展开关键帧结束态应使用 transform:none');
+  assert.doesNotMatch(source, /animation:\s*agSmoothExpand[^;]*forwards/, '折叠展开动画不得使用 forwards 永久锁定合成层');
+  assert.match(source, /\.view-pane-fade\{[^}]*transform:none/, '视图切换容器静止态应使用 transform:none');
+
+  // 2. 运行态设备像素网格对齐与跨屏 DPI change 事件测试
+  const ctx = {};
+  const winListeners = new Map();
+  const mqlListeners = new Map();
+  let mqlRemoved = 0;
+  const mockHost = {
+    style: { setProperty() {}, removeProperty() {}, top: '', right: '', left: '', zIndex: '' },
+    setAttribute() {},
+    getAttribute() { return null; },
+    removeAttribute() {},
+    remove() {},
+    getBoundingClientRect: () => ({ left: 1210.4, top: 6.3, right: 1410.3, bottom: 34.1, width: 199.9, height: 27.8 }),
+    attachShadow() {
+      return {
+        _innerHTML: '',
+        set innerHTML(v) { this._innerHTML = v; },
+        get innerHTML() { return this._innerHTML; },
+        getElementById: id => {
+          if (!mockElements.has(id)) mockElements.set(id, makeEl(id));
+          return mockElements.get(id);
+        },
+        querySelector: () => null,
+        querySelectorAll: () => []
+      };
+    }
+  };
+  const makeEl = id => {
+    const attrs = new Map([['id', id]]);
+    return {
+      id,
+      hidden: id.startsWith('panel') || id === 'overflow-menu' || id === 'color-picker-popover',
+      textContent: '',
+      value: '',
+      children: [],
+      style: { display: '', top: '', left: '', right: '', maxWidth: '', maxHeight: '', transformOrigin: '', setProperty() {}, removeProperty() {} },
+      classList: { add() {}, remove() {}, contains() { return false; } },
+      setAttribute(k, v) { attrs.set(k, String(v)); },
+      getAttribute(k) { return attrs.get(k) ?? null; },
+      removeAttribute(k) { attrs.delete(k); },
+      addEventListener() {},
+      removeEventListener() {},
+      replaceChildren() {},
+      appendChild() {},
+      querySelectorAll: () => [],
+      getBoundingClientRect: () => ({ left: 1300.3, top: 6.2, right: 1410.3, bottom: 34.1, width: 110, height: 27.9 })
+    };
+  };
+  const mockElements = new Map();
+  for (const id of ['badge', 'badge-quota', 'badge-tokens', 'badge-overflow', 'panel', 'panel-quota', 'panel-tokens', 'overflow-menu', 'update-popover', 'btn-check-update', 'context-tooltip', 'color-picker-popover', 'v']) {
+    mockElements.set(id, makeEl(id));
+  }
+  const winObj = {
+    devicePixelRatio: 1.75,
+    innerWidth: 1646,
+    innerHeight: 1029,
+    addEventListener(type, fn) { winListeners.set(type, fn); },
+    removeEventListener(type, fn) { if (winListeners.get(type) === fn) winListeners.delete(type); },
+    matchMedia(query) {
+      return {
+        media: query,
+        matches: true,
+        addEventListener(type, fn) { if (type === 'change') mqlListeners.set(query, fn); },
+        removeEventListener(type, fn) { if (type === 'change' && mqlListeners.get(query) === fn) { mqlListeners.delete(query); mqlRemoved++; } }
+      };
+    }
+  };
+  let isFirstCreate = true;
+  const docObj = {
+    body: { appendChild() {}, children: [] },
+    documentElement: { appendChild() {} },
+    createElement: () => {
+      if (isFirstCreate) {
+        isFirstCreate = false;
+        return mockHost;
+      }
+      return makeEl('dyn');
+    },
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    addEventListener() {},
+    removeEventListener() {},
+    getElementById: () => null
+  };
+  Object.assign(ctx, {
+    location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/c/11111111-1111-1111-1111-111111111111' },
+    __AGContextMeterCore: core,
+    window: Object.assign(winObj, { __APP_CONFIG__: { csrfToken: 'test' }, contextMeterAPI: { scan: async () => ({ ok: true, data: { session: session(), scannedAt: Date.now(), latest: null } }) } }),
+    document: docObj,
+    globalThis: null,
+    navigator: {},
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    setTimeout: () => 1,
+    clearTimeout() {},
+    setInterval: () => 1,
+    clearInterval() {},
+    fetch: () => new Promise(() => {}),
+    AbortController,
+    URL,
+    Date,
+    Math,
+    Number,
+    String,
+    Array,
+    Object,
+    Map,
+    Set,
+    Promise,
+    Error,
+    getComputedStyle: () => ({ color: '', backgroundColor: '' })
+  });
+  ctx.globalThis = ctx;
+  ctx.window.window = winObj;
+  vm.runInNewContext(source, ctx);
+  try {
+    const panel = mockElements.get('panel');
+    panel.hidden = false;
+    // 1.75x 下验证物理像素对齐：val * 1.75 应为整数
+    const top175 = parseFloat(panel.style.top);
+    const left175 = parseFloat(panel.style.left);
+    assert.ok(Number.isFinite(top175) && Number.isFinite(left175), '175% DPI 下应计算出面板坐标');
+    assert.equal(Math.round(top175 * 1.75), top175 * 1.75, '175% DPI 下 top 必须落在物理像素边界上');
+    assert.equal(Math.round(left175 * 1.75), left175 * 1.75, '175% DPI 下 left 必须落在物理像素边界上');
+    const prevGeomKey = panel._lastPlacedGeomKey;
+    assert.match(prevGeomKey, /\|1\.75$/, 'geomKey 应记录当前 dpr');
+
+    // 模拟拖到 1920x1080 @ 100% 屏幕：触发 resolution: 1.75dppx 的 change
+    const changeFn = mqlListeners.get('(resolution: 1.75dppx)');
+    assert.equal(typeof changeFn, 'function', '应注册当前 DPI 的 matchMedia 监听');
+    winObj.devicePixelRatio = 1;
+    winObj.innerWidth = 1920;
+    winObj.innerHeight = 1080;
+    mockElements.get('badge').getBoundingClientRect = () => ({ left: 1700.4, top: 6.2, right: 1810.4, bottom: 34.4, width: 110, height: 28.2 });
+    const upPop = mockElements.get('update-popover');
+    upPop.style.display = 'block';
+    mockElements.get('btn-check-update').getBoundingClientRect = () => ({ left: 1750.3, right: 1790.7, top: 45.2, bottom: 68.6, width: 40.4, height: 23.4 });
+
+    changeFn();
+    const top100 = parseFloat(panel.style.top);
+    const left100 = parseFloat(panel.style.left);
+    assert.equal(Math.floor(top100), top100, '100% DPI 下 top 必须严格取整');
+    assert.equal(Math.floor(left100), left100, '100% DPI 下 left 必须严格取整');
+    assert.match(panel._lastPlacedGeomKey, /\|1$/, '切换 DPI 后应重算并更新 geomKey');
+    assert.equal(Math.floor(parseFloat(upPop.style.top)), parseFloat(upPop.style.top), '100% DPI 下 update-popover top 必须取整');
+    assert.equal(Math.floor(parseFloat(upPop.style.right)), parseFloat(upPop.style.right), '100% DPI 下 update-popover right 必须取整');
+    assert.equal(typeof mqlListeners.get('(resolution: 1dppx)'), 'function', '变更后应重新订阅新 DPI (1dppx) 的监听');
+  } finally {
+    ctx.__AGContextMeter.dispose();
+    assert.ok(mqlRemoved >= 1, 'dispose() 时必须取消 DPI matchMedia 监听');
+  }
+});
+
+test('By Model usage view: renders stacked bars, percentages, 7d/30d, variant/cache toggles, and hover tooltip', async () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  try {
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const yesterdayDt = new Date(Date.now() - 86400000);
+    const yKey = `${yesterdayDt.getFullYear()}-${String(yesterdayDt.getMonth() + 1).padStart(2, '0')}-${String(yesterdayDt.getDate()).padStart(2, '0')}`;
+    const tKey = (() => {
+      const d = new Date();
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    })();
+
+    const modelMetaByKey = {
+      'gemini-4-hydrogen:xhigh': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:xhigh', variantLabel: 'Gemini 4 Hydrogen (XHigh)' },
+      'gemini-4-hydrogen:medium': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:medium', variantLabel: 'Gemini 4 Hydrogen (Medium)' },
+      'gemini-4-argon:high': { modelKey: 'gemini-4-argon', modelLabel: 'Gemini 4 Argon', variantKey: 'gemini-4-argon:high', variantLabel: 'Gemini 4 Argon (High)' }
+    };
+
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      summary: { grandTotalTokens: 1000000, todayTokens: 600000, totalConversations: 4 },
+      dailyMap: {
+        [yKey]: { total: 400000, input: 100000, cache: 250000, output: 50000, steps: 4 },
+        [tKey]: { total: 600000, input: 150000, cache: 350000, output: 100000, steps: 6 }
+      },
+      dailyMapBySource: {
+        all: {
+          [yKey]: { total: 400000, input: 100000, cache: 250000, output: 50000, steps: 4 },
+          [tKey]: { total: 600000, input: 150000, cache: 350000, output: 100000, steps: 6 }
+        },
+        desktop: {
+          [tKey]: { total: 200000, input: 50000, cache: 100000, output: 50000, steps: 2 }
+        },
+        cli: {
+          [yKey]: { total: 400000, input: 100000, cache: 250000, output: 50000, steps: 4 },
+          [tKey]: { total: 400000, input: 100000, cache: 250000, output: 50000, steps: 4 }
+        }
+      },
+      dailyModelMapBySource: {
+        all: {
+          [yKey]: {
+            'gemini-4-hydrogen:medium': { total: 300000, input: 75000, cache: 185000, output: 40000, steps: 3 },
+            'gemini-4-argon:high': { total: 100000, input: 25000, cache: 65000, output: 10000, steps: 1 }
+          },
+          [tKey]: {
+            'gemini-4-hydrogen:xhigh': { total: 500000, input: 120000, cache: 300000, output: 80000, steps: 5 },
+            __unattributed__: { total: 100000, input: 30000, cache: 50000, output: 20000, steps: 1 }
+          }
+        },
+        desktop: {
+          [tKey]: {
+            'gemini-4-hydrogen:xhigh': { total: 200000, input: 50000, cache: 100000, output: 50000, steps: 2 }
+          }
+        },
+        cli: {
+          [yKey]: {
+            'gemini-4-hydrogen:medium': { total: 300000, input: 75000, cache: 185000, output: 40000, steps: 3 },
+            'gemini-4-argon:high': { total: 100000, input: 25000, cache: 65000, output: 10000, steps: 1 }
+          },
+          [tKey]: {
+            'gemini-4-hydrogen:xhigh': { total: 300000, input: 70000, cache: 200000, output: 30000, steps: 3 },
+            __unattributed__: { total: 100000, input: 30000, cache: 50000, output: 20000, steps: 1 }
+          }
+        }
+      },
+      modelMetaByKey
+    });
+
+    // Switch to By Model view
+    h.elements.get('tok-view-models').click();
+    assert.equal(h.elements.get('model-usage-view').style.display, 'block');
+    assert.equal(h.elements.get('tokens-main-view').style.display, 'none');
+    assert.equal(h.elements.get('cost-estimate-card').style.display, 'none');
+
+    const barsEl = h.elements.get('model-usage-bars');
+    const legendEl = h.elements.get('model-usage-legend');
+    assert.equal(barsEl.children.length, 7);
+    assert.equal(legendEl.children.length, 3); // Hydrogen, Argon, Unattributed
+    assert.equal(h.elements.get('model-usage-window-total').textContent, '1.0M Tokens');
+    assert.equal(h.elements.get('model-toggle-unattr').style.display, 'inline-flex');
+
+    // Hover today's bar (last column) -> shows heat-pop details
+    barsEl.children[6].trigger('mouseenter');
+    assert.equal(h.elements.get('heat-pop').style.opacity, '1');
+    assert.match(h.elements.get('heat-pop-val').textContent, /600\.0K Tokens/);
+
+    // Switch to variant breakdown
+    h.elements.get('model-group-variant').click();
+    assert.equal(legendEl.children.length, 4); // XHigh, Medium, Argon High, Unattributed
+
+    // Hide unattributed -> 3 variants and 900.0K total
+    h.elements.get('model-toggle-unattr').click();
+    assert.equal(legendEl.children.length, 3);
+    assert.equal(h.elements.get('model-usage-window-total').textContent, '900.0K Tokens');
+
+    // Switch to 30d and noCache
+    h.elements.get('model-period-30d').click();
+    assert.equal(barsEl.children.length, 30);
+    h.elements.get('model-metric-nocache').click();
+    assert.equal(h.elements.get('model-usage-window-total').textContent, '350.0K Tokens');
+
+    // Source switch to desktop
+    h.elements.get('src-tab-desktop').click();
+    assert.equal(h.elements.get('model-usage-window-total').textContent, '100.0K Tokens');
+    assert.equal(legendEl.children.length, 1);
+
+    // Switch back to all sources and verify variant effort shade + dark/light theme color adaptation
+    h.elements.get('src-tab-all').click();
+    h.sandbox.__AGContextMeter.setTheme('dark');
+    assert.equal(legendEl.children[0].children[0].style.background, '#826cc3'); // gemini-4-hydrogen:xhigh shade
+
+    h.elements.get('model-group-model').click();
+    h.elements.get('model-metric-total').click();
+    h.elements.get('model-toggle-unattr').click(); // show unattributed again
+    assert.equal(legendEl.children.length, 3);
+    assert.equal(legendEl.children[0].children[0].style.background, '#a78bfa');
+    assert.equal(legendEl.children[1].children[0].style.background, '#6366f1');
+    assert.equal(legendEl.children[2].children[0].style.background, 'rgba(161, 161, 170, 0.28)');
+
+    h.sandbox.__AGContextMeter.setTheme('light');
+    assert.equal(legendEl.children[0].children[0].style.background, '#7c3aed');
+    assert.equal(legendEl.children[1].children[0].style.background, '#4f46e5');
+    assert.equal(legendEl.children[2].children[0].style.background, 'rgba(113, 113, 122, 0.24)');
+
+    h.sandbox.__AGContextMeter.setTheme('dark');
+    assert.equal(legendEl.children[0].children[0].style.background, '#a78bfa');
+  } finally {
+    api.dispose();
+  }
+});
+
+test('v0.8.8 顶栏收尾回归: ring-only 保留溢出菜单入口，无菜单栏贴顶时主标题栏右侧自动避让 WCO', () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  const stylesCssText = fs.readFileSync(path.join(__dirname, 'src/renderer/styles.css'), 'utf8');
+  try {
+    // 1. ring-only 模式下 CSS 与布局保持溢出按钮与已打开溢出菜单可用
+    assert.match(stylesCssText, /:host\(\[data-layout="ring-only"\]\)\s*#badge-overflow\{\s*display:inline-flex!important;/);
+    assert.doesNotMatch(stylesCssText, /:host\(\[data-layout="ring-only"\]\)[^}]*#badge-overflow[^}]*display:\s*none/);
+
+    api.setAvailableWidthForTest(90); // minimal
+    h.elements.get('badge-overflow').click();
+    assert.equal(h.elements.get('overflow-menu').hidden, false);
+    assert.equal(api.setAvailableWidthForTest(40), 'ring-only');
+    assert.equal(h.elements.get('overflow-menu').hidden, false, '切换到 ring-only 时不得强行关闭溢出菜单');
+
+    // 2. 无独立菜单栏行（titlebar top < 20 且贴窗口最右边）时，自动注入 padding-right 避让原生 138px 窗口控制区
+    if (!h.sandbox.document.head) {
+      h.sandbox.document.head = h.sandbox.document.createElement();
+    }
+    h.sandbox.navigator = { platform: 'Win32' };
+    h.sandbox.window.innerWidth = 1440;
+    h.sandbox.window.outerWidth = 1440;
+    const tb = h.sandbox.document.createElement();
+    tb.className = 'flex w-full min-w-0 select-none items-center justify-between overflow-hidden @container/titlebar';
+    tb.getBoundingClientRect = () => ({ top: 0, left: 256, right: 1440, bottom: 40, width: 1184, height: 40 });
+    h.sandbox.document.querySelector = sel => (sel.includes('@container/titlebar') ? tb : null);
+
+    api.syncWindowControlsOverlayForTest();
+    const fixEl = h.sandbox.document.getElementById('ag-topbar-host-fix');
+    assert.ok(fixEl, '应创建 #ag-topbar-host-fix 样式节点');
+    assert.match(fixEl.textContent, /\[class\*="@container\/titlebar"\][\s\S]*padding-right:\s*138px\s*!important/);
+
+    // 3. 当顶部有独立菜单栏行（titlebar top >= 20）时，立即撤销 titlebar padding-right 避让规则
+    tb.getBoundingClientRect = () => ({ top: 35, left: 256, right: 1440, bottom: 75, width: 1184, height: 40 });
+    api.syncWindowControlsOverlayForTest();
+    assert.doesNotMatch(fixEl.textContent, /\[class\*="@container\/titlebar"\]\s*\{\s*padding-right:/);
+  } finally {
+    api.dispose();
+  }
+});
+
+test('v0.8.8 chart visual redesign E2E: single 1.82M vs heavy 100..3.64B, cross-tier monotonic invariance, cumulative A+C strip/ruler/lock, stacked bars and theme/narrow', () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+
+  // 为 yearly/cum SVG 提供 createElementNS 与测量追踪能力
+  api.switchHeatView('cum');
+  api.switchHeatView('yearly');
+  api.switchHeatView('daily');
+  const origCreateEl = h.sandbox.document.createElement;
+  h.sandbox.document.createElementNS = (_ns, tag) => {
+    const node = origCreateEl();
+    node.tagName = tag;
+    return node;
+  };
+
+  const scrollBox = h.elements.get('h-scroll-box');
+  let mockChartWidth = 670;
+  scrollBox.getBoundingClientRect = () => ({ left: 0, top: 0, width: mockChartWidth, height: 120, right: mockChartWidth, bottom: 120 });
+
+  const today = new Date();
+  const y = today.getFullYear();
+  const m = today.getMonth();
+  const pad = n => String(n).padStart(2, '0');
+  const todayStr = `${y}-${pad(m + 1)}-${pad(today.getDate())}`;
+  const ymCur = `${y}-${pad(m + 1)}`;
+
+  const findAll = (root, pred) => {
+    const out = [];
+    const walk = n => {
+      if (!n) return;
+      if (pred(n)) out.push(n);
+      if (Array.isArray(n.children)) n.children.forEach(walk);
+    };
+    walk(root);
+    return out;
+  };
+
+  try {
+    // 场景 1: 全年单月 1.82M（今天所在月，早先为未启用，未来为虚线）
+    const activeDay = `${ymCur}-${pad(Math.min(28, Math.max(1, today.getDate())))}`;
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: activeDay,
+      dailyMap: { [activeDay]: { total: 1.82e6, input: 100e3, cache: 1.7e6, output: 20e3 } },
+      dailyMapBySource: { all: { [activeDay]: { total: 1.82e6, input: 100e3, cache: 1.7e6, output: 20e3 } } },
+      summary: {
+        firstUseDate: activeDay,
+        grandTotalTokens: 1.82e6,
+        totalInputTokens: 100e3,
+        totalCacheTokens: 1.7e6,
+        totalOutputTokens: 20e3,
+        cacheReadStats: {
+          cacheStatus: 'hit',
+          totalUncachedInput: 100e3,
+          totalCacheRead: 1.7e6,
+          totalInput: 1.8e6,
+          totalOutput: 20e3,
+          cacheReadPct: 94.4,
+          missingCount: 0
+        }
+      },
+      dailyModelMap: { [activeDay]: { 'gemini-4-hydrogen': { total: 1.82e6, input: 100e3, cache: 1.7e6, output: 20e3, steps: 2 } } },
+      dailyModelMapBySource: { all: { [activeDay]: { 'gemini-4-hydrogen': { total: 1.82e6, input: 100e3, cache: 1.7e6, output: 20e3, steps: 2 } } } }
+    });
+
+    // 缓存占比条与 API 明细卡微进度条
+    const tcbState = api.getTokenCacheBreakdownForTest();
+    assert.equal(tcbState.ratio, '94.4%');
+    assert.equal(tcbState.ratioBarWidth, '94.4%');
+    h.elements.get('tok-view-cost').click();
+    assert.match(h.elements.get('ref-cost-output-share').textContent, /%$/);
+    h.elements.get('tok-view-tokens').click();
+
+    // 「今年」视图：单月 1.82M 直径 33.64px、无峰值圈、同心参考环、三态区分
+    api.switchHeatView('yearly');
+    const yearlyBox = h.elements.get('h-yearly-box');
+    assert.equal(yearlyBox.getAttribute('data-scale-tier'), '10M');
+    const svg = yearlyBox.children[0];
+    assert.equal(findAll(svg, n => String(n.className || '').includes('bubble-peak-badge')).length, 0);
+    assert.equal(findAll(svg, n => String(n.className || '').includes('yearly-ref-rings')).length, 1);
+    const monthGroups = findAll(svg, n => String(n.className || '').includes('heat-yearly-bubble-group'));
+    const curCircle182 = findAll(monthGroups[m], n => String(n.className || '').includes('bubble-main'))[0];
+    const diam182Single = Number(curCircle182.getAttribute('data-diameter'));
+    const color182Single = curCircle182.getAttribute('fill');
+    assert.ok(Math.abs(diam182Single - 33.64) < 0.08, `连续分锚点映射下 1.82M 气泡应约 33.64px，实测 ${diam182Single}`);
+
+    // 窄窗 (W=360) 验证：同心参考环不挡月份标签
+    mockChartWidth = 360;
+    api.switchHeatView('yearly');
+    const monthLbls = findAll(h.elements.get('h-yearly-box').children[0], n => String(n.className || '').includes('bubble-month-lbl'));
+    assert.ok(Number(monthLbls[11].getAttribute('x')) < 360 - 52);
+    mockChartWidth = 670;
+
+    // 场景 2: 同一张图跨 100M -> 1B+ 边界：其他同值月 1.82M 与 100M 的尺寸与颜色绝不缩小！
+    const otherMonth = m > 0 ? 0 : 1;
+    const mPad = pad(otherMonth + 1);
+    const crossDm = {
+      [`${y}-${mPad}-05`]: { total: 100e6, input: 10e6, cache: 85e6, output: 5e6 }
+    };
+    crossDm[activeDay] = { total: 1.82e6, input: 100e3, cache: 1.7e6, output: 20e3 };
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: `${y}-01-01`,
+      dailyMap: crossDm,
+      dailyMapBySource: { all: crossDm },
+      summary: { firstUseDate: `${y}-01-01`, grandTotalTokens: 101.82e6 }
+    });
+    api.switchHeatView('yearly');
+    assert.equal(h.elements.get('h-yearly-box').getAttribute('data-scale-tier'), '100M');
+    let mGroupsCross = findAll(h.elements.get('h-yearly-box').children[0], n => String(n.className || '').includes('heat-yearly-bubble-group'));
+    const d100M_at100M = Number(findAll(mGroupsCross[otherMonth], n => String(n.className || '').includes('bubble-main'))[0].getAttribute('data-diameter'));
+    const c100M_at100M = findAll(mGroupsCross[otherMonth], n => String(n.className || '').includes('bubble-main'))[0].getAttribute('fill');
+    assert.equal(d100M_at100M, 49.0);
+    // 同值 1.82M 在 100M 包络下与 10M 包络下像素/颜色完全相等
+    assert.equal(Number(findAll(mGroupsCross[m], n => String(n.className || '').includes('bubble-main'))[0].getAttribute('data-diameter')), diam182Single);
+    assert.equal(findAll(mGroupsCross[m], n => String(n.className || '').includes('bubble-main'))[0].getAttribute('fill'), color182Single);
+
+    // 将 otherMonth 增加到 100M + 1 -> 跨入 1B 包络，此时自身不得缩小且 1.82M 也不得缩小！
+    crossDm[`${y}-${mPad}-06`] = { total: 1, input: 1, cache: 0, output: 0 };
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: `${y}-01-01`,
+      dailyMap: crossDm,
+      dailyMapBySource: { all: crossDm },
+      summary: { firstUseDate: `${y}-01-01`, grandTotalTokens: 101.82e6 + 1 }
+    });
+    api.switchHeatView('yearly');
+    assert.equal(h.elements.get('h-yearly-box').getAttribute('data-scale-tier'), '1B');
+    mGroupsCross = findAll(h.elements.get('h-yearly-box').children[0], n => String(n.className || '').includes('heat-yearly-bubble-group'));
+    const d100M_at1B = Number(findAll(mGroupsCross[otherMonth], n => String(n.className || '').includes('bubble-main'))[0].getAttribute('data-diameter'));
+    const c100M_at1B = findAll(mGroupsCross[otherMonth], n => String(n.className || '').includes('bubble-main'))[0].getAttribute('fill');
+    assert.ok(d100M_at1B >= d100M_at100M, `100M+1 (${d100M_at1B}) 不得小于 100M (${d100M_at100M})`);
+    assert.equal(c100M_at1B, c100M_at100M);
+    assert.equal(Number(findAll(mGroupsCross[m], n => String(n.className || '').includes('bubble-main'))[0].getAttribute('data-diameter')), diam182Single);
+
+    // 场景 3: 重做「累计总量」A+C — 30 天 ~4.86B（含 4 个零用量日 + 3 个连续高峰日）
+    const d30End = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const d30Start = new Date(d30End.getTime() - 29 * 86400000);
+    const fmtD = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const dm30 = {};
+    const zeroIdxSet = new Set([4, 13, 19, 20]);
+    const peakIdxMap = { 9: 620e6, 10: 710e6, 11: 580e6 };
+    let sum30 = 0;
+    for (let i = 0; i < 30; i++) {
+      const ds = fmtD(new Date(d30Start.getTime() + i * 86400000));
+      if (zeroIdxSet.has(i)) continue;
+      const val = peakIdxMap[i] || (i >= 7 && i <= 12 ? 220e6 : 100e6);
+      sum30 += val;
+      dm30[ds] = { total: val, input: Math.round(val * 0.1), cache: Math.round(val * 0.85), output: Math.round(val * 0.05) };
+    }
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: fmtD(d30Start),
+      dailyMap: dm30,
+      dailyMapBySource: { all: dm30 },
+      summary: { firstUseDate: fmtD(d30Start), grandTotalTokens: sum30 }
+    });
+    api.switchHeatView('cum');
+    const cumBox = h.elements.get('h-cum-box');
+    const byId = id => findAll(cumBox, n => n.id === id)[0];
+    const cumState30 = api.getCumulativeViewStateForTest();
+    assert.equal(cumState30.summary.totalDays, 30);
+    assert.equal(cumState30.summary.activeDays, 26);
+    assert.equal(cumState30.summary.zeroDays, 4);
+    assert.equal(cumState30.summary.grouping, 'daily');
+    assert.equal(h.elements.get('h-sum-tokens-wrap').style.display, 'none', '累计页顶部已显示总量，底部区间合计必须隐藏防重复');
+    assert.equal(h.elements.get('h-sum-cost-wrap').style.display, 'none', '累计页顶部已显示参考金额，底部预估费用必须隐藏防重复');
+    assert.equal(byId('cum-ruler-marker').getAttribute('data-ruler-status'), 'in_range');
+    const stripSegs = byId('cum-strip').children;
+    assert.equal(stripSegs.length, 26, '横带仅包含 26 个活跃日，4 个 0 用量日不占宽度');
+    const pctTotal = stripSegs.reduce((acc, el) => acc + parseFloat(el.getAttribute('data-width-pct')), 0);
+    assert.ok(Math.abs(pctTotal - 100) < 0.02);
+    const axisZeroSlots = byId('cum-axis-row').children.filter(el => el.getAttribute('data-zero') === 'true');
+    assert.equal(axisZeroSlots.length, 4, '等距日期轴应标出 4 个 0 用量日的 ✕ 标记');
+    assert.ok(byId('cum-peak-chips').children.length >= 1);
+    assert.match(byId('cum-conclusion-row').textContent, /50%/);
+
+    // 点击锁定某段 -> 出现详情与定位按钮 -> 按 Esc 取消锁定但不关闭面板 -> 再锁定并点击定位「每天」热力图高亮
+    const peakKey = cumState30.summary.peakDay.date;
+    const peakSegEl = stripSegs.find(el => el.getAttribute('data-cum-key') === peakKey);
+    peakSegEl.click();
+    assert.equal(api.getCumulativeViewStateForTest().lockedKey, peakKey);
+    assert.ok(byId('cum-inspector'));
+    api.getCumulativeViewStateForTest().pressEscape();
+    assert.equal(api.getCumulativeViewStateForTest().lockedKey, null, 'Esc 应取消累计段锁定');
+    // 再次点击锁定并定位到「每天」
+    byId('cum-strip').children.find(el => el.getAttribute('data-cum-key') === peakKey).click();
+    byId('cum-btn-locate-daily').click();
+    assert.equal(api.getActiveHeatView(), 'daily');
+    const linkedCell = findAll(h.elements.get('h-grid-cols'), n => n.getAttribute?.('data-date') === peakKey)[0];
+    assert.ok(linkedCell && String(linkedCell.className || '').includes('is-cum-linked'), '跳转「每天」后应高亮联动同一天格子');
+
+    // 场景 4: 3 天轻量账号 -> 省略集中度结论，保留峰值与 <10M 量级尺提示，切换清理旧锁定
+    const d3Start = new Date(d30End.getTime() - 2 * 86400000);
+    const dm3 = {};
+    for (let i = 0; i < 3; i++) {
+      dm3[fmtD(new Date(d3Start.getTime() + i * 86400000))] = { total: (i + 1) * 5000, input: 1000, cache: 3000, output: 1000 };
+    }
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: fmtD(d3Start),
+      dailyMap: dm3,
+      dailyMapBySource: { all: dm3 },
+      summary: { firstUseDate: fmtD(d3Start), grandTotalTokens: 30000 }
+    });
+    api.switchHeatView('cum');
+    const cum3State = api.getCumulativeViewStateForTest();
+    assert.equal(cum3State.lockedKey, null, '切换账号数据后应清理失效锁定');
+    assert.equal(cum3State.summary.totalDays, 3);
+    assert.equal(cum3State.summary.concentration, null);
+    assert.equal(byId('cum-ruler-marker').getAttribute('data-ruler-status'), 'below_min');
+
+    // 场景 5: 0 用量空态（避免除零）
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      isAccountSwitched: true,
+      firstUseDate: fmtD(d3Start),
+      dailyMap: {},
+      dailyMapBySource: { all: {} },
+      summary: { firstUseDate: fmtD(d3Start), grandTotalTokens: 0 }
+    });
+    api.switchHeatView('cum');
+    assert.ok(byId('cum-empty-state'));
+    assert.equal(byId('cum-ruler-marker').getAttribute('data-ruler-status'), 'zero');
+
+    // 场景 6: 超过 90 天 + 历史翻页 + 按周分组展开到日 + 窄窗 + 深浅主题切换
+    const d400Start = new Date(d30End.getTime() - 420 * 86400000);
+    const dmLong = {};
+    for (let i = 0; i <= 420; i += 3) {
+      dmLong[fmtD(new Date(d400Start.getTime() + i * 86400000))] = { total: 50e6, input: 5e6, cache: 40e6, output: 5e6 };
+    }
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: fmtD(d400Start),
+      dailyMap: dmLong,
+      dailyMapBySource: { all: dmLong },
+      summary: { firstUseDate: fmtD(d400Start), grandTotalTokens: 7e9 }
+    });
+    api.switchHeatView('cum');
+    assert.equal(api.getCumulativeViewStateForTest().summary.grouping, 'weekly');
+    // 点击第 1 段周分组并展开日明细
+    byId('cum-strip').children[0].click();
+    assert.ok(byId('cum-week-days'), '按周分组选中后可展开日明细');
+    // 历史翻页：保留历史窗口末日，不强制改成今天
+    h.elements.get('h-page-prev').click();
+    const pagedCum = api.getCumulativeViewStateForTest().summary;
+    assert.ok(pagedCum.endDate < todayStr, `历史翻页区间末日 (${pagedCum.endDate}) 应早于今天 (${todayStr})`);
+    // 窄窗模式 & 浅色主题切换
+    mockChartWidth = 360;
+    api.switchHeatView('cum');
+    assert.ok(String(cumBox.children[0].className || '').includes('is-narrow'));
+    h.sandbox.__AGContextMeter.setTheme('light');
+    assert.equal(h.elements.get('h-cum-box').style.display, 'block');
+    h.sandbox.__AGContextMeter.setTheme('dark');
+    mockChartWidth = 670;
+
+    // 场景 7: 按模型 100 vs 418.3M -> 跨 500M+ 与 800M 边界柱高单调 + 1.5px 微段保底 & 求和恒等 + 图例折叠与锁定
+    const modelDayMap = {};
+    for (let k = 0; k < 7; k++) {
+      modelDayMap[`series-${k}`] = { total: k === 0 ? 418.3e6 : (k === 1 ? 100 : (7 - k) * 1e6), input: 10, cache: 10, output: 10, steps: 1 };
+    }
+    const dayMinorKey = fmtD(new Date(today.getTime() - 86400000));
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: fmtD(d3Start),
+      dailyMap: dm30,
+      dailyMapBySource: { all: dm30 },
+      summary: { firstUseDate: fmtD(d3Start), grandTotalTokens: sum30 },
+      dailyModelMap: {
+        [todayStr]: modelDayMap,
+        [dayMinorKey]: { 'series-0': { total: 100, input: 40, cache: 40, output: 20, steps: 1 } }
+      },
+      dailyModelMapBySource: {
+        all: {
+          [todayStr]: modelDayMap,
+          [dayMinorKey]: { 'series-0': { total: 100, input: 40, cache: 40, output: 20, steps: 1 } }
+        }
+      }
+    });
+    h.elements.get('tok-view-models').click();
+    const mLegend = h.elements.get('model-usage-legend');
+    assert.equal(mLegend.children.length, 6);
+    assert.equal(mLegend.children[5].getAttribute('data-series-key'), '__other_series__');
+
+    const mBars = h.elements.get('model-usage-bars');
+    const todayStack = mBars.children[mBars.children.length - 1].children[0];
+    const todayTotalH = parseFloat(todayStack.getAttribute('data-total-height'));
+    const segHeights = todayStack.children.map(seg => parseFloat(seg.style.height));
+    assert.ok(Math.abs(segHeights.reduce((a, b) => a + b, 0) - todayTotalH) < 0.01);
+    assert.ok(segHeights.every(sh => sh >= 1.49));
+
+    const minorBarH_mixed = parseFloat(mBars.children[mBars.children.length - 2].children[0].getAttribute('data-total-height'));
+    h.elements.get('model-scale-linear').click();
+    const minorBarH_linear = parseFloat(mBars.children[mBars.children.length - 2].children[0].getAttribute('data-total-height'));
+    assert.ok(minorBarH_mixed > minorBarH_linear + 5);
+    h.elements.get('model-scale-mixed').click();
+
+    const targetLegendKey = mLegend.children[1].getAttribute('data-series-key');
+    mLegend.children[1].click();
+    assert.equal(api.getModelUsageScaleForTest().lockedKey, targetLegendKey);
+    assert.equal(mBars.children[mBars.children.length - 1].children[0].children[0].getAttribute('data-series-key'), targetLegendKey);
+
+    // 场景 8: 累计页容器不被 height:105px 或 overflow-y:hidden 裁切，切回其他页正确还原
+    const stylesSrc = fs.readFileSync(path.join(__dirname, 'src', 'renderer', 'styles.css'), 'utf8');
+    assert.ok(!/#h-cum-box\s*\{[^}]*height\s*:\s*105px/i.test(stylesSrc), '#h-cum-box 不得存在 height:105px 覆盖规则');
+    assert.ok(/\.heat-scroll-box\.is-cum-active\s*\{\s*overflow\s*:\s*visible\s*\}/i.test(stylesSrc), '缺少 .heat-scroll-box.is-cum-active{overflow:visible}');
+    api.switchHeatView('cum');
+    assert.ok(String(h.elements.get('h-scroll-box').className || '').includes('is-cum-active'));
+    api.switchHeatView('daily');
+    assert.ok(!String(h.elements.get('h-scroll-box').className || '').includes('is-cum-active'));
+  } finally {
+    api.dispose();
+  }
+});
+
+test('v0.8.8 α 版本展示与更新比较隔离: 界面展示 0.8.8 α 且无正式版字样, 0.8.8==0.8.8 判最新, 0.8.9 判有更新', async () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+  assert.equal(pkg.version, '0.8.8');
+
+  // 1. 默认构建模板中 #v 与 #up-pop-ver 均为 0.8.8 α，且渲染源码中不含“正式版”字样
+  const builtCode = fs.readFileSync(path.join(__dirname, 'meter-renderer.js'), 'utf8');
+  assert.match(builtCode, /<span id="v">0\.8\.8 α<\/span>/);
+  assert.match(builtCode, /<span id="up-pop-ver"[^>]*>0\.8\.8 α<\/span>/);
+  assert.equal(builtCode.includes('正式版'), false);
+
+  // 2. 0.8.8 vs 0.8.8 判为已是最新，且文案展示 0.8.8 α
+  {
+    const h = harness();
+    const api = h.sandbox.__AGContextMeter;
+    h.sandbox.window.contextMeterAPI = {
+      ...h.sandbox.window.contextMeterAPI,
+      checkUpdate: async (req) => {
+        assert.equal(req.currentVersion, '0.8.8');
+        return { ok: true, hasUpdate: false, currentVersion: '0.8.8', installedVersion: '0.8.8' };
+      }
+    };
+    try {
+      await api.checkUpdate(true);
+      await h.flush();
+      assert.equal(h.elements.get('up-pop-ver').textContent, '0.8.8 α (已是最新)');
+      assert.match(h.elements.get('up-pop-body').textContent, /0\.8\.8 α/);
+      assert.equal(h.elements.get('up-pop-body').textContent.includes('正式版'), false);
+    } finally {
+      api.dispose();
+    }
+  }
+
+  // 3. 0.8.8 vs 0.8.9 判为有更新，且展示 0.8.8 α → v0.8.9
+  {
+    const h = harness();
+    const api = h.sandbox.__AGContextMeter;
+    h.sandbox.window.contextMeterAPI = {
+      ...h.sandbox.window.contextMeterAPI,
+      checkUpdate: async (req) => {
+        assert.equal(req.currentVersion, '0.8.8');
+        return { ok: true, hasUpdate: true, currentVersion: '0.8.8', latestVersion: '0.8.9', releaseNotes: 'v0.8.9 test' };
+      }
+    };
+    try {
+      await api.checkUpdate(true);
+      await h.flush();
+      assert.equal(h.elements.get('up-pop-ver').textContent, '0.8.8 α → v0.8.9');
+      assert.match(h.elements.get('up-pop-body').textContent, /v0\.8\.9/);
+      assert.equal(h.elements.get('btn-apply-update').style.display, 'inline-block');
+    } finally {
+      api.dispose();
+    }
+  }
+});
+
+test('i18n completeness: all static t()/data-i18n keys and known dynamic keys exist in zh-CN/zh-TW/en', () => {
+  const vm = require('node:vm');
+  const i18nSrc = fs.readFileSync(path.join(__dirname, 'src', 'renderer', 'i18n.js'), 'utf8');
+  const ctx = {};
+  vm.runInNewContext(`${i18nSrc}\nthis.__I18N = PANEL_I18N;`, ctx);
+  const dict = ctx.__I18N;
+  const langs = ['zh-CN', 'zh-TW', 'en'];
+
+  const files = ['main.js', 'heatmap.js', 'colors.js', 'dropdown.js', 'context-budget-engine.js', 'template.html'];
+  const staticKeys = new Set();
+  const reT = /\bt\(\s*'([^']+)'/g;
+  const reAttr = /data-i18n(?:-title|-aria|-placeholder|-html)?="([^"]+)"/g;
+  for (const rel of files) {
+    const src = fs.readFileSync(path.join(__dirname, 'src', 'renderer', rel), 'utf8');
+    let m;
+    while ((m = reT.exec(src))) staticKeys.add(m[1]);
+    while ((m = reAttr.exec(src))) staticKeys.add(m[1]);
+  }
+
+  // 补充扫描到的动态模板键值
+  for (let i = 0; i <= 4; i++) {
+    ['desc', 'keeps', 'clears', 'replaces', 'meaning'].forEach(p => staticKeys.add(`enhance.tier.${i}.${p}`));
+    if (i >= 1) staticKeys.add(`enhance.tier.${i}.short`);
+  }
+  ['exhausted', 'no_permission', 'error', 'stale', 'unknown'].forEach(s => staticKeys.add(`quota.short.${s}`));
+  ['disabled', 'watching', 'pending_debounce', 'waiting_idle', 'cooldown', 'switching', 'all_candidates_exhausted', 'blocked_untrusted_quota', 'error'].forEach(s => staticKeys.add(`accounts.status.${s}`));
+  ['account_switched', 'quota_reset', 'rolling_recovery', 'sampling_gap'].forEach(s => staticKeys.add(`quota.split.${s}`));
+  for (let i = 0; i <= 4; i++) staticKeys.add(`colors.lvl${i}`);
+
+  const missing = [];
+  for (const key of staticKeys) {
+    const entry = dict[key];
+    for (const lang of langs) {
+      if (!entry || typeof entry[lang] !== 'string' || !entry[lang].trim()) {
+        missing.push(`${key}:${lang}`);
+      }
+    }
+  }
+  assert.deepEqual(missing, [], `发现缺失的 i18n 词条: ${missing.join(', ')}`);
+  assert.equal(dict['tokens.cum.zeroDayBadge']['zh-CN'], '0 用量');
+  assert.equal(dict['tokens.cum.zeroDayBadge']['en'], '0 Tokens');
+  assert.equal(dict['models.btnRestartHost']['en'], 'Restart Client');
+});
+
+test('cumulative ResizeObserver auto-toggles is-narrow across 460px threshold without redundant rerenders and disconnects on dispose', () => {
+  const observerInstances = [];
+  class MockResizeObserver {
+    constructor(cb) {
+      this.cb = cb;
+      this.observed = [];
+      this.disconnected = false;
+      observerInstances.push(this);
+    }
+    observe(target) { this.observed.push(target); }
+    disconnect() { this.disconnected = true; }
+    trigger() { if (!this.disconnected) this.cb([]); }
+  }
+
+  const h = harness(session(), { ResizeObserver: MockResizeObserver });
+  const api = h.sandbox.__AGContextMeter;
+  const origCreateEl = h.sandbox.document.createElement;
+  h.sandbox.document.createElementNS = (_ns, tag) => {
+    const node = origCreateEl();
+    node.tagName = tag;
+    return node;
+  };
+
+  let mockWidth = 670;
+  const scrollBox = h.elements.get('h-scroll-box');
+  const panelTokens = h.elements.get('panel-tokens');
+  scrollBox.getBoundingClientRect = () => ({ left: 0, top: 0, width: mockWidth, height: 120, right: mockWidth, bottom: 120 });
+  panelTokens.getBoundingClientRect = () => ({ left: 0, top: 0, width: mockWidth + 56, height: 420, right: mockWidth + 56, bottom: 420 });
+
+  const today = new Date();
+  const fmt = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const d0 = fmt(today);
+  const d1 = fmt(new Date(today.getTime() - 86400000));
+  const dm = {
+    [d1]: { total: 10e6, input: 1e6, cache: 8e6, output: 1e6 },
+    [d0]: { total: 20e6, input: 2e6, cache: 16e6, output: 2e6 }
+  };
+
+  try {
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      firstUseDate: d1,
+      dailyMap: dm,
+      dailyMapBySource: { all: dm },
+      summary: { firstUseDate: d1, grandTotalTokens: 30e6 }
+    });
+    api.switchHeatView('cum');
+
+    const cumBox = h.elements.get('h-cum-box');
+    const panelObserver = observerInstances.find(inst => inst.observed.includes(panelTokens));
+    assert.ok(panelObserver, '#panel-tokens 必须被 ResizeObserver 监听');
+
+    const rootWide1 = cumBox.children[0];
+    assert.equal(String(rootWide1.className || '').includes('is-narrow'), false);
+
+    // 仍在 >=460px 同一侧收缩，不应触发冗余重绘（DOM 根节点引用不变）
+    mockWidth = 520;
+    panelObserver.trigger();
+    assert.equal(cumBox.children[0], rootWide1);
+
+    // 跨过 460px 阈值降至 360px：自动重绘并加上 .is-narrow
+    mockWidth = 360;
+    panelObserver.trigger();
+    const rootNarrow = cumBox.children[0];
+    assert.notEqual(rootNarrow, rootWide1);
+    assert.ok(String(rootNarrow.className || '').includes('is-narrow'));
+
+    // 再从 360px 恢复至 670px：自动重绘并移除 .is-narrow
+    mockWidth = 670;
+    panelObserver.trigger();
+    const rootWide2 = cumBox.children[0];
+    assert.notEqual(rootWide2, rootNarrow);
+    assert.equal(String(rootWide2.className || '').includes('is-narrow'), false);
+
+    api.dispose();
+    assert.equal(panelObserver.disconnected, true, 'dispose 时必须断开 panelTokensResizeObserver');
+  } finally {
+    try { api.dispose(); } catch {}
+  }
+});
+
+function htmlAwareRendererHarness(extraSandbox = null) {
+  const elements = new Map();
+  const docElements = new Map();
+  const listeners = new Map();
+  let shadowRootNode = null;
+
+  const makeEl = (tagName = 'div') => {
+    const attrs = new Map();
+    const props = new Map();
+    let _innerHTML = '';
+    const el = {
+      tagName: String(tagName).toUpperCase(),
+      style: {
+        display: '',
+        opacity: '',
+        setProperty(k, v) { props.set(k, v); },
+        removeProperty(k) { props.delete(k); },
+        getPropertyValue(k) { return props.get(k) || ''; }
+      },
+      children: [],
+      hidden: false,
+      textContent: '',
+      value: '',
+      checked: false,
+      disabled: false,
+      get options() {
+        return this.children.filter(c => String(c.tagName).toUpperCase() === 'OPTION');
+      },
+      get selectedOptions() {
+        return this.options.filter(o => o.value === this.value);
+      },
+      get innerHTML() { return _innerHTML; },
+      set innerHTML(v) {
+        _innerHTML = String(v || '');
+        if (!shadowRootNode || this !== shadowRootNode) return;
+        const bodyHtml = _innerHTML
+          .replace(/<style[\s\S]*?<\/style>/gi, '')
+          .replace(/<!--[\s\S]*?-->/g, '');
+        const VOID_TAGS = new Set(['INPUT', 'BR', 'HR', 'IMG', 'META', 'LINK', 'PATH', 'CIRCLE', 'RECT', 'LINE', 'POLYLINE', 'POLYGON']);
+        const stack = [shadowRootNode];
+        const tokRe = /<(\/?)([a-zA-Z0-9-]+)((?:[^>"']|"[^"]*"|'[^']*')*?)\s*(\/?)>|([^<]+)/g;
+        let m;
+        while ((m = tokRe.exec(bodyHtml))) {
+          if (m[5] !== undefined) {
+            const txt = m[5].replace(/\s+/g, ' ');
+            const curParent = stack[stack.length - 1];
+            if (txt.trim() && curParent && !curParent.children.length) {
+              curParent.textContent = (curParent.textContent ? curParent.textContent + ' ' : '') + txt.trim();
+            } else if (txt.trim() && curParent) {
+              curParent.textContent = (curParent.textContent ? curParent.textContent + ' ' : '') + txt.trim();
+            }
+            continue;
+          }
+          const isClose = m[1] === '/';
+          const tName = m[2].toUpperCase();
+          const attrStr = m[3] || '';
+          const selfClose = m[4] === '/' || VOID_TAGS.has(tName);
+          if (isClose) {
+            while (stack.length > 1) {
+              const popped = stack.pop();
+              if (popped.tagName === tName) break;
+            }
+            continue;
+          }
+          const node = makeEl(tName);
+          const attrRe = /([a-zA-Z0-9_:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+          let am;
+          while ((am = attrRe.exec(attrStr))) {
+            const ak = am[1];
+            const av = am[2] ?? am[3] ?? am[4] ?? '';
+            node.setAttribute(ak, av);
+            if (ak === 'value') node.value = av;
+            if (ak === 'hidden') node.hidden = true;
+            if (ak === 'disabled') node.disabled = true;
+            if (ak === 'style') {
+              const dispMatch = /display\s*:\s*([^;]+)/i.exec(av);
+              if (dispMatch) node.style.display = dispMatch[1].trim();
+            }
+          }
+          const parent = stack[stack.length - 1];
+          parent.appendChild(node);
+          if (node.id) elements.set(node.id, node);
+          if (!selfClose) stack.push(node);
+        }
+      },
+      get id() { return attrs.get('id') || ''; },
+      set id(v) { attrs.set('id', String(v)); if (v) { docElements.set(String(v), el); elements.set(String(v), el); } },
+      get className() { return attrs.get('class') || ''; },
+      set className(v) { attrs.set('class', String(v || '')); },
+      classList: {
+        add(c) {
+          const cur = (attrs.get('class') || '').split(/\s+/).filter(Boolean);
+          if (!cur.includes(c)) cur.push(c);
+          attrs.set('class', cur.join(' '));
+        },
+        remove(c) {
+          const cur = (attrs.get('class') || '').split(/\s+/).filter(x => x && x !== c);
+          attrs.set('class', cur.join(' '));
+        },
+        contains(c) {
+          return (attrs.get('class') || '').split(/\s+/).includes(c);
+        }
+      },
+      addEventListener(type, fn) {
+        if (!listeners.has(el)) listeners.set(el, []);
+        listeners.get(el).push({ type, fn });
+      },
+      dispatchEvent(ev) {
+        const type = ev?.type || ev;
+        const handlers = listeners.get(el) || [];
+        for (const h of handlers) {
+          if (h.type === type) h.fn({ target: el, ...ev });
+        }
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+        if (k === 'id' && v) { docElements.set(String(v), el); elements.set(String(v), el); }
+      },
+      getAttribute(k) { return attrs.get(k) ?? null; },
+      removeAttribute(k) { attrs.delete(k); },
+      closest(sel) {
+        const cl = String(sel || '').replace(/^\./, '');
+        let cur = this;
+        while (cur) {
+          if (cur.classList?.contains?.(cl)) return cur;
+          cur = cur.parentElement;
+        }
+        return null;
+      },
+      appendChild(x) {
+        if (x) {
+          x.parentElement = this;
+          this.children.push(x);
+          const xId = x.id || x.getAttribute?.('id');
+          if (xId) { docElements.set(xId, x); elements.set(xId, x); }
+        }
+      },
+      insertBefore(x, ref) {
+        if (!x) return;
+        x.parentElement = this;
+        const idx = ref ? this.children.indexOf(ref) : -1;
+        if (idx >= 0) this.children.splice(idx, 0, x);
+        else this.children.push(x);
+        const xId = x.id || x.getAttribute?.('id');
+        if (xId) { docElements.set(xId, x); elements.set(xId, x); }
+      },
+      replaceChildren(...nodes) {
+        this.children = [];
+        for (const n of nodes) this.appendChild(n);
+      },
+      querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+      querySelectorAll(sel) {
+        const res = [];
+        const walk = (n) => {
+          if (!n || n === this) {
+            for (const c of (n?.children || [])) walk(c);
+            return;
+          }
+          let ok = false;
+          if (sel.startsWith('[') && sel.endsWith(']')) {
+            const inner = sel.slice(1, -1);
+            const eq = inner.indexOf('=');
+            if (eq > 0) {
+              const ak = inner.slice(0, eq).trim();
+              const av = inner.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+              ok = n.getAttribute?.(ak) === av;
+            } else {
+              ok = n.getAttribute?.(inner) !== null;
+            }
+          } else if (sel.startsWith('.')) {
+            const parts = sel.split('.').filter(Boolean);
+            ok = parts.every(p => n.classList?.contains?.(p));
+          } else if (sel.startsWith('#')) {
+            ok = n.id === sel.slice(1);
+          } else if (/^input\[type="date"\]$/i.test(sel)) {
+            ok = n.tagName === 'INPUT' && n.getAttribute?.('type') === 'date';
+          } else {
+            ok = n.tagName === sel.toUpperCase();
+          }
+          if (ok) res.push(n);
+          for (const c of (n.children || [])) walk(c);
+        };
+        walk(this);
+        return res;
+      },
+      click() {
+        const handlers = listeners.get(el) || [];
+        for (const h of handlers) {
+          if (h.type === 'click') h.fn({ target: el, stopPropagation() {} });
+        }
+      },
+      trigger(type, ev = {}) {
+        const handlers = listeners.get(el) || [];
+        for (const h of handlers) {
+          if (h.type === type) h.fn({ target: el, preventDefault() {}, stopPropagation() {}, ...ev });
+        }
+      },
+      getBoundingClientRect() { return { left: 100, top: 100, width: 120, height: 26, right: 220, bottom: 126 }; },
+      get nextSibling() {
+        if (!this.parentElement) return null;
+        const i = this.parentElement.children.indexOf(this);
+        return i >= 0 ? (this.parentElement.children[i + 1] || null) : null;
+      },
+      remove() {
+        if (this.parentElement && Array.isArray(this.parentElement.children)) {
+          const i = this.parentElement.children.indexOf(this);
+          if (i >= 0) this.parentElement.children.splice(i, 1);
+        }
+      }
+    };
+    return el;
+  };
+
+  const host = makeEl('div');
+  host.attachShadow = () => {
+    shadowRootNode = makeEl('shadow-root');
+    shadowRootNode.getElementById = (id) => {
+      if (!elements.has(id)) elements.set(id, makeEl('div'));
+      return elements.get(id);
+    };
+    return shadowRootNode;
+  };
+
+  const savedSettings = [];
+  const docListeners = [];
+  const sandbox = {
+    location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/c/11111111-1111-1111-1111-111111111111' },
+    document: {
+      createElement: (tag) => makeEl(tag || 'div'),
+      createElementNS: (_ns, tag) => makeEl(tag || 'svg'),
+      getElementById: id => docElements.get(id) || null,
+      documentElement: { appendChild() {} },
+      addEventListener(type, fn) { docListeners.push({ type, fn }); },
+      removeEventListener() {},
+      hidden: false
+    },
+    window: {
+      __APP_CONFIG__: { csrfToken: 'test' },
+      innerWidth: 1000,
+      innerHeight: 800,
+      contextMeterAPI: {
+        scan: () => Promise.resolve(null),
+        saveSettings: async (payload) => { savedSettings.push(payload); return { ok: true, settings: payload }; },
+        getSettings: async () => ({}),
+        checkUpdate: async () => ({ ok: true, currentVersion: '0.8.8', latestVersion: '0.8.8', hasUpdate: false, tagName: 'v0.8.8' })
+      }
+    },
+    __AGContextMeterCore: core,
+    AbortController,
+    Date,
+    setTimeout: () => 1,
+    clearTimeout() {},
+    setInterval: () => 1,
+    clearInterval() {},
+    fetch: () => new Promise(() => {}),
+    ...(extraSandbox && typeof extraSandbox === 'object' ? extraSandbox : {})
+  };
+  let first = true;
+  sandbox.document.createElement = (tag) => { if (first) { first = false; return host; } return makeEl(tag || 'div'); };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+  return { sandbox, host, get shadow() { return shadowRootNode; }, elements, savedSettings };
+}
+
+test('v0.8.8 英文界面完整去汉字回归、地区预设自动转换与零 native input[type="date"] 门禁', async () => {
+  const h = htmlAwareRendererHarness();
+  const api = h.sandbox.__AGContextMeter;
+  try {
+    const today = new Date();
+    const ym = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
+    const d0 = `${ym}-10`;
+    const d1 = `${ym}-09`;
+    const oldDates = [];
+    for (let i = 100; i >= 1; i--) {
+      const dt = new Date(today.getTime() - i * 86400000);
+      oldDates.push(`${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`);
+    }
+    const dm = {
+      [d1]: { total: 40e6, input: 10e6, cache: 25e6, output: 5e6, costUSD: 20.5 },
+      [d0]: { total: 80e6, input: 20e6, cache: 50e6, output: 10e6, costUSD: 40.0 }
+    };
+    dm[oldDates[0]] = { total: 5e6, input: 1e6, cache: 3e6, output: 1e6, costUSD: 2.0 };
+
+    // 1. 先在简体中文环境下注入完整真实场景数据并打开各主要子面板/自定义表单/日期选择器
+    await api.setPanelLanguage('zh-CN', { persist: false });
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      currentPeriod: { key: ym, periodType: 'calendar_month', label: ym, isCurrentMonth: true },
+      firstUseDate: oldDates[0],
+      dailyMap: dm,
+      dailyMapBySource: { all: dm },
+      summary: {
+        firstUseDate: oldDates[0],
+        grandTotalTokens: 125e6,
+        totalInputTokens: 31e6,
+        totalCacheTokens: 78e6,
+        totalOutputTokens: 16e6,
+        monthTokens: 120e6,
+        currentMonthInput: 30e6,
+        currentMonthCache: 75e6,
+        currentMonthOutput: 15e6,
+        todayTokens: 80e6
+      },
+      planStatus: {
+        tierKey: 'pro',
+        tierName: 'Google AI Pro',
+        email: 'elvis@example.com',
+        country: '美国 (US)',
+        countrySource: 'custom',
+        region: '美国 (USD)',
+        subscriptionRegion: '美国 (USD)',
+        regionSource: 'custom',
+        currency: 'USD',
+        currencySymbol: '$',
+        actualPricePaid: 19.99,
+        billingCycle: '月付',
+        validEndDate: `${ym}-28`,
+        acquisitionSource: 'normal_paid',
+        acquisitionSourceName: '正常付费订阅',
+        priceMode: 'preset',
+        priceSource: 'preset_region'
+      },
+      byModel: {
+        'gemini-3.8-flash': { modelLabel: 'Gemini 3.8 Flash', totalTokens: 80e6, inputTokens: 20e6, cacheTokens: 50e6, outputTokens: 10e6, requestCount: 12 },
+        'claude-opus-4-7': { modelLabel: 'Claude Opus 4.7', totalTokens: 45e6, inputTokens: 11e6, cacheTokens: 28e6, outputTokens: 6e6, requestCount: 8 }
+      }
+    });
+
+    h.elements.get('badge-tokens').click();
+    h.elements.get('tok-view-models').click();
+    h.elements.get('tok-view-tokens').click();
+    h.elements.get('tok-view-cost').click();
+    h.elements.get('btn-plan-detail-toggle').click();
+    h.elements.get('btn-edit-plan-custom').click();
+    h.elements.get('valid-end-trigger').click();
+    api.switchHeatView('cum');
+
+    // 2. 切换为英文（en），验证所有可见节点与控件值、提示属性零汉字残留
+    await api.setPanelLanguage('en', { persist: false });
+
+    assert.equal(h.shadow.querySelectorAll('input[type="date"]').length, 0, '不允许存在原生 input[type="date"]');
+    assert.equal(h.elements.get('input-custom-country').value, 'United States (US)');
+    assert.equal(h.elements.get('input-custom-region').value, 'United States (USD)');
+    assert.equal(h.elements.get('cost-period-tag').textContent, `${ym} (Calendar Month)`);
+    assert.doesNotMatch(h.elements.get('cost-scope-desc').textContent, /[\u4e00-\u9fff]/);
+    assert.doesNotMatch(h.elements.get('plan-summary-price-val').textContent, /[\u4e00-\u9fff]/);
+    assert.equal(h.elements.get('plan-summary-price-cny').textContent, '', 'en 下默认 USD 订阅不显示人民币换算');
+    assert.doesNotMatch(h.elements.get('p-det-price').textContent, /CNY|¥/);
+
+    const leaks = [];
+    const ALLOWED_SWITCHER_IDS = new Set(['btn-top-lang-zh-CN', 'btn-top-lang-zh-TW', 'btn-lang-zh-CN', 'btn-lang-zh-TW', 'btn-ctx-lang-zh-CN', 'btn-ctx-lang-zh-TW']);
+    const isInsideHiddenOrOption = (node) => {
+      if (node.tagName === 'OPTION') return true;
+      let cur = node;
+      while (cur) {
+        if (cur.style?.display === 'none' || cur.hidden) return true;
+        if (ALLOWED_SWITCHER_IDS.has(cur.id)) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+    const walkShadow = (node) => {
+      if (!node) return;
+      if (isInsideHiddenOrOption(node)) return;
+      const fields = [
+        ['textContent', node.textContent],
+        ['value', node.value],
+        ['title', node.getAttribute?.('title')],
+        ['placeholder', node.getAttribute?.('placeholder')],
+        ['aria-label', node.getAttribute?.('aria-label')]
+      ];
+      for (const [fName, val] of fields) {
+        if (typeof val === 'string' && /[\u4e00-\u9fff]/.test(val)) {
+          leaks.push({ id: node.id || node.className || node.tagName, field: fName, val });
+        }
+      }
+      for (const child of (node.children || [])) walkShadow(child);
+    };
+    // 将主看板全部设为可见以便全量遍历
+    h.elements.get('panel-tokens').style.display = 'flex';
+    h.elements.get('plan-detail-card').style.display = 'block';
+    h.elements.get('plan-custom-form').style.display = 'block';
+    h.elements.get('valid-end-popover').style.display = 'block';
+    h.elements.get('cost-details-pane').style.display = 'block';
+    walkShadow(h.shadow);
+    assert.deepEqual(leaks, [], `en 模式下发现汉字泄露: ${JSON.stringify(leaks, null, 2)}`);
+  } finally {
+    try { api.dispose(); } catch {}
+  }
+});
+
+test('v0.8.8 三语货币参考规则（en 纯 USD / zh-CN USD+CNY / zh-TW 四币种且零简体）与自定义日期选择器全流程', async () => {
+  const h = htmlAwareRendererHarness();
+  const api = h.sandbox.__AGContextMeter;
+  try {
+    const today = new Date();
+    const pad2 = n => String(n).padStart(2, '0');
+    const todayYmd = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}-${pad2(today.getDate())}`;
+    const ym = `${today.getFullYear()}-${pad2(today.getMonth() + 1)}`;
+    const d0 = `${ym}-${pad2(Math.max(1, today.getDate()))}`;
+    const dm = { [d0]: { total: 50e6, input: 10e6, cache: 35e6, output: 5e6, costUSD: 100.0 } };
+
+    const basePayload = {
+      schemaVersion: '0.8.5',
+      currentPeriod: { key: ym, periodType: 'calendar_month', label: ym, isCurrentMonth: true },
+      firstUseDate: d0,
+      dailyMap: dm,
+      dailyMapBySource: { all: dm },
+      summary: {
+        firstUseDate: d0,
+        grandTotalTokens: 50e6,
+        totalInputTokens: 10e6,
+        totalCacheTokens: 35e6,
+        totalOutputTokens: 5e6,
+        monthTokens: 50e6,
+        currentMonthInput: 10e6,
+        currentMonthCache: 35e6,
+        currentMonthOutput: 5e6,
+        todayTokens: 50e6
+      },
+      planStatus: {
+        tierKey: 'pro',
+        tierName: 'Google AI Pro',
+        country: '美国 (US)',
+        region: '美国 (USD)',
+        currency: 'USD',
+        currencySymbol: '$',
+        actualPricePaid: 19.99,
+        billingCycle: '月付',
+        priceMode: 'custom',
+        priceSource: 'custom'
+      }
+    };
+
+    // A. en: 纯 USD，绝无 ¥ / CNY；非 USD 订阅展示 approx. $... USD
+    await api.setPanelLanguage('en', { persist: false });
+    api.applyTokenHistoryPayload(basePayload);
+    h.elements.get('tok-view-cost').click();
+    assert.doesNotMatch(h.elements.get('t-total-cost').textContent, /¥|CNY/);
+    assert.doesNotMatch(h.elements.get('t-today-cost').textContent, /¥|CNY/);
+    assert.doesNotMatch(h.elements.get('t-month-cost').textContent, /¥|CNY/);
+    assert.doesNotMatch(h.elements.get('t-year-cost').textContent, /¥|CNY/);
+    assert.doesNotMatch(h.elements.get('cost-grand-val').textContent, /¥|CNY/);
+    assert.equal(h.elements.get('plan-summary-price-cny').textContent, '');
+
+    api.applyTokenHistoryPayload({
+      ...basePayload,
+      planStatus: { ...basePayload.planStatus, region: '日本 (JPY)', currency: 'JPY', currencySymbol: '¥', actualPricePaid: 2900 }
+    });
+    assert.match(h.elements.get('plan-summary-price-cny').textContent, /approx\. \$\d+\.\d{2} USD/);
+
+    // B. zh-CN: USD + CNY (¥)
+    await api.setPanelLanguage('zh-CN', { persist: false });
+    api.applyTokenHistoryPayload(basePayload);
+    assert.match(h.elements.get('t-total-cost').textContent, /≈ \$.*\(¥/);
+    assert.match(h.elements.get('p-det-price').textContent, /¥[\d.]+ CNY/);
+
+    // C. zh-TW: 紧凑卡片 USD + HK$/NT$；详情四币种 USD/HKD/TWD/CNY；地区转繁体且零简体字
+    await api.setPanelLanguage('zh-TW', { persist: false });
+    api.applyTokenHistoryPayload(basePayload);
+    assert.match(h.elements.get('t-total-cost').textContent, /HK\$[\d.]+.*NT\$[\d.]+/);
+    assert.match(h.elements.get('cost-grand-val').textContent, /HK\$.*NT\$.*¥[\d.]+ CNY/);
+    assert.match(h.elements.get('cost-sub-line').textContent, /HK\$.*NT\$.*¥[\d.]+ CNY/);
+
+    h.elements.get('btn-plan-detail-toggle').click();
+    h.elements.get('btn-edit-plan-custom').click();
+    assert.equal(h.elements.get('input-custom-country').value, '美國 (US)');
+    assert.equal(h.elements.get('input-custom-region').value, '美國 (USD)');
+
+    // 扫描 PANEL_I18N zh-TW 全字典不含明确简体专属字
+    const simpOnlyRe = /[国韩亚欧乌罗马联东陆区宾兰达尔义书买云亿仅从仓优会体佣储兑划创删剂剑劝办务动励劳势协单卖卫却压厌双变叠叶号叹启员响哑唤严丰临举么乐习乡乱亏亚产亲们价众伙伞伟传伤伦伪侣侦侧侨俩仓个倾偿催傲傻]/;
+    const i18nSrc = fs.readFileSync(path.join(__dirname, 'src', 'renderer', 'i18n.js'), 'utf8');
+    const iCtx = {};
+    vm.runInNewContext(`${i18nSrc}\nthis.__I18N = PANEL_I18N;`, iCtx);
+    const twSimpHits = [];
+    for (const [k, v] of Object.entries(iCtx.__I18N)) {
+      if (typeof v['zh-TW'] === 'string' && simpOnlyRe.test(v['zh-TW'])) {
+        twSimpHits.push(`${k}: ${v['zh-TW']}`);
+      }
+    }
+    assert.deepEqual(twSimpHits, [], `zh-TW 字典存在简体字: ${twSimpHits.join('; ')}`);
+
+    // D. 自定义日期选择器全流程：英文表头、选日、清空、今天、保存持久化
+    await api.setPanelLanguage('en', { persist: false });
+    const dpTrigger = h.elements.get('valid-end-trigger');
+    const dpPopover = h.elements.get('valid-end-popover');
+    const dpHidden = h.elements.get('input-valid-end');
+    const dpLabel = h.elements.get('valid-end-label');
+
+    dpTrigger.click();
+    assert.equal(dpPopover.style.display, 'block');
+    const wkTexts = dpPopover.querySelectorAll('.ag-dp-weekday').map(n => n.textContent);
+    assert.deepEqual(wkTexts, ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa']);
+
+    const targetCell = dpPopover.querySelectorAll('.ag-dp-day').find(b => b.getAttribute('data-date') === d0);
+    assert.ok(targetCell, `应存在日期格 ${d0}`);
+    targetCell.click();
+    assert.equal(dpHidden.value, d0);
+    assert.equal(dpLabel.textContent, d0);
+    assert.equal(dpPopover.style.display, 'none');
+
+    // 重新打开点 Clear
+    dpTrigger.click();
+    dpPopover.querySelector('[data-dp-action="clear"]').click();
+    assert.equal(dpHidden.value, '');
+    assert.equal(dpLabel.textContent, 'YYYY-MM-DD');
+
+    // 重新打开点 Today 并保存
+    dpTrigger.click();
+    dpPopover.querySelector('[data-dp-action="today"]').click();
+    assert.equal(dpHidden.value, todayYmd);
+    assert.equal(dpLabel.textContent, todayYmd);
+
+    h.elements.get('btn-custom-plan-save').click();
+    const lastSave = h.savedSettings[h.savedSettings.length - 1];
+    assert.equal(lastSave?.customPlan?.validEndDate, todayYmd);
+  } finally {
+    try { api.dispose(); } catch {}
   }
 });

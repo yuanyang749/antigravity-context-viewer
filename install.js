@@ -12,9 +12,9 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
-const { loadAsarEngine, builtinAsar, getStateDir, findAsarPath } = require('./asar-engine');
+const { loadAsarEngine, builtinAsar, collectUnpackedPaths, getStateDir, getAppDataDir, isIsolatedTestPath, findAsarPath } = require('./asar-engine');
 const { discoverAntigravityCdp, createCdpClient } = require('./local-api');
-const { loadModulesConfig, saveModulesConfig, acquireFileLock } = require('./modules-config');
+const { loadModulesConfig, saveModulesConfig, acquireFileLock, getHostCoreBuildId } = require('./modules-config');
 const {
   TAGS,
   validateSyntax,
@@ -34,7 +34,7 @@ function clearAsarCache(archivePath) {
   try {
     if (asar && typeof asar.uncacheAll === 'function') asar.uncacheAll();
     if (asar && typeof asar.uncache === 'function' && archivePath) asar.uncache(archivePath);
-  } catch {}
+  } catch { }
 }
 
 function extractAsarFile(archivePath, relPath) {
@@ -57,85 +57,261 @@ function extractAllAsar(archivePath, destDir) {
 
 // findAsarPath 由 ./asar-engine 纯路径共享模块提供并导出
 
-async function tryHotInject(options = {}) {
-  try {
-    const discovered = await discoverAntigravityCdp(options);
-    if (!discovered.running || !discovered.targets || !discovered.targets.length) return false;
-    const targets = discovered.targets;
+function postLiveHttpJson(port, token, routePath, origin, body = {}, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    try {
+      const net = require('net');
+      const dataStr = JSON.stringify(body || {});
+      const numPort = Number(port);
+      const req = http.request({
+        hostname: '127.0.0.1',
+        port: numPort,
+        path: routePath,
+        method: 'POST',
+        agent: false,
+        createConnection: () => net.connect(numPort, '127.0.0.1'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(dataStr),
+          'Origin': origin,
+          'X-AG-Context-Token': String(token || '')
+        }
+      }, res => {
+        let raw = '';
+        res.on('data', c => raw += c);
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(raw || '{}');
+            resolve({ statusCode: res.statusCode, ...parsed });
+          } catch {
+            resolve({ ok: false, statusCode: res.statusCode });
+          }
+        });
+      });
+      req.setTimeout(timeoutMs, () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+      req.on('error', e => resolve({ ok: false, error: e.message }));
+      req.end(dataStr);
+    } catch (e) {
+      resolve({ ok: false, error: e.message });
+    }
+  });
+}
 
+async function probeLiveHostRuntimeInfo(liveInfo, origin = null) {
+  if (!liveInfo || !liveInfo.port || !liveInfo.token) return { ok: false, error: 'missing_live_info' };
+  const probeOrigin = origin || liveInfo.origin || (Array.isArray(liveInfo.origins) && liveInfo.origins[0]) || null;
+  if (!probeOrigin) return { ok: false, error: 'missing_origin' };
+  return postLiveHttpJson(liveInfo.port, liveInfo.token, '/runtime-info', probeOrigin, {}, 2500);
+}
+
+async function shutdownLiveHostGracefully(liveInfo) {
+  if (!liveInfo || !liveInfo.pid) return { ok: false, reason: 'no_pid' };
+  const targetOrigin = liveInfo.origin || (Array.isArray(liveInfo.origins) && liveInfo.origins[0]) || 'https://127.0.0.1:1';
+  if (liveInfo.port && liveInfo.token) {
+    const res = await postLiveHttpJson(liveInfo.port, liveInfo.token, '/shutdown', targetOrigin, {}, 1200);
+    if (res && res.ok) {
+      await new Promise(r => setTimeout(r, 150));
+      return { ok: true, method: 'http_shutdown', pid: liveInfo.pid };
+    }
+  }
+  try {
+    process.kill(liveInfo.pid, 0);
+    process.kill(liveInfo.pid);
+    return { ok: true, method: 'process_kill', pid: liveInfo.pid };
+  } catch {
+    return { ok: true, method: 'already_exited', pid: liveInfo.pid };
+  }
+}
+
+async function tryHotInjectDetailed(options = {}) {
+  const report = {
+    ok: false,
+    reason: null,
+    windowCount: 0,
+    injectedCount: 0,
+    backendSource: options.backendSource || null,
+    backendVersion: options.backendVersion || null,
+    backendVerified: false,
+    windows: []
+  };
+  try {
+    const appData = getAppDataDir(options);
+
+    // 严格安全隔离门禁：若处于测试模式且未显式指定隔离路径或显式测试端口，严禁连接真实宿主机 DevTools 端口！
+    if ((process.env.AG_METER_TEST_MODE === '1' || process.env.NODE_ENV === 'test') && !options.port && !options.appDataDir) {
+      if (!isIsolatedTestPath(appData)) {
+        report.reason = 'test_mode_isolated';
+        return report;
+      }
+    }
+
+    let targets;
+    try {
+      const cdp = await discoverAntigravityCdp(options);
+      targets = Array.isArray(cdp.pages) ? cdp.pages : [];
+    } catch (cdpErr) {
+      const msg = String(cdpErr?.message || '');
+      if (msg.includes('未找到 Antigravity 主窗口')) {
+        report.reason = 'no_page_targets';
+      } else if (msg.includes('连接信息无效')) {
+        report.reason = 'invalid_cdp_port';
+      } else {
+        report.reason = 'cdp_not_enabled';
+      }
+      return report;
+    }
+    report.windowCount = targets.length;
+    if (!targets.length) {
+      report.reason = 'no_page_targets';
+      return report;
+    }
+
+    let pkgVersion = null;
+    try {
+      pkgVersion = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || null;
+    } catch { }
     const stateDir = options.stateDir || getStateDir();
     const livePath = fs.existsSync(path.join(stateDir, '.live-session.json'))
       ? path.join(stateDir, '.live-session.json')
       : path.join(__dirname, '.live-session.json');
-    const liveInfo = fs.existsSync(livePath) ? JSON.parse(fs.readFileSync(livePath, 'utf8')) : null;
+    let liveInfo = options.liveInfo || (fs.existsSync(livePath) ? JSON.parse(fs.readFileSync(livePath, 'utf8')) : null);
+    let liveProbeOk = Boolean(options.liveVerified);
+    if (liveInfo && !liveProbeOk) {
+      const probe = await probeLiveHostRuntimeInfo(liveInfo, new URL(targets[0].url).origin);
+      if (probe && probe.ok && probe.backendVersion) {
+        liveProbeOk = !pkgVersion || probe.backendVersion === pkgVersion;
+        liveInfo = {
+          ...liveInfo,
+          version: probe.backendVersion,
+          backendSource: 'live-host',
+          capabilities: probe.capabilities || liveInfo.capabilities || {},
+          origins: probe.origins || liveInfo.origins || [liveInfo.origin]
+        };
+      }
+    }
+
     const bundle = ['meter-core.js', 'meter-renderer.js']
       .map(f => fs.readFileSync(path.join(__dirname, f), 'utf8'))
       .join('\n');
 
-    let settingsSnap = null;
-    let historyData = null;
-    if (!options.skipInitialData) {
-      try {
-        const { collectTokenHistoryAsync, getPluginSettings } = require('./meter-collector');
-        const snap = getPluginSettings();
-        if (snap && snap.ok) settingsSnap = snap;
-        const hist = await collectTokenHistoryAsync({ force: Boolean(options.forceHistory) });
-        if (hist && !hist.loading) historyData = hist;
-      } catch {}
-    }
+    let cachedSettings = null;
+    let cachedHistory = null;
+    try {
+      const { collectTokenHistoryAsync, getPluginSettings } = require('./meter-collector');
+      const settingsSnap = getPluginSettings();
+      if (settingsSnap && settingsSnap.ok) cachedSettings = settingsSnap;
+      const historyData = await collectTokenHistoryAsync({ force: true });
+      if (historyData && !historyData.loading) cachedHistory = historyData;
+    } catch { }
 
-    let injectedCount = 0;
     for (const target of targets) {
-      let client = null;
+      const targetOrigin = new URL(target.url).origin;
+      const winEntry = { origin: targetOrigin, injected: false, rendererVersion: null, backendSource: null, backendVersion: null, error: null };
+      let cdpClient = null;
       try {
-        client = await createCdpClient(target.webSocketDebuggerUrl, options);
-        const livePayload = liveInfo && liveInfo.port
-          ? (liveInfo.token ? { port: liveInfo.port, token: liveInfo.token } : { port: liveInfo.port })
-          : null;
-        if (options.onlyIfAbsent) {
-          const alreadyActive = await client.evaluateValue('Boolean(window.__AGContextMeter)', { timeoutMs: 4000 });
-          if (alreadyActive) {
-            if (livePayload && liveInfo.origin === new URL(target.url).origin) {
-              const currentLive = await client.evaluateValue('window.__AGContextMeterLive || null', { timeoutMs: 3000 });
-              const expectedToken = liveInfo.token || null;
-              const currentToken = currentLive?.token || null;
-              if (!currentLive || currentLive.port !== liveInfo.port || currentToken !== expectedToken) {
-                await client.evaluate(
-                  'window.__AGContextMeterLive=' + JSON.stringify(livePayload) +
-                  ';window.__AGContextMeter?.onLiveBridgeReconnected?.()',
-                  { timeoutMs: 4000 }
-                );
+        cdpClient = await createCdpClient(target.webSocketDebuggerUrl, { timeoutMs: 5000 });
+        const evalExpr = (expression, evalTimeoutMs = 6000) => cdpClient.evaluate(expression, { timeoutMs: evalTimeoutMs });
+
+        const liveCoversOrigin = Boolean(
+          liveInfo &&
+          liveInfo.port &&
+          liveInfo.token &&
+          (liveInfo.origin === targetOrigin || (Array.isArray(liveInfo.origins) && liveInfo.origins.includes(targetOrigin)))
+        );
+        if (options.clearStaleLiveBridge) {
+          await evalExpr('window.__AGContextMeterLive = null;');
+        } else if (liveCoversOrigin) {
+          await evalExpr('window.__AGContextMeterLive=' + JSON.stringify({
+            port: liveInfo.port,
+            token: liveInfo.token,
+            origin: targetOrigin,
+            origins: liveInfo.origins || [liveInfo.origin],
+            version: liveInfo.version || pkgVersion || null,
+            backendSource: liveInfo.backendSource || 'live-host',
+            capabilities: liveInfo.capabilities || null,
+            verified: liveProbeOk
+          }));
+        }
+        await evalExpr('window.__AGContextMeterHotReloadContext=' + JSON.stringify({
+          expectedVersion: pkgVersion,
+          source: options.source || 'cli',
+          hotInjectedAt: Date.now(),
+          preferLiveHost: Boolean(liveCoversOrigin && (options.preferLiveHost || liveProbeOk))
+        }));
+
+        if (cachedSettings) {
+          await evalExpr('window.__AGContextMeterSettings=' + JSON.stringify(cachedSettings));
+        }
+        if (cachedHistory) {
+          await evalExpr('window.__AGContextMeterHistory=' + JSON.stringify(cachedHistory));
+        }
+
+        const evalRes = await evalExpr(bundle, 8000);
+        if (evalRes && !evalRes.exceptionDetails) {
+          winEntry.injected = true;
+          report.injectedCount++;
+          try {
+            const verifyRes = await evalExpr(`(async () => {
+              const api = window.__AGContextMeter;
+              if (!api) return null;
+              if (typeof api.verifyHotReloadAndRefreshQuota === 'function') {
+                return await api.verifyHotReloadAndRefreshQuota();
+              }
+              return {
+                rendererVersion: api.version || null,
+                backendStatus: typeof api.getBackendStatusForTest === 'function' ? api.getBackendStatusForTest() : null
+              };
+            })()`, 6500);
+            const val = verifyRes?.result?.value;
+            if (val && typeof val === 'object') {
+              winEntry.rendererVersion = val.rendererVersion || pkgVersion;
+              winEntry.backendSource = val.backendSource || val.backendStatus?.backendSource || null;
+              winEntry.backendVersion = val.backendVersion || val.backendStatus?.backendVersion || null;
+              winEntry.quotaRefreshed = Boolean(val.quotaOk || val.quotaAttempted);
+              if (winEntry.backendVersion && (!pkgVersion || winEntry.backendVersion === pkgVersion)) {
+                report.backendVerified = true;
+                report.backendSource = winEntry.backendSource;
+                report.backendVersion = winEntry.backendVersion;
               }
             }
-            continue;
-          }
+          } catch { }
+        } else {
+          winEntry.error = evalRes?.exceptionDetails?.text || 'eval_failed';
         }
-        if (livePayload && liveInfo.origin === new URL(target.url).origin) {
-          await client.evaluate('window.__AGContextMeterLive=' + JSON.stringify(livePayload), { timeoutMs: 5000 });
-        }
-        if (settingsSnap) {
-          await client.evaluate('window.__AGContextMeterSettings=' + JSON.stringify(settingsSnap), { timeoutMs: 5000 });
-        }
-        if (historyData) {
-          await client.evaluate('window.__AGContextMeterHistory=' + JSON.stringify(historyData), { timeoutMs: 5000 });
-        }
-        const evalRes = await client.evaluate(bundle, { timeoutMs: 10000 });
-        if (evalRes && !evalRes.error && !evalRes.result?.exceptionDetails) {
-          injectedCount++;
-        }
-      } catch {} finally {
-        if (client) {
-          try { client.close(); } catch {}
+      } catch (e) {
+        winEntry.error = e.message;
+      } finally {
+        if (cdpClient) {
+          try { cdpClient.close(); } catch { }
         }
       }
+      report.windows.push(winEntry);
     }
-    return injectedCount > 0;
-  } catch {
-    return false;
+    report.ok = report.injectedCount > 0;
+    if (!report.ok && !report.reason) report.reason = 'injection_failed';
+    return report;
+  } catch (e) {
+    report.reason = e?.message || 'unknown_error';
+    return report;
   }
 }
 
+async function tryHotInject(options = {}) {
+  const res = await tryHotInjectDetailed(options);
+  return Boolean(res && res.ok);
+}
+
 async function install(options = {}) {
+  if (options && typeof options === 'object') {
+    if (options.path === undefined) {
+      const misnamedKey = ['asarPath', 'targetPath', 'target', 'file', 'asar'].find(k => options[k] !== undefined);
+      if (misnamedKey) {
+        throw new Error(`无效的安装选项字段 "${misnamedKey}"：请使用 { path: "<app.asar>" } 指定安装目标，已拒绝回落至默认宿主路径。`);
+      }
+    } else if (options.path !== null && (typeof options.path !== 'string' || !options.path.trim())) {
+      throw new Error('安装选项 path 必须为非空字符串。');
+    }
+  }
   const customPathIdx = process.argv.indexOf('--path');
   const customPath = options.path || (customPathIdx >= 0 ? process.argv[customPathIdx + 1] : null);
   const customBackupIdx = process.argv.indexOf('--backup');
@@ -152,7 +328,7 @@ async function install(options = {}) {
     : (fs.existsSync(legacyManifestPath) ? legacyManifestPath : null);
 
   if (activeManifestPath) {
-    try { previousManifest = JSON.parse(fs.readFileSync(activeManifestPath, 'utf8')); } catch {}
+    try { previousManifest = JSON.parse(fs.readFileSync(activeManifestPath, 'utf8')); } catch { }
   }
 
   // 获取目标文件互斥锁，避免并发改写冲突
@@ -176,7 +352,7 @@ async function install(options = {}) {
       let tHostVer = null;
       try {
         tHostVer = JSON.parse(extractAsarFile(installed, 'package.json').toString('utf8')).version;
-      } catch {}
+      } catch { }
       if (bHostVer && tHostVer && bHostVer !== tHostVer) {
         throw new Error(`指定的 --backup 宿主版本 (v${bHostVer}) 与当前目标宿主版本 (v${tHostVer}) 不匹配，拒绝跨版本还原。`);
       }
@@ -207,9 +383,9 @@ async function install(options = {}) {
       }
 
       const hasPluginTrace = currentUtilsRaw.includes('installContextMeter') ||
-                             currentUtilsRaw.includes(TAGS.METER_UTILS_START) ||
-                             currentUtilsRaw.includes(TAGS.PROXY_START) ||
-                             currentPreloadRaw.includes(TAGS.CHINESE_START);
+        currentUtilsRaw.includes(TAGS.METER_UTILS_START) ||
+        currentUtilsRaw.includes(TAGS.PROXY_START) ||
+        currentPreloadRaw.includes(TAGS.CHINESE_START);
 
       if (!hasPluginTrace) {
         // 场景 A: 纯净宿主（全新安装或宿主官方升级后，无本插件任何模块痕迹）
@@ -260,7 +436,7 @@ async function install(options = {}) {
                   bVer = JSON.parse(extractAsarFile(matchedBackup, 'package.json').toString('utf8')).version;
                   const bUtils = extractAsarFile(matchedBackup, 'dist/utils.js').toString('utf8');
                   bClean = verifyCleanStructure(bUtils);
-                } catch {}
+                } catch { }
                 if (bVer && targetHostVer && bVer === targetHostVer && bClean) {
                   sourceArchive = matchedBackup;
                   console.log(`[Installation] 已安全采信与当前宿主版本 (v${bVer}) 匹配的原版备份 (${path.basename(matchedBackup)}) 作为基底重新安装。`);
@@ -320,12 +496,23 @@ async function install(options = {}) {
     const snapshotFile = path.join(snapshotDir, `app-${version}-preinstall-${stamp}-${currentInstalledSha.slice(0, 8)}.asar`);
     fs.copyFileSync(installed, snapshotFile);
 
-    // 5. 建立长期官方原版备份（基于当前目标路径与宿主版本严格物理隔离）
+    // 5. 建立长期官方原版备份（基于当前目标路径与宿主版本严格物理隔离，若旧备份已损坏则从安全基线重建）
     const targetKey = crypto.createHash('sha256').update(path.resolve(installed)).digest('hex').slice(0, 8);
     const backup = path.join(backupDir, `app-${version}-${targetKey}-base.asar`);
 
-    if (!fs.existsSync(backup)) {
-      if (sourceArchive !== installed) {
+    const isReadableAsar = (filePath) => {
+      try {
+        if (!filePath || !fs.existsSync(filePath)) return false;
+        const pkgBuf = extractAsarFile(filePath, 'package.json');
+        const pkg = JSON.parse(pkgBuf.toString('utf8'));
+        return Boolean(pkg && pkg.name);
+      } catch {
+        return false;
+      }
+    };
+
+    if (!isReadableAsar(backup)) {
+      if (sourceArchive !== installed && isReadableAsar(sourceArchive)) {
         fs.copyFileSync(sourceArchive, backup);
       } else if (!extractAsarFile(sourceArchive, 'dist/utils.js').toString('utf8').includes('installContextMeter')) {
         fs.copyFileSync(sourceArchive, backup);
@@ -355,15 +542,8 @@ async function install(options = {}) {
       // 若用户或测试显式传入 pureMeterOnly: true 或 --pure-meter-only，则仅注入上下文监控
       const isPureMeterOnly = Boolean(options.pureMeterOnly || process.argv.includes('--pure-meter-only'));
 
-      // 模块 A: Proxy NoTun (免 TUN 代理组件注入：默认不注入已禁用的扩展模块，除非显式启用或请求)
-      const shouldInjectProxy = !isPureMeterOnly &&
-        options.injectProxy !== false &&
-        Boolean(
-          modulesConfig.modules.proxy.enabled ||
-          options.injectProxy === true ||
-          process.argv.includes('--inject-proxy') ||
-          process.argv.includes('--inject-all-modules')
-        );
+      // 模块 A: Proxy NoTun (免 TUN 代理组件注入)
+      const shouldInjectProxy = !isPureMeterOnly && (modulesConfig.modules.proxy.enabled || options.injectProxy !== false);
       if (shouldInjectProxy) {
         const proxyCode = generateProxyUtilsCode(modulesConfig.modules.proxy);
         finalUtils = proxyCode + '\n' + finalUtils;
@@ -392,16 +572,8 @@ async function install(options = {}) {
         finalPreload += generateMeterPreloadCode();
       }
 
-      // 模块 C: Chinese (桌面端界面汉化组件注入：默认不注入已禁用的汉化模块，除非显式启用或请求，或配置了非英文品牌标题)
-      const shouldInjectChinese = !isPureMeterOnly &&
-        options.injectChinese !== false &&
-        Boolean(
-          modulesConfig.modules.chinese.enabled ||
-          (modulesConfig.modules.chinese.brandTitle && modulesConfig.modules.chinese.brandTitle !== 'english') ||
-          options.injectChinese === true ||
-          process.argv.includes('--inject-chinese') ||
-          process.argv.includes('--inject-all-modules')
-        );
+      // 模块 C: Chinese (桌面端界面汉化组件注入)
+      const shouldInjectChinese = !isPureMeterOnly && (modulesConfig.modules.chinese.enabled || options.injectChinese !== false);
       if (shouldInjectChinese) {
         const homeDir = os.homedir();
         const localAppDir = process.platform === 'win32'
@@ -461,13 +633,27 @@ async function install(options = {}) {
         'meter-cli-launcher.js',
         'meter-context-unlock.js',
         'meter-enhance.js',
+        'meter-accounts.js',
+        'macos-binary-utils.js',
         'local-api.js',
         'attachment_scan.py'
       ];
+      const { PROJECT_VERSION } = require('./modules-config');
+      const pkgVersion = PROJECT_VERSION;
+
       for (const file of additions) {
         const srcP = path.join(__dirname, file);
         if (fs.existsSync(srcP) && !fs.statSync(srcP).isDirectory()) {
-          fs.copyFileSync(srcP, path.join(staging, 'dist', file));
+          if (file === 'modules-config.js' && pkgVersion) {
+            const rawModCfg = fs.readFileSync(srcP, 'utf8');
+            const syncedModCfg = rawModCfg.replace(
+              /const FALLBACK_PROJECT_VERSION = '[^']*';/,
+              `const FALLBACK_PROJECT_VERSION = '${String(pkgVersion).replace(/'/g, '')}';`
+            );
+            fs.writeFileSync(path.join(staging, 'dist', file), syncedModCfg, 'utf8');
+          } else {
+            fs.copyFileSync(srcP, path.join(staging, 'dist', file));
+          }
         } else {
           const inStaging = path.join(staging, 'dist', file);
           if (!fs.existsSync(inStaging)) {
@@ -487,14 +673,16 @@ async function install(options = {}) {
         }
       }
 
-      const originalEntries = asar.listPackage(sourceArchive);
-      const hasUnpacked = originalEntries.some(file => {
-        const s = asar.statFile(sourceArchive, file.slice(1));
-        return s && s.unpacked;
-      });
+      fs.writeFileSync(path.join(staging, 'dist', 'meter-manifest.json'), JSON.stringify({
+        version: pkgVersion,
+        hostVersion: version,
+        updatedAt: new Date().toISOString()
+      }, null, 2), 'utf8');
 
-      if (hasUnpacked) {
-        await builtinAsar.createPackageWithOptions(staging, packed, { unpackDir: '**/chrome-devtools-mcp' });
+      const originalEntries = asar.listPackage(sourceArchive);
+      const unpackedPaths = collectUnpackedPaths(asar, sourceArchive);
+      if (unpackedPaths.size > 0) {
+        await builtinAsar.createPackageWithOptions(staging, packed, { unpackedPaths });
       } else {
         await builtinAsar.createPackageWithOptions(staging, packed, {});
       }
@@ -503,19 +691,35 @@ async function install(options = {}) {
       const allowedChanges = [
         'dist/utils.js',
         'dist/preload.js',
+        'dist/meter-manifest.json',
         'dist/i18n/zh-CN.json',
         'dist/i18n/i18n-runtime.js',
         ...additions.map(f => 'dist/' + f)
       ].map(p => path.normalize(p));
       for (const file of originalEntries) {
         const name = path.normalize(file.slice(1));
-        const before = asar.statFile(sourceArchive, name);
-        const after = asar.statFile(packed, name);
-        if (before.files || before.link) continue;
+        let before = null;
+        let after = null;
+        try { before = asar.statFile(sourceArchive, name); } catch {}
+        try { after = asar.statFile(packed, name); } catch {}
+        if (!before || before.files || before.link) continue;
+        if (!after) throw new Error(`Target missing file after pack: ${name}`);
         if (!!before.unpacked !== !!after.unpacked) throw new Error(`Unpack flag changed: ${name}`);
         const isAllowed = allowedChanges.includes(name) || name.startsWith('dist' + path.sep + 'i18n' + path.sep);
-        if (!isAllowed && sha(asar.extractFile(sourceArchive, name)) !== sha(asar.extractFile(packed, name))) {
-          throw new Error(`Unexpected file change: ${name}`);
+        if (!isAllowed) {
+          if (!before.unpacked) {
+            if (sha(asar.extractFile(sourceArchive, name)) !== sha(asar.extractFile(packed, name))) {
+              throw new Error(`Unexpected file change: ${name}`);
+            }
+          } else {
+            let bBuf = null;
+            let aBuf = null;
+            try { bBuf = builtinAsar.extractFile(sourceArchive, name); } catch {}
+            try { aBuf = builtinAsar.extractFile(packed, name); } catch {}
+            if (bBuf && aBuf && sha(bBuf) !== sha(aBuf)) {
+              throw new Error(`Unexpected unpacked file change: ${name}`);
+            }
+          }
         }
         verified++;
       }
@@ -525,19 +729,18 @@ async function install(options = {}) {
         ? previousManifest.previousInstalledBackup
         : path.join(backupDir, `pre-meter-${version}-${targetKey}.asar`);
 
-      if (fs.existsSync(backup) && !fs.existsSync(previousInstalledBackup)) {
-        try { fs.copyFileSync(backup, previousInstalledBackup); } catch {}
+      if (isReadableAsar(backup) && !isReadableAsar(previousInstalledBackup)) {
+        try { fs.copyFileSync(backup, previousInstalledBackup); } catch { }
       }
-      const previousInstalledSha256 = fs.existsSync(previousInstalledBackup) ? sha(fs.readFileSync(previousInstalledBackup)) : null;
-      const origSha = fs.existsSync(backup) ? sha(fs.readFileSync(backup)) : (previousInstalledSha256 || previousManifest?.originalSha256);
-
-      const { PROJECT_VERSION } = require('./modules-config');
-      const pkgVersion = PROJECT_VERSION;
+      const previousInstalledSha256 = isReadableAsar(previousInstalledBackup) ? sha(fs.readFileSync(previousInstalledBackup)) : null;
+      const origSha = isReadableAsar(backup) ? sha(fs.readFileSync(backup)) : (previousInstalledSha256 || previousManifest?.originalSha256);
 
       const manifest = {
         meterVersion: pkgVersion,
         version,
         installed,
+        installerDir: __dirname,
+        cliPath: path.join(__dirname, 'cli.js'),
         backup,
         previousInstalledBackup,
         previousInstalledSha256,
@@ -570,7 +773,7 @@ async function install(options = {}) {
           }
           throw err;
         } finally {
-          try { if (fs.existsSync(tempReplacement)) fs.unlinkSync(tempReplacement); } catch {}
+          try { if (fs.existsSync(tempReplacement)) fs.unlinkSync(tempReplacement); } catch { }
         }
 
         if (sha(fs.readFileSync(installed)) !== manifest.patchedSha256) {
@@ -594,7 +797,7 @@ async function install(options = {}) {
         if (extractedLauncher.includes("spawnSync('powershell.exe'") || extractedLauncher.includes('timeout: 8000')) {
           throw new Error('ASAR 内仍然残留旧版同步 PowerShell 启动逻辑，拒绝完成安装！');
         }
-        if (!extractedLauncher.includes('0.8.3-helper-v2')) {
+        if (!extractedLauncher.includes('0.8.4-helper-v2')) {
           throw new Error('ASAR 内未包含最新的 LAUNCHER_VERSION 标识，拒绝完成安装！');
         }
 
@@ -635,7 +838,7 @@ async function install(options = {}) {
           if (fs.existsSync(resBinDir)) {
             try {
               fs.copyFileSync(helperSrc, path.join(resBinDir, 'cli-window-helper.exe'));
-            } catch {}
+            } catch { }
           }
         }
 
@@ -647,8 +850,12 @@ async function install(options = {}) {
         fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 
         installCommitted = true;
-        const liveInjected = await tryHotInject();
-        return { ...manifest, liveInjected };
+        try {
+          const { syncLiveRuntimeBundle } = require('./meter-collector');
+          syncLiveRuntimeBundle(__dirname, { version: manifest.meterVersion });
+        } catch { }
+        const hotInjectReport = await tryHotInjectDetailed(options.hotInjectOptions || {});
+        return { ...manifest, liveInjected: hotInjectReport.ok, hotInjectReport };
       } catch (err) {
         // 失败回滚机制：若在改写目标后发生任何校验或保存异常，立即从快照无损回滚还原
         if (!installCommitted && fs.existsSync(snapshotFile)) {
@@ -663,12 +870,36 @@ async function install(options = {}) {
         throw err;
       }
     } finally {
-      try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
-      try { fs.rmSync(packed, { force: true }); } catch {}
-      try { fs.rmSync(packed + '.unpacked', { recursive: true, force: true }); } catch {}
+      try { fs.rmSync(staging, { recursive: true, force: true }); } catch { }
+      try { fs.rmSync(packed, { force: true }); } catch { }
+      try { fs.rmSync(packed + '.unpacked', { recursive: true, force: true }); } catch { }
     }
   } finally {
     fileLock.release();
+  }
+}
+
+function getRendererBuildId(filePath = null) {
+  try {
+    const p = filePath || path.join(__dirname, 'meter-renderer.js');
+    if (!fs.existsSync(p)) return null;
+    return sha(fs.readFileSync(p)).slice(0, 12);
+  } catch {
+    return null;
+  }
+}
+
+function getWatchBundleBuildId(baseDir = null) {
+  try {
+    const root = baseDir || __dirname;
+    const h = crypto.createHash('sha256');
+    for (const f of ['meter-core.js', 'meter-renderer.js', 'live-host.js', 'meter-collector.js', 'meter-storage.js', 'meter-proxy.js', 'meter-cli-launcher.js', 'meter-context-unlock.js', 'meter-enhance.js', 'meter-accounts.js', 'macos-binary-utils.js', 'local-api.js', 'modules-config.js', 'asar-engine.js', 'package.json']) {
+      const p = path.join(root, f);
+      if (fs.existsSync(p)) h.update(f + ':').update(fs.readFileSync(p));
+    }
+    return h.digest('hex').slice(0, 12);
+  } catch {
+    return null;
   }
 }
 
@@ -681,4 +912,15 @@ if (require.main === module) {
     });
 }
 
-module.exports = { install, findAsarPath, tryHotInject, extractAsarFile };
+module.exports = {
+  install,
+  findAsarPath,
+  tryHotInject,
+  tryHotInjectDetailed,
+  probeLiveHostRuntimeInfo,
+  shutdownLiveHostGracefully,
+  extractAsarFile,
+  getRendererBuildId,
+  getHostCoreBuildId,
+  getWatchBundleBuildId
+};

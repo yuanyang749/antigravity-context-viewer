@@ -331,6 +331,7 @@ test('savePluginSettings & getPluginSettings: panelLanguage 白名单校验、�
   }
 });
 
+
 test('recordModelCalls & loadPricingLedger: 显式 agDir 与默认 AG_DIR 交替写入绝不相互覆盖（A -> A+B -> A+B+C）', async () => {
   const { collectTokenHistoryAsync } = require('./meter-collector');
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-ledger-interleave-'));
@@ -640,6 +641,183 @@ test('loadPricingLedger: 读取前后 statSync (mtimeMs / size) 发生变化时�
     assert.equal(secondRead.calls['call-v2-concurrent'].totalTokens, 999);
   } finally {
     fs.readFileSync = origReadFileSync;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('meter-proxy & modules-config: modules.json 优先于遗留 proxy.json，关闭与改端口不被旧配置覆盖', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-proxy-prio-'));
+  const prevLocalApp = process.env.LOCALAPPDATA;
+  const prevXdgState = process.env.XDG_STATE_HOME;
+  const prevMeterState = process.env.AG_METER_STATE_DIR;
+  try {
+    const stateRoot = path.join(tempDir, 'AntigravityContextMeter');
+    fs.mkdirSync(stateRoot, { recursive: true });
+    process.env.AG_METER_STATE_DIR = stateRoot;
+    if (process.platform === 'win32') process.env.LOCALAPPDATA = tempDir;
+    else process.env.XDG_STATE_HOME = tempDir;
+
+    // 同时存在历史遗留 proxy.json（启用 7897）与新统一 modules.json（关闭，端口 17890）
+    fs.writeFileSync(path.join(stateRoot, 'proxy.json'), JSON.stringify({
+      enabled: true,
+      httpProxy: 'http://127.0.0.1:7897',
+      allProxy: 'socks5://127.0.0.1:7897'
+    }), 'utf8');
+    fs.writeFileSync(path.join(stateRoot, 'modules.json'), JSON.stringify({
+      schemaVersion: 1,
+      modules: {
+        proxy: {
+          enabled: false,
+          proxyUrl: 'http://127.0.0.1:17890',
+          bypassList: 'localhost,127.0.0.1'
+        }
+      }
+    }), 'utf8');
+
+    const cands = getProxyCandidatePaths();
+    assert.equal(path.basename(cands[0]), 'modules.json', 'modules.json 必须排在历史 proxy.json 之前');
+    const detected = detectProxyConfig();
+    assert.equal(detected.enabled, false, '禁用状态不得被旧 proxy.json 的 enabled:true 覆盖');
+    assert.equal(detected.detected, true);
+    assert.equal(path.resolve(detected.configPath), path.resolve(path.join(stateRoot, 'modules.json')));
+
+    // 重新开启 modules.json 代理，env 注入应读取新端口 17890 而非 7897
+    const cfg = JSON.parse(fs.readFileSync(path.join(stateRoot, 'modules.json'), 'utf8'));
+    cfg.modules.proxy.enabled = true;
+    fs.writeFileSync(path.join(stateRoot, 'modules.json'), JSON.stringify(cfg, null, 2), 'utf8');
+    const targetEnv = {};
+    applyProxyEnvironment(targetEnv);
+    assert.equal(targetEnv.HTTPS_PROXY, 'http://127.0.0.1:17890');
+    assert.equal(targetEnv.ALL_PROXY, 'http://127.0.0.1:17890');
+  } finally {
+    if (prevMeterState === undefined) delete process.env.AG_METER_STATE_DIR; else process.env.AG_METER_STATE_DIR = prevMeterState;
+    if (prevLocalApp === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = prevLocalApp;
+    if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prevXdgState;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('testProxyHealth: 协议/端口边界校验与 HTTP/SOCKS5 分层连通性探测（modelCallVerified 绝不虚报）', async () => {
+  const http = require('http');
+  const net = require('net');
+  const { testProxyHealth } = require('./modules-config');
+
+  // 1. 非法协议与空地址校验
+  const badEmpty = await testProxyHealth('');
+  assert.equal(badEmpty.configValid, false);
+  const badProto = await testProxyHealth('ftp://127.0.0.1:7897');
+  assert.equal(badProto.configValid, false);
+  const badPort = await testProxyHealth('http://127.0.0.1:99999');
+  assert.equal(badPort.configValid, false);
+
+  // 2. HTTP 代理端口可达 + 外网通 vs 端口可达但外网不通
+  const httpProxy = http.createServer((req, res) => {
+    res.writeHead(req.url.includes('generate_204') ? 204 : 502);
+    res.end();
+  });
+  httpProxy.on('connect', (_req, socket) => {
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.end();
+  });
+  await new Promise((r) => httpProxy.listen(0, '127.0.0.1', r));
+
+  const deadOnlineProxy = http.createServer((_req, res) => {
+    res.writeHead(502);
+    res.end();
+  });
+  deadOnlineProxy.on('connect', (_req, socket) => {
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.end();
+  });
+  await new Promise((r) => deadOnlineProxy.listen(0, '127.0.0.1', r));
+
+  // 3. 本地 SOCKS5 模拟服务器（greeting + CONNECT + generate_204）
+  const socksProxy = net.createServer((sock) => {
+    let stage = 0;
+    sock.on('data', () => {
+      if (stage === 0) {
+        stage = 1;
+        sock.write(Buffer.from([0x05, 0x00]));
+      } else if (stage === 1) {
+        stage = 2;
+        sock.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 80]));
+      } else if (stage === 2) {
+        stage = 3;
+        sock.write('HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n');
+        sock.end();
+      }
+    });
+  });
+  await new Promise((r) => socksProxy.listen(0, '127.0.0.1', r));
+
+  try {
+    const httpPort = httpProxy.address().port;
+    const rHttp = await testProxyHealth(`http://127.0.0.1:${httpPort}`);
+    assert.equal(rHttp.configValid, true);
+    assert.equal(rHttp.proxyReachable, true);
+    assert.equal(rHttp.internetReachable, true);
+    assert.equal(rHttp.modelCallVerified, false);
+
+    const deadPort = deadOnlineProxy.address().port;
+    const rDeadNet = await testProxyHealth(`http://127.0.0.1:${deadPort}`);
+    assert.equal(rDeadNet.configValid, true);
+    assert.equal(rDeadNet.proxyReachable, true);
+    assert.equal(rDeadNet.internetReachable, false);
+    assert.equal(rDeadNet.modelCallVerified, false);
+
+    const socksPort = socksProxy.address().port;
+    const rSocks = await testProxyHealth(`socks5://127.0.0.1:${socksPort}`);
+    assert.equal(rSocks.configValid, true);
+    assert.equal(rSocks.proxyReachable, true);
+    assert.equal(rSocks.internetReachable, true);
+    assert.equal(rSocks.modelCallVerified, false);
+  } finally {
+    await Promise.all([
+      new Promise((r) => httpProxy.close(r)),
+      new Promise((r) => deadOnlineProxy.close(r)),
+      new Promise((r) => socksProxy.close(r))
+    ]);
+  }
+});
+
+test('meter-main.js 模块 IPC: 跨平台提示无 install.bat、代理校验与品牌热更 restartRequired 区分', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-ipc-mod-'));
+  const prevLocalApp = process.env.LOCALAPPDATA;
+  const prevXdgState = process.env.XDG_STATE_HOME;
+  const prevMeterState = process.env.AG_METER_STATE_DIR;
+  const origPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  try {
+    process.env.AG_METER_STATE_DIR = path.join(tempDir, 'AntigravityContextMeter');
+    if (process.platform === 'win32') process.env.LOCALAPPDATA = tempDir;
+    else process.env.XDG_STATE_HOME = tempDir;
+
+    const handlers = {};
+    const mockIpc = { handle: (ch, fn) => { handlers[ch] = fn; } };
+    const { registerMeterIpcHandlers } = require('./meter-main');
+    registerMeterIpcHandlers(mockIpc, {});
+    const localFrame = { url: 'https://127.0.0.1:5173/' };
+    const localEv = { senderFrame: localFrame, sender: { mainFrame: localFrame } };
+
+    // 1. 在 macOS 下请求开启未注入组件时，不得出现 install.bat 字样
+    Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    const fakeUninjectedAsar = path.join(tempDir, 'empty.asar');
+    const modResMac = await handlers['context-meter:toggle-module'](localEv, 'proxy', true, { asarPath: fakeUninjectedAsar });
+    assert.equal(modResMac.ok, false);
+    assert.equal(modResMac.status, 'install_failed');
+    assert.doesNotMatch(modResMac.error, /install\.bat/);
+    assert.match(modResMac.error, /node cli\.js proxy:enable/);
+
+    // 2. status 返回包含 runtime 元数据
+    const statusRes = await handlers['context-meter:modules-status'](localEv, fakeUninjectedAsar);
+    assert.equal(statusRes.ok, true);
+    assert.equal(typeof statusRes.runtime, 'object');
+    assert.equal(typeof statusRes.runtime.proxyActive, 'boolean');
+    assert.equal(typeof statusRes.runtime.proxyNeedsRestart, 'boolean');
+  } finally {
+    if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
+    if (prevMeterState === undefined) delete process.env.AG_METER_STATE_DIR; else process.env.AG_METER_STATE_DIR = prevMeterState;
+    if (prevLocalApp === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = prevLocalApp;
+    if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prevXdgState;
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

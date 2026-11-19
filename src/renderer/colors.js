@@ -128,17 +128,23 @@
   function normalizeHex(input) {
     if (!input || typeof input !== 'string') return null;
     const s = input.trim();
-    if (!s || s.toLowerCase() === 'transparent') return null;
+    if (!s || /^transparent$/i.test(s)) return null;
     const direct = hexToRgb(s);
     if (direct) return rgbToHex(direct.r, direct.g, direct.b);
-    const mRgb = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*[,/]\s*([\d.]+))?\s*\)/i);
+    const mRgb = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*[,/]\s*([\d.]+%?))?/i);
     if (mRgb) {
-      if (mRgb[4] !== undefined && Number(mRgb[4]) <= 0) return null;
+      if (mRgb[4] !== undefined) {
+        const alphaRaw = mRgb[4].endsWith('%') ? Number(mRgb[4].slice(0, -1)) / 100 : Number(mRgb[4]);
+        if (!Number.isNaN(alphaRaw) && alphaRaw <= 0.01) return null;
+      }
       return rgbToHex(Number(mRgb[1]), Number(mRgb[2]), Number(mRgb[3]));
     }
-    const mHsl = s.match(/hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%?\s*,\s*([\d.]+)%?(?:\s*[,/]\s*([\d.]+))?\s*\)/i);
+    const mHsl = s.match(/hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%?\s*,\s*([\d.]+)%?(?:\s*[,/]\s*([\d.]+%?))?/i);
     if (mHsl) {
-      if (mHsl[4] !== undefined && Number(mHsl[4]) <= 0) return null;
+      if (mHsl[4] !== undefined) {
+        const alphaRaw = mHsl[4].endsWith('%') ? Number(mHsl[4].slice(0, -1)) / 100 : Number(mHsl[4]);
+        if (!Number.isNaN(alphaRaw) && alphaRaw <= 0.01) return null;
+      }
       const rgb = hslToRgb(Number(mHsl[1]), Number(mHsl[2]), Number(mHsl[3]));
       return rgbToHex(rgb.r, rgb.g, rgb.b);
     }
@@ -234,11 +240,9 @@
             const norm = normalizeHex(raw);
             if (!norm) continue;
             const lum = parseRgbLuminance(norm);
-            if (lum == null) continue;
-            // 当宿主 0 级背景明度与当前选定的浅/深色主题冲突时，干净回退至标准默认背景色 (#ffffff / #181818)
-            if (isLight && lum <= 0.55) return fallback;
-            if (!isLight && lum > 0.55) return fallback;
-            return norm;
+            const normIsLight = lum != null ? lum > 0.55 : Boolean(isLight);
+            if (normIsLight === Boolean(isLight)) return norm;
+            return fallback;
           }
         }
       }
@@ -413,6 +417,60 @@
     }
   }
 
+  function getContinuousScaleStops() {
+    const scale = getEffectiveHeatmapScale();
+    const isLight = typeof resolveEffectiveTheme === 'function' && resolveEffectiveTheme() === 'light';
+    const hasCustomHeat = Boolean(
+      customColors.heatLow ||
+      customColors.heatHigh ||
+      customColors.heatLvl1 ||
+      customColors.heatLvl2 ||
+      customColors.heatLvl3 ||
+      customColors.heatLvl4
+    );
+    if (!isLight && heatPreset === 'purple' && !hasCustomHeat) {
+      return ['#2E1A47', '#6D28D9', '#9333EA', '#D8B4FE'];
+    }
+    return [scale[1], scale[2], scale[3], scale[4]].filter(Boolean);
+  }
+
+  function getContinuousHeatColor(value, modeOrAnchor = 'heat') {
+    const v = Number(value) || 0;
+    if (v <= 0) return null;
+    const core = globalThis.__AGContextMeterCore || {};
+    let resp = 0;
+    if (typeof modeOrAnchor === 'string') {
+      resp = typeof core.computeColorScaleResponse === 'function'
+        ? core.computeColorScaleResponse(v, modeOrAnchor)
+        : (typeof core.computeMixedScaleResponse === 'function' ? core.computeMixedScaleResponse(v, 100e6) : 0.5);
+    } else {
+      const anchor = Number(modeOrAnchor) || 100e6;
+      resp = typeof core.computeMixedScaleResponse === 'function'
+        ? core.computeMixedScaleResponse(v, anchor)
+        : Math.max(0, Math.min(1, Math.pow(Math.min(v, anchor) / anchor, 0.42)));
+    }
+    const stops = getContinuousScaleStops();
+    if (typeof core.interpolateScaleColorHsl === 'function') {
+      return core.interpolateScaleColorHsl(resp, stops);
+    }
+    return stops[stops.length - 1] || '#9333ea';
+  }
+
+  let __chartsReady = false;
+
+  function refreshActiveChartViews() {
+    if (!__chartsReady) return;
+    if (activeHeatView === 'daily' && typeof renderHeatmapGrid === 'function') renderHeatmapGrid(true);
+    else if (activeHeatView === 'weekly' && typeof renderHeatmapWeekly === 'function') renderHeatmapWeekly();
+    else if (activeHeatView === 'monthly' && typeof renderHeatmapMonthly === 'function') renderHeatmapMonthly();
+    else if (activeHeatView === 'yearly' && typeof renderHeatmapYearly === 'function') renderHeatmapYearly();
+    else if (activeHeatView === 'cum' && typeof renderHeatmapCum === 'function') renderHeatmapCum();
+    const modelViewEl = el('model-usage-view');
+    if (modelViewEl && modelViewEl.style && modelViewEl.style.display === 'block' && typeof renderModelUsageView === 'function') {
+      renderModelUsageView();
+    }
+  }
+
   function applyCustomColors() {
     for (const [key, cssVar] of Object.entries(COLOR_SLOTS)) {
       const val = customColors[key];
@@ -434,8 +492,7 @@
     }
     applyHeatmapPalette();
     syncSwatchAndResetButtons();
-    if (activeHeatView === 'weekly') renderHeatmapWeekly();
-    else if (activeHeatView === 'cum') renderHeatmapCum();
+    refreshActiveChartViews();
   }
 
   function setCustomColor(key, value) {
@@ -498,8 +555,7 @@
     });
     applyHeatmapPalette();
     syncSwatchAndResetButtons();
-    if (activeHeatView === 'weekly') renderHeatmapWeekly();
-    else if (activeHeatView === 'cum') renderHeatmapCum();
+    refreshActiveChartViews();
     syncNativeOverlayTheme();
   }
 
@@ -619,20 +675,21 @@
           }
         }
       }
-      let left = Math.round((vw - popW) / 2);
+      const snapPx = typeof snapToDevicePixel === 'function' ? snapToDevicePixel : Math.round;
+      let left = snapPx((vw - popW) / 2);
       let top = 90;
       if (activePickerAnchor?.getBoundingClientRect) {
         const ar = activePickerAnchor.getBoundingClientRect();
         if (ar.width > 0 || ar.height > 0) {
-          left = Math.round(ar.right - popW);
-          top = Math.round(ar.bottom + 6);
+          left = snapPx(ar.right - popW);
+          top = snapPx(ar.bottom + 6);
           if (top + popH > vh - 12 && ar.top > popH + 12) {
-            top = Math.round(ar.top - popH - 6);
+            top = snapPx(ar.top - popH - 6);
           }
         }
       }
-      left = Math.max(minLeft, Math.min(vw - popW - 12, left));
-      top = Math.max(42, Math.min(vh - popH - 12, top));
+      left = snapPx(Math.max(minLeft, Math.min(vw - popW - 12, left)));
+      top = snapPx(Math.max(42, Math.min(vh - popH - 12, top)));
       pop.style.left = `${left}px`;
       pop.style.top = `${top}px`;
     } catch {}

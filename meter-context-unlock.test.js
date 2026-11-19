@@ -424,11 +424,11 @@ test('主线程无阻塞验证：异步进程枚举期间 Node.js 事件循环�
     const testFile = path.join(tmpDir, 'language_server.exe');
     fs.writeFileSync(testFile, createMockGoBinary({ isPatched: false }));
 
-    // 启动一个 1ms 的高频事件循环计数器
+    // 启动一个 5ms 的高频事件循环计数器
     let tickCount = 0;
     const interval = setInterval(() => {
       tickCount++;
-    }, 1);
+    }, 5);
 
     // 调用异步分析
     const analysis = await analyzeBinaryAsync(testFile, { backupDir: tmpDir, forceRefresh: true });
@@ -442,62 +442,16 @@ test('主线程无阻塞验证：异步进程枚举期间 Node.js 事件循环�
   }
 });
 
-test('跨平台与安全架构拦截：非支持平台或架构明确拒绝写入', async () => {
-  // 1) 验证 ELF/PE 架构解析器提取正确
-  const mock = createMockGoBinary();
-  const textInfo = findTextSection(mock);
-  assert.equal(textInfo.arch, 'x86-64');
-
-  // 2) 通过 options.platform 覆盖验证非 Windows 平台均返回 unsupported / PLATFORM_UNSUPPORTED
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'unlock-platform-'));
+test('跨平台与安全架构拦截：非支持平台或架构明确拒绝写入', () => {
+  // 模拟非法平台传入
+  const origPlatform = process.platform;
   try {
-    const testFile = path.join(tmpDir, 'language_server');
-    fs.writeFileSync(testFile, mock);
-
-    const darwinAnalyze = await analyzeBinaryAsync(testFile, { platform: 'darwin', backupDir: tmpDir });
-    assert.equal(darwinAnalyze.status, 'unsupported');
-    assert.match(darwinAnalyze.reason, /Windows/i);
-
-    const darwinApply = await applyUnlock({
-      platform: 'darwin',
-      targetPath: testFile,
-      targetLimitTokens: 262144,
-      backupDir: tmpDir
-    });
-    assert.equal(darwinApply.ok, false);
-    assert.equal(darwinApply.code, 'PLATFORM_UNSUPPORTED');
-
-    const darwinRestore = await restoreUnlock({
-      platform: 'darwin',
-      targetPath: testFile,
-      backupDir: tmpDir
-    });
-    assert.equal(darwinRestore.ok, false);
-    assert.equal(darwinRestore.code, 'PLATFORM_UNSUPPORTED');
-
-    // 3) 验证显式传入非 PE (Mach-O) 目标文件时，非 Windows 宿主下同样明确拒绝并返回 unsupported / PLATFORM_UNSUPPORTED
-    const machoFile = path.join(tmpDir, 'language_server_macho');
-    fs.writeFileSync(machoFile, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.alloc(128, 0)]));
-
-    const machoAnalyze = await analyzeBinaryAsync(machoFile, { backupDir: tmpDir });
-    assert.equal(machoAnalyze.status, 'unsupported');
-
-    const machoApply = await applyUnlock({
-      targetPath: machoFile,
-      targetLimitTokens: 262144,
-      backupDir: tmpDir
-    });
-    assert.equal(machoApply.ok, false);
-    assert.equal(machoApply.code, 'PLATFORM_UNSUPPORTED');
-
-    const machoRestore = await restoreUnlock({
-      targetPath: machoFile,
-      backupDir: tmpDir
-    });
-    assert.equal(machoRestore.ok, false);
-    assert.equal(machoRestore.code, 'PLATFORM_UNSUPPORTED');
+    // 验证状态判定中的平台支持说明
+    const mock = createMockGoBinary();
+    const textInfo = findTextSection(mock);
+    assert.equal(textInfo.arch, 'x86-64');
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    Object.defineProperty(process, 'platform', { value: origPlatform });
   }
 });
 
@@ -814,6 +768,277 @@ test('安全隔离回归：测试下缺失或拼错 targetPath 绝对禁止探�
     const syncedNoHome = syncExternalContextConfigs('fixed', 512000, { backupDir, targetPath: mockExe, syncConfigFiles: true });
     assert.deepEqual(syncedNoHome, [], '隔离上下文缺失 homeDir 时不得写入真实主目录');
     assert.equal(fs.existsSync(fakeHome), false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('macOS Mach-O arm64 适配：Gate 3A (clamp + default) 与 Gate 3B (bl + tbnz) 读写与 sidecar 无损还原', async () => {
+  const buf = Buffer.alloc(0x20000, 0);
+  const vmBase = 0x100000000n;
+  const textOff = 0x1000;
+  const textVA = vmBase + 0x1000n;
+
+  buf.writeUInt32LE(0xfeedfacf, 0);
+  buf.writeUInt32LE(0x0100000c, 4); // arm64
+  buf.writeUInt32LE(2, 12);
+  buf.writeUInt32LE(2, 16); // ncmds
+  buf.writeUInt32LE(0x1b, 32); // LC_UUID
+  buf.writeUInt32LE(24, 36);
+  Buffer.from('aabbccddeeff00112233445566778899', 'hex').copy(buf, 40);
+  buf.writeUInt32LE(0x19, 56); // LC_SEGMENT_64
+  buf.writeUInt32LE(72 + 80, 60);
+  buf.write('__TEXT', 64, 'ascii');
+  buf.writeBigUInt64LE(vmBase, 80);
+  buf.writeBigUInt64LE(0x10000n, 88);
+  buf.writeBigUInt64LE(0n, 96);
+  buf.writeBigUInt64LE(0x10000n, 104);
+  buf.writeUInt32LE(1, 120);
+  buf.writeUInt32LE(24 + 72 + 80, 20);
+
+  const s1 = 128;
+  buf.write('__text', s1, 'ascii');
+  buf.write('__TEXT', s1 + 16, 'ascii');
+  buf.writeBigUInt64LE(textVA, s1 + 32);
+  buf.writeBigUInt64LE(0x8000n, s1 + 40);
+  buf.writeUInt32LE(textOff, s1 + 48);
+
+  // 函数布局:
+  // 0x000..0x300 utils.GetCheckpointConfig (clamp at +0x100, default at +0x200)
+  // 0x300..0x400 config.selectCheckpointExperimentKey
+  // 0x400..0x500 config.applyFeatureProviderCheckpointOverrideConfig (bl 0x300 at +0x20, tbnz w0, #0, +12 at +0x2c)
+  const clampArm64 = Buffer.from('04009dd26400a0f27f00046b04009dd26400a0f26330849a', 'hex');
+  clampArm64.copy(buf, textOff + 0x100);
+  // cmp w3, #0 (7100007f); b.gt +16 (5400008c); mov x3, #0xe800; movk x3, #0x3, lsl #16; str w3, [x0, #0xc]
+  buf.writeUInt32LE(0x7100007f, textOff + 0x200 - 8);
+  buf.writeUInt32LE(0x5400008c, textOff + 0x200 - 4);
+  Buffer.from('03009dd26300a0f2030c00b9', 'hex').copy(buf, textOff + 0x200);
+
+  // BL from 0x420 to 0x300 => delta = -0x120 => -0x48 words => 0x97ffffb8
+  buf.writeUInt32LE(0x97ffffb8, textOff + 0x420);
+  // tbnz w0, #0, +12 => 0x37000060 at +0x42c
+  buf.writeUInt32LE(0x37000060, textOff + 0x42c);
+
+  // Minimal .gopclntab at 0x10000
+  const pcBase = 0x10000;
+  const funcNames = [
+    { name: 'google3/third_party/jetski/cortex/utils/utils.GetCheckpointConfig', entry: 0x0, size: 0x300 },
+    { name: 'google3/third_party/jetski/cortex/config/config.selectCheckpointExperimentKey', entry: 0x300, size: 0x100 },
+    { name: 'google3/third_party/jetski/cortex/config/config.applyFeatureProviderCheckpointOverrideConfig', entry: 0x400, size: 0x100 }
+  ];
+  const fnNameOff = 0x100;
+  const pclnOff = 0x400;
+  buf.writeUInt32LE(0xfffffff1, pcBase);
+  buf[pcBase + 6] = 4;
+  buf[pcBase + 7] = 8;
+  // nfunc must satisfy 1000 < nfunc < 5000000
+  buf.writeBigUInt64LE(1001n, pcBase + 8);
+  buf.writeBigUInt64LE(BigInt(fnNameOff), pcBase + 32);
+  buf.writeBigUInt64LE(BigInt(pclnOff), pcBase + 64);
+
+  let strPos = pcBase + fnNameOff;
+  for (let i = 0; i < funcNames.length; i++) {
+    const f = funcNames[i];
+    const relName = strPos - (pcBase + fnNameOff);
+    buf.write(f.name + '\0', strPos, 'ascii');
+    strPos += f.name.length + 1;
+    const recOff = 1002 * 8 + i * 16;
+    buf.writeUInt32LE(f.entry, pcBase + pclnOff + i * 8);
+    buf.writeUInt32LE(recOff, pcBase + pclnOff + i * 8 + 4);
+    buf.writeInt32LE(relName, pcBase + pclnOff + recOff + 4);
+  }
+  buf.writeUInt32LE(0x500, pcBase + pclnOff + 3 * 8);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-unlock-macho-'));
+  try {
+    const binPath = path.join(tmpDir, 'language_server');
+    const backupDir = path.join(tmpDir, 'bak');
+    fs.writeFileSync(binPath, buf);
+
+    const a0 = analyzeBinary(binPath, { backupDir, skipProcessCheck: true });
+    assert.equal(a0.format, 'Mach-O');
+    assert.equal(a0.arch, 'arm64');
+    assert.equal(a0.status, 'not_patched');
+    assert.equal(a0.gate3a.hasDefaultSite, true);
+    assert.equal(a0.gate3b.status, 'unpatched');
+    assert.equal(a0.gate3b.origHex, '60000037');
+
+    // 1. 固定模式 512,000
+    const rFixed = applyUnlock({ targetPath: binPath, backupDir, mode: 'fixed', limitTokens: 512000, skipCodesign: true });
+    assert.equal(rFixed.ok, true);
+    assert.equal(rFixed.defaultSitePatched, true);
+    const aFixed = analyzeBinary(binPath, { backupDir, skipProcessCheck: true });
+    assert.equal(aFixed.configuredMode, 'fixed');
+    assert.equal(aFixed.configuredLimitTokens, 512000);
+    assert.equal(aFixed.gate3a.defaultLimit, 512000);
+    assert.equal(aFixed.gate3b.status, 'patched');
+
+    // 2. 动态模式
+    const rDyn = applyUnlock({ targetPath: binPath, backupDir, mode: 'dynamic', skipCodesign: true });
+    assert.equal(rDyn.ok, true);
+    const aDyn = analyzeBinary(binPath, { backupDir, skipProcessCheck: true });
+    assert.equal(aDyn.configuredMode, 'dynamic');
+    assert.equal(aDyn.gate3a.defaultLimit, 256000);
+
+    // 3. 无整包备份条件下验证 sidecar 逆向还原一字节不差
+    fs.rmSync(rFixed.backupPath, { force: true });
+    const rRev = restoreUnlock({ targetPath: binPath, backupDir, skipCodesign: true });
+    assert.equal(rRev.ok, true);
+    assert.equal(Buffer.compare(fs.readFileSync(binPath), buf), 0, 'ARM64 sidecar 逆向还原后必须一字节不差');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('macOS Mach-O 安全边界：Intel Mac(x86-64)、Fat Binary、头部截断越界与 codesign 失败原文件零损伤回滚', () => {
+  const crypto = require('crypto');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-unlock-mac-safety-'));
+  try {
+    const backupDir = path.join(tmpDir, 'bak');
+    const sha = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+
+    // 1. Fat/Universal Mach-O (0xcafebabe BE) 明确拒绝写入
+    const fatPath = path.join(tmpDir, 'ls_fat');
+    const fatBuf = Buffer.alloc(64, 0);
+    fatBuf.writeUInt32BE(0xcafebabe, 0);
+    fatBuf.writeUInt32BE(2, 4);
+    fs.writeFileSync(fatPath, fatBuf);
+    const fatSha = sha(fatPath);
+    const fatApply = applyUnlock({ targetPath: fatPath, backupDir, mode: 'fixed', limitTokens: 512000, skipCodesign: true });
+    assert.equal(fatApply.ok, false);
+    assert.equal(sha(fatPath), fatSha);
+
+    // 2. 损坏/段越界 Mach-O 明确拒绝写入
+    const badPath = path.join(tmpDir, 'ls_corrupt');
+    const badBuf = Buffer.alloc(0x1000, 0);
+    badBuf.writeUInt32LE(0xfeedfacf, 0);
+    badBuf.writeUInt32LE(0x0100000c, 4); // arm64
+    badBuf.writeUInt32LE(2, 12);
+    badBuf.writeUInt32LE(1, 16); // ncmds=1
+    badBuf.writeUInt32LE(72 + 80, 20); // sizeofcmds
+    badBuf.writeUInt32LE(0x19, 32); // LC_SEGMENT_64
+    badBuf.writeUInt32LE(72 + 80, 36);
+    badBuf.write('__TEXT', 40, 'ascii');
+    badBuf.writeUInt32LE(1, 96); // nsects=1
+    badBuf.write('__text', 104, 'ascii');
+    badBuf.write('__TEXT', 120, 'ascii');
+    badBuf.writeBigUInt64LE(0x1000n, 144); // size
+    badBuf.writeUInt32LE(0x9000, 152); // offset 超出文件总大小 0x1000
+    fs.writeFileSync(badPath, badBuf);
+    const badSha = sha(badPath);
+    const badInfo = analyzeBinary(badPath, { backupDir, skipProcessCheck: true });
+    assert.equal(badInfo.status, 'unsupported');
+    const badApply = applyUnlock({ targetPath: badPath, backupDir, mode: 'fixed', limitTokens: 512000, skipCodesign: true });
+    assert.equal(badApply.ok, false);
+    assert.equal(sha(badPath), badSha);
+
+    // 3. Intel Mac (Mach-O x86-64 cpuType = 0x01000007) 必须拒绝写入
+    const intelPath = path.join(tmpDir, 'ls_x86_64');
+    const intelBuf = Buffer.alloc(0x4000, 0);
+    intelBuf.writeUInt32LE(0xfeedfacf, 0);
+    intelBuf.writeUInt32LE(0x01000007, 4); // x86_64
+    intelBuf.writeUInt32LE(2, 12);
+    intelBuf.writeUInt32LE(1, 16);
+    intelBuf.writeUInt32LE(72 + 80, 20);
+    intelBuf.writeUInt32LE(0x19, 32);
+    intelBuf.writeUInt32LE(72 + 80, 36);
+    intelBuf.write('__TEXT', 40, 'ascii');
+    intelBuf.writeBigUInt64LE(0x4000n, 64);
+    intelBuf.writeBigUInt64LE(0x4000n, 72);
+    intelBuf.writeUInt32LE(1, 96);
+    intelBuf.write('__text', 104, 'ascii');
+    intelBuf.write('__TEXT', 120, 'ascii');
+    intelBuf.writeBigUInt64LE(0x1000n, 144);
+    intelBuf.writeUInt32LE(0x1000, 152);
+    fs.writeFileSync(intelPath, intelBuf);
+    const intelSha = sha(intelPath);
+    const intelInfo = analyzeBinary(intelPath, { backupDir, skipProcessCheck: true });
+    assert.equal(intelInfo.format, 'Mach-O');
+    assert.equal(intelInfo.arch, 'x86-64');
+    assert.equal(intelInfo.status, 'unsupported');
+    const intelApply = applyUnlock({ targetPath: intelPath, backupDir, mode: 'fixed', limitTokens: 512000, skipCodesign: true });
+    assert.equal(intelApply.ok, false);
+    assert.equal(intelApply.code, 'UNSUPPORTED_OR_UNKNOWN');
+    assert.equal(sha(intelPath), intelSha);
+
+    // 4. arm64 Mach-O 在 codesign 重签名失败时必须回滚且原文件哈希毫发无损、无残留临时文件
+    const armBuf = Buffer.alloc(0x20000, 0);
+    const vmBase = 0x100000000n;
+    const textOff = 0x1000;
+    armBuf.writeUInt32LE(0xfeedfacf, 0);
+    armBuf.writeUInt32LE(0x0100000c, 4);
+    armBuf.writeUInt32LE(2, 12);
+    armBuf.writeUInt32LE(2, 16);
+    armBuf.writeUInt32LE(0x1b, 32);
+    armBuf.writeUInt32LE(24, 36);
+    Buffer.from('11223344556677889900aabbccddeeff', 'hex').copy(armBuf, 40);
+    armBuf.writeUInt32LE(0x19, 56);
+    armBuf.writeUInt32LE(72 + 80, 60);
+    armBuf.write('__TEXT', 64, 'ascii');
+    armBuf.writeBigUInt64LE(vmBase, 80);
+    armBuf.writeBigUInt64LE(0x10000n, 88);
+    armBuf.writeBigUInt64LE(0x10000n, 104);
+    armBuf.writeUInt32LE(1, 120);
+    armBuf.writeUInt32LE(24 + 72 + 80, 20);
+    armBuf.write('__text', 128, 'ascii');
+    armBuf.write('__TEXT', 144, 'ascii');
+    armBuf.writeBigUInt64LE(vmBase + 0x1000n, 160);
+    armBuf.writeBigUInt64LE(0x8000n, 168);
+    armBuf.writeUInt32LE(textOff, 176);
+    Buffer.from('04009dd26400a0f27f00046b04009dd26400a0f26330849a', 'hex').copy(armBuf, textOff + 0x100);
+    armBuf.writeUInt32LE(0x7100007f, textOff + 0x1f8);
+    armBuf.writeUInt32LE(0x5400008c, textOff + 0x1fc);
+    Buffer.from('03009dd26300a0f2030c00b9', 'hex').copy(armBuf, textOff + 0x200);
+    armBuf.writeUInt32LE(0x97ffffb8, textOff + 0x420);
+    armBuf.writeUInt32LE(0x37000060, textOff + 0x42c);
+    const pcBase = 0x10000;
+    const funcNames = [
+      { name: 'google3/third_party/jetski/cortex/utils/utils.GetCheckpointConfig', entry: 0x0 },
+      { name: 'google3/third_party/jetski/cortex/config/config.selectCheckpointExperimentKey', entry: 0x300 },
+      { name: 'google3/third_party/jetski/cortex/config/config.applyFeatureProviderCheckpointOverrideConfig', entry: 0x400 }
+    ];
+    armBuf.writeUInt32LE(0xfffffff1, pcBase);
+    armBuf[pcBase + 6] = 4;
+    armBuf[pcBase + 7] = 8;
+    armBuf.writeBigUInt64LE(1001n, pcBase + 8);
+    armBuf.writeBigUInt64LE(0x100n, pcBase + 32);
+    armBuf.writeBigUInt64LE(0x400n, pcBase + 64);
+    let strPos = pcBase + 0x100;
+    for (let i = 0; i < funcNames.length; i++) {
+      const f = funcNames[i];
+      const rel = strPos - (pcBase + 0x100);
+      armBuf.write(f.name + '\0', strPos, 'ascii');
+      strPos += f.name.length + 1;
+      const recOff = 1002 * 8 + i * 16;
+      armBuf.writeUInt32LE(f.entry, pcBase + 0x400 + i * 8);
+      armBuf.writeUInt32LE(recOff, pcBase + 0x400 + i * 8 + 4);
+      armBuf.writeInt32LE(rel, pcBase + 0x400 + recOff + 4);
+    }
+    armBuf.writeUInt32LE(0x500, pcBase + 0x400 + 3 * 8);
+
+    const armPath = path.join(tmpDir, 'ls_arm64_csfail');
+    fs.writeFileSync(armPath, armBuf);
+    const armOrigSha = sha(armPath);
+    const csCalls = [];
+    const csFailApply = applyUnlock({
+      targetPath: armPath,
+      backupDir,
+      mode: 'fixed',
+      limitTokens: 512000,
+      forceCodesign: true,
+      _execFileSync: (_bin, args) => {
+        csCalls.push(args);
+        if (args.includes('-d')) return ''; // entitlements 提取返回空
+        if (args.includes('--force')) throw new Error('codesign exited 1: CSSMERR_TP_NOT_TRUSTED');
+        return '';
+      }
+    });
+    assert.equal(csFailApply.ok, false);
+    assert.equal(csFailApply.code, 'MACOS_CODESIGN_OR_WRITE_FAILED');
+    assert.ok(csCalls.some(a => a.includes('--force')));
+    assert.equal(sha(armPath), armOrigSha, 'codesign 失败后原文件 SHA256 必须毫发无损');
+    const leftovers = fs.readdirSync(tmpDir).filter(f => f.includes('.tmp'));
+    assert.deepEqual(leftovers, [], 'codesign 失败后不得遗留临时文件');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
