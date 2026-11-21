@@ -1,6 +1,6 @@
 (function () {
-  const METER_VERSION = '0.8.8';
-  const METER_DISPLAY_VERSION = '0.8.8 α';
+  const METER_VERSION = '0.8.9';
+  const METER_DISPLAY_VERSION = '0.8.9';
 
   'use strict';
   if ((location.protocol !== 'https:' && location.protocol !== 'http:') || location.hostname !== '127.0.0.1') return;
@@ -120,13 +120,32 @@
     convertToCNY,
     resolveEffectivePlanStatus,
     selectPrimaryQuotaBucket,
+    resolveQuotaWindowBucketPair,
     splitModelDisplayAndEffort,
     resolvePlaceholderModelInfo
   } = (globalThis.__AGContextMeterCore || {});
+  const VALID_DOCK_POSITIONS = ['flow'];
+  const VALID_QUOTA_WINDOW_MODES = ['auto', '5h', 'weekly', 'both'];
+  let dockPosition = (() => {
+    try {
+      const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('ag_dock_position') : null;
+      if (saved && saved !== 'flow') {
+        localStorage.setItem('ag_dock_position', 'flow');
+      }
+      return 'flow';
+    } catch { return 'flow'; }
+  })();
+  let dockFallbackReason = '';
+  let quotaBadgeWindowMode = (() => {
+    try {
+      const saved = typeof localStorage !== 'undefined' ? localStorage.getItem('ag_quota_badge_window_mode') : null;
+      return VALID_QUOTA_WINDOW_MODES.includes(saved) ? saved : 'auto';
+    } catch { return 'auto'; }
+  })();
   const host = document.createElement('div');
   host.id = 'ag-context-meter';
   host.setAttribute('data-layout', 'wide');
-  host.setAttribute('data-dock', 'fixed');
+  host.setAttribute('data-dock', dockPosition);
   host.setAttribute('data-window-active', 'true');
   const shadow = host.attachShadow({ mode: 'open' });
 
@@ -159,10 +178,10 @@
 
   shadow.innerHTML = `<style>
     :host{
-      position:fixed;top:6px;right:138px;z-index:2147483000;
+      position:relative;z-index:20;
       font:12px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei UI","Microsoft YaHei",sans-serif;
       -webkit-app-region:no-drag;user-select:none;display:inline-flex;align-items:center;gap:2px;
-      height:28px;flex-shrink:0;vertical-align:middle;
+      height:28px;flex-shrink:0;vertical-align:middle;margin-right:4px;
 
       /* 优先复用 Antigravity 0 级宿主主题变量，无变量时回退深色默认值 */
       --ag-toolbar-fg:var(--secondary-foreground,#b8b8c0);
@@ -249,10 +268,28 @@
     }
 
     /* 融入宿主原生布局容器时参与正常 Flexbox 空间分配 */
-    :host([data-dock="flow"]){
+    :host([data-dock="flow"]),
+    :host:not([data-dock]){
       position:relative !important;top:auto !important;right:auto !important;left:auto !important;bottom:auto !important;z-index:20;
-      margin-right:4px;
+      margin-right:4px;display:inline-flex !important;
     }
+    :host([data-dock="aux"]),
+    :host([data-dock="page"]){
+      position:static !important;top:auto !important;right:auto !important;left:auto !important;bottom:auto !important;
+      display:block !important;width:100% !important;max-width:100% !important;z-index:20;
+      box-sizing:border-box;
+    }
+    :host([data-dock="aux"]) #ag-topbar-units,
+    :host([data-dock="page"]) #ag-topbar-units{
+      width:100%;justify-content:flex-start;flex-wrap:wrap;padding:2px 4px;
+    }
+    :host([data-dock="aux"]) .ag-panel[data-panel-docked="true"],
+    :host([data-dock="page"]) .ag-panel[data-panel-docked="true"]{
+      position:static !important;top:auto !important;left:auto !important;right:auto !important;
+      width:100% !important;max-width:100% !important;max-height:none !important;margin-top:6px;
+      box-shadow:none;
+    }
+
 
     /* 窗口非活动状态适度降低顶栏对比度 */
     :host([data-window-active="false"]) .ag-unit{
@@ -459,8 +496,24 @@
       line-height:1;letter-spacing:-0.02em;white-space:nowrap;opacity:0.82;
       font-variant-numeric:tabular-nums;
     }
+    .quota-badge-dual{
+      display:inline-flex;flex-direction:column;justify-content:center;align-items:flex-start;
+      gap:1px;line-height:1;font-variant-numeric:tabular-nums;
+    }
+    .quota-badge-dual[hidden]{ display:none!important; }
+    .quota-dual-line{
+      font-size:9px;font-weight:600;line-height:1.05;white-space:nowrap;color:var(--ag-text-primary);
+    }
+    .quota-dual-line.is-secondary{ color:var(--ag-text-secondary);font-weight:500; }
+    .quota-help-btn{
+      width:16px;height:16px;padding:0;border-radius:999px;font-size:10px;font-weight:700;
+      border:1px solid var(--ag-border-card);background:transparent;color:var(--ag-text-muted);
+      cursor:help;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
+    }
+    .quota-help-btn:hover,.quota-help-btn:focus-visible{ color:var(--ag-text-primary);border-color:var(--ag-border-subtle); }
     :host([data-layout="compact"]) #badge-quota{ padding:0 4px 0 3px;gap:2.5px; }
-    :host([data-layout="compact"]) .quota-badge-tag{ display:none!important; }
+    :host([data-layout="compact"]) .quota-badge-tag,
+    :host([data-layout="compact"]) .quota-badge-dual{ display:none!important; }
     :host([data-layout="minimal"]) #badge-quota,
     :host([data-layout="ring-only"]) #badge-quota{ display:none!important; }
 
@@ -469,6 +522,79 @@
       color:var(--ag-custom-speed,var(--ag-speed-default));
       min-width:54px;
       justify-content:flex-start;
+    }
+    #badge-speed[data-speed-phase="waiting"]{
+      min-width:28px;
+      justify-content:center;
+      padding:0 5px;
+    }
+    #badge-speed[data-speed-phase="waiting"] #badge-speed-icon,
+    #badge-speed[data-speed-phase="waiting"] #speed-amount{
+      display:none!important;
+    }
+    .speed-wait-svg{
+      width:14px;height:14px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
+    }
+    .speed-wait-svg[hidden]{ display:none!important; }
+    .ag-hourglass-svg{
+      display:block;width:14px;height:14px;
+      transform-origin:center;
+      animation:ag-hourglass-flip 1.8s cubic-bezier(0.4,0,0.2,1) infinite;
+      will-change:transform;
+    }
+    .ag-hourglass-sand-top{
+      transform-origin:7px 6.5px;
+      animation:ag-hg-top-drain 1.8s linear infinite;
+    }
+    .ag-hourglass-sand-bot{
+      transform-origin:7px 11.5px;
+      animation:ag-hg-bot-fill 1.8s linear infinite;
+    }
+    .ag-hourglass-stream{
+      animation:ag-hg-stream 1.8s linear infinite;
+    }
+    @keyframes ag-hourglass-flip{
+      0%,68%{ transform:rotate(0deg); }
+      88%,100%{ transform:rotate(180deg); }
+    }
+    @keyframes ag-hg-top-drain{
+      0%{ transform:scaleY(1);opacity:0.95; }
+      68%,100%{ transform:scaleY(0.12);opacity:0.35; }
+    }
+    @keyframes ag-hg-bot-fill{
+      0%{ transform:scaleY(0.15);opacity:0.4; }
+      68%,100%{ transform:scaleY(1);opacity:0.95; }
+    }
+    @keyframes ag-hg-stream{
+      0%,66%{ opacity:0.9;transform:translateY(0); }
+      70%,100%{ opacity:0;transform:translateY(1px); }
+    }
+    .version-pill-btn{
+      cursor:pointer;border:none;background:transparent;padding:1px 5px;border-radius:4px;
+      font:inherit;color:var(--ag-text-muted);display:inline-flex;align-items:center;gap:4px;
+    }
+    .version-pill-btn:hover,.version-pill-btn:focus-visible{
+      background:var(--ag-toolbar-bg-hover);color:var(--ag-text-primary);
+    }
+    .ctx-compact-pill-btn{
+      display:inline-flex;align-items:center;gap:4px;max-width:210px;
+      padding:2px 7px;border-radius:999px;font-size:10px;line-height:1.2;
+      background:var(--ag-bg-subcard);border:1px solid var(--ag-border-subcard);
+      color:var(--ag-text-secondary);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    }
+    .ctx-compact-pill-btn:hover,.ctx-compact-pill-btn:focus-visible{
+      border-color:var(--ag-border-card);color:var(--ag-text-primary);
+    }
+    .ctx-compact-sep{ opacity:0.55; }
+    .ctx-seg-wrap{ display:flex;flex-wrap:wrap;gap:4px; }
+    .ctx-seg-wrap .ctx-seg-btn{ font-size:10.5px;padding:3px 7px; }
+    .ctx-dock-note{
+      font-size:11px;color:var(--ag-text-secondary);margin-top:6px;line-height:1.45;
+      padding:5px 9px;border-radius:6px;background:rgba(56,189,248,0.08);border:1px solid rgba(56,189,248,0.24);
+      cursor:pointer;display:flex;align-items:center;gap:6px;transition:background-color .15s ease;
+    }
+    .ctx-dock-note:hover{
+      background:rgba(56,189,248,0.15);color:var(--ag-text-primary);
     }
     #badge-speed:hover,#badge-speed:focus-visible,#badge-speed[aria-expanded="true"]{
       color:var(--ag-custom-speed,var(--ag-toolbar-fg-hover));
@@ -2327,7 +2453,7 @@
       .panel-icon-btn{width:22px;height:22px}
     }
     @media (prefers-reduced-motion: reduce){
-      *,.ag-unit,.ring-fill,.quota-ring-fill,.ctx-quota-ring-fill,.ctx-model-quota-chip,.quota-bar-fill,.quota-bar-charge-stage,.quota-bar-charge-fill,.quota-bar-charge-sheen,.quota-refresh-icon,.key-bar-fill,.ag-panel,#context-tooltip,.heat-cell,.w-bar-fill,.latest-call-body,.latest-call-body.is-entering{
+      *,.ag-unit,.ring-fill,.quota-ring-fill,.ctx-quota-ring-fill,.ctx-model-quota-chip,.quota-bar-fill,.quota-bar-charge-stage,.quota-bar-charge-fill,.quota-bar-charge-sheen,.quota-refresh-icon,.key-bar-fill,.ag-panel,#context-tooltip,.heat-cell,.w-bar-fill,.latest-call-body,.latest-call-body.is-entering,.ag-hourglass-svg,.ag-hourglass-sand-top,.ag-hourglass-sand-bot,.ag-hourglass-stream{
         transition:none!important;animation:none!important;
       }
       .quota-bar-charge-stage{display:none!important}
@@ -2542,6 +2668,7 @@
   <span class="quota-badge-metric">
     <span id="quota-badge-val" class="quota-badge-val" data-i18n="quota.state.unknown">未知</span>
     <span id="quota-badge-tag" class="quota-badge-tag" hidden></span>
+    <span id="quota-badge-dual" class="quota-badge-dual" hidden></span>
   </span>
 </button>
 
@@ -2561,10 +2688,18 @@
   <span id="hover-wrap" class="sr-only"><span id="hover-extra"></span></span>
 </button>
 
-<!-- 顶部基本单元 2: 输出速度 (tok/s) -->
+<!-- 顶部基本单元 2: 输出速度 (tok/s) / 等待纯动效沙漏 -->
 <button id="badge-speed" class="ag-unit" type="button" aria-label="模型输出速度与耗时统计" data-i18n-aria="badge.speed.aria"
   aria-expanded="false">
   <span id="badge-speed-icon" class="speed-icon" aria-hidden="true">⚡</span>
+  <span id="badge-speed-wait-svg" class="speed-wait-svg" hidden aria-hidden="true">
+    <svg class="ag-hourglass-svg" viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3.2 2.2h7.6M3.2 11.8h7.6M4 2.2c0 2.5 3 4.2 3 4.8s-3 2.3-3 4.8M10 2.2c0 2.5-3 4.2-3 4.8s3 2.3 3 4.8" opacity="0.88" />
+      <path class="ag-hourglass-sand-top" d="M4.8 3.2h4.4L7 6.1z" fill="currentColor" stroke="none" />
+      <line class="ag-hourglass-stream" x1="7" y1="6.7" x2="7" y2="9.4" stroke-dasharray="1 1.2" stroke-width="1.2" />
+      <path class="ag-hourglass-sand-bot" d="M4.8 11.1h4.4L7 8.4z" fill="currentColor" stroke="none" />
+    </svg>
+  </span>
   <span id="speed-amount">-- tok/s</span>
   <span id="speed-hover-extra" class="sr-only"></span>
 </button>
@@ -2596,6 +2731,8 @@
     <circle cx="12.5" cy="8" r="1.25"></circle>
   </svg>
 </button>
+
+
 
 <!-- CLI 启动反馈提示气泡 -->
 <div id="cli-launch-toast" hidden role="status" aria-live="polite"></div>
@@ -2636,7 +2773,8 @@
       <span class="panel-title-text" style="font-size:13px;font-weight:600;color:var(--ag-text-primary)"
         data-i18n="panel.ctx.title" title="Antigravity Context Meter" data-i18n-title="panel.ctx.fullName"
         aria-label="Antigravity Context Meter" data-i18n-aria="panel.ctx.fullName">💬 当前会话上下文</span>
-      <span id="v">0.8.8 α</span>
+      <span id="v" class="version-pill-btn" role="button" tabindex="0" title="点击跳转到版本更新与关于设置"
+        data-i18n-title="header.versionBtn.title">0.8.9</span>
     </div>
     <div class="panel-header-actions ctx-header-actions">
       <!-- 插件面板三语言快速切换分段按钮 -->
@@ -2649,7 +2787,7 @@
         <button id="btn-top-lang-en" class="ctx-seg-btn" type="button" data-panel-lang="en" title="English"
           aria-label="English">EN</button>
       </div>
-      <button id="btn-github-repo-ctx" class="panel-icon-btn" type="button" aria-label="打开 GitHub 仓库"
+      <button id="btn-github-repo" class="panel-icon-btn" type="button" aria-label="打开 GitHub 仓库"
         data-i18n-aria="header.github.aria" title="打开 GitHub 仓库" data-i18n-title="header.github.aria">
         <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor">
           <path
@@ -2657,17 +2795,15 @@
           </path>
         </svg>
       </button>
-      <button id="btn-check-update-ctx" class="panel-icon-btn update-btn" type="button" aria-label="检查插件更新"
+      <button id="btn-check-update" class="panel-icon-btn update-btn" type="button" aria-label="检查插件更新"
         data-i18n-aria="header.update.aria" title="检查插件更新" data-i18n-title="header.update.aria"
         style="position:relative">
         <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6"
           stroke-linecap="round" stroke-linejoin="round">
           <path d="M14 8A6 6 0 1 1 8 2M14 2v6h-6"></path>
         </svg>
-        <span id="update-badge-dot-ctx" class="update-badge-dot" style="display:none"></span>
+        <span id="update-badge-dot" class="update-badge-dot" style="display:none"></span>
       </button>
-      <button id="btn-panel-palette" class="panel-icon-btn" type="button" aria-label="外观与调色设置"
-        data-i18n-aria="header.palette.aria" title="外观与调色设置" data-i18n-title="header.palette.aria">🎨</button>
       <button id="theme-toggle" class="panel-icon-btn" type="button" aria-label="切换浅色/深色主题"
         data-i18n-aria="header.theme.aria" title="当前：跟随IDE（点击切换：浅色 / 深色 / 自动）"
         data-i18n-title="header.theme.title">🌓</button>
@@ -2702,8 +2838,19 @@
 
       <!-- 卡片 1: 核心用量速览 -->
       <div id="key-summary">
-        <div class="key-header"><span class="key-title" data-i18n="session.keySummary.title">⭐ 核心用量速览</span><span
-            id="key-badge" class="key-pill pill-muted" data-i18n="session.badge.reading">读取中</span></div>
+        <div class="key-header" style="gap:6px;flex-wrap:wrap">
+          <span class="key-title" data-i18n="session.keySummary.title">⭐ 核心用量速览</span>
+          <div style="display:flex;align-items:center;gap:6px;margin-left:auto;min-width:0">
+            <button id="btn-goto-model-settings" class="ctx-compact-pill-btn" type="button"
+              title="去模型设置 ›" data-i18n-title="session.compact.gotoModels">
+              <span id="ctx-compact-saved" data-i18n="status.savedDefault">未单独设置（使用默认）</span>
+              <span class="ctx-compact-sep">·</span>
+              <span id="ctx-compact-client" data-i18n="status.badge.reading">状态读取中…</span>
+              <span aria-hidden="true">›</span>
+            </button>
+            <span id="key-badge" class="key-pill pill-muted" data-i18n="session.badge.reading">读取中</span>
+          </div>
+        </div>
         <div class="key-bar-track">
           <div id="key-bar-fill" class="key-bar-fill"></div>
         </div>
@@ -2721,7 +2868,7 @@
             <div id="key-remaining" class="key-stat-val">—</div>
           </div>
         </div>
-        <div id="key-takeaway" class="key-takeaway" data-i18n="session.keyTakeaway.loading">正在计算核心指标…</div>
+        <div id="key-takeaway" class="key-takeaway" hidden style="display:none" data-i18n="session.keyTakeaway.loading">正在计算核心指标…</div>
       </div>
 
       <!-- 卡片 2: 生成体验、纯流式速度与 E 评分速览 -->
@@ -2809,21 +2956,6 @@
             <button id="btn-timeline-load-more" class="ctx-compact-link-btn" type="button" data-i18n="session.timeline.loadMore">加载更多轮次</button>
           </div>
         </div>
-      </div>
-
-      <!-- 紧凑上下文设置入口卡片 -->
-      <div id="ctx-compact-card" class="ctx-compact-card">
-        <div class="ctx-compact-info">
-          <div class="ctx-compact-title" data-i18n="session.compact.title">上下文设置</div>
-          <div class="ctx-compact-meta">
-            <span><span data-i18n="session.compact.savedLabel">本模型已保存：</span><strong
-                id="ctx-compact-saved" data-i18n="status.savedDefault">未单独设置（使用默认）</strong></span>
-            <span><span data-i18n="session.compact.clientLabel">客户端当前使用：</span><strong
-                id="ctx-compact-client" data-i18n="status.badge.reading">状态读取中…</strong></span>
-          </div>
-        </div>
-        <button id="btn-goto-model-settings" class="ctx-compact-link-btn" type="button"
-          data-i18n="session.compact.gotoModels">去模型设置 ›</button>
       </div>
 
       <!-- 底层技术参数与附件审计 -->
@@ -3328,44 +3460,65 @@
         </div>
       </div>
 
-      <div id="speed-active-test-note" class="ctx-active-test-note" data-i18n="speed.activeTestNote">
-        主动测试：未接通。目前没有可靠的指定模型调用入口，暂时只能使用日常对话的实测记录。</div>
     </div>
 
     <!-- 设置与系统配置 (第四分页: 配置 / setting) -->
     <div id="pane-ctx-settings" class="ctx-tab-pane" role="tabpanel" aria-labelledby="tab-ctx-settings" hidden>
+      <!-- 0. 插件外观、停靠位置与顶栏偏好 (ELV-94 & Issue #41) -->
+      <div class="ctx-settings-card" id="ui-slim-prefs-card">
+        <div class="ctx-settings-card-hdr">
+          <div class="ctx-settings-card-title" data-i18n="settings.appearance.title">🎨 外观、停靠位置与顶栏偏好</div>
+        </div>
+        <div class="ctx-small-label" data-i18n="settings.dock.label">面板与顶栏停靠位置</div>
+        <div id="dock-pos-segmented" class="ctx-segmented ctx-seg-wrap" role="group" aria-label="面板停靠位置">
+          <button id="btn-dock-flow" class="ctx-seg-btn active" type="button" data-dock-mode="flow" data-i18n="settings.dock.flow">顶栏默认靠在打开 IDE 左侧</button>
+        </div>
+        <div class="ctx-small-label" style="margin-top:8px" data-i18n="settings.quotaBadgeMode.label">顶栏额度窗口显示（右键/Alt+点击切换）</div>
+        <div id="quota-mode-segmented" class="ctx-segmented ctx-seg-wrap" role="group" aria-label="顶栏额度窗口">
+          <button id="btn-quota-mode-auto" class="ctx-seg-btn active" type="button" data-quota-window-mode="auto" data-i18n="settings.quotaBadgeMode.auto">自动 (最紧缩)</button>
+          <button id="btn-quota-mode-5h" class="ctx-seg-btn" type="button" data-quota-window-mode="5h" data-i18n="settings.quotaBadgeMode.5h">5h 窗口</button>
+          <button id="btn-quota-mode-weekly" class="ctx-seg-btn" type="button" data-quota-window-mode="weekly" data-i18n="settings.quotaBadgeMode.weekly">周额度</button>
+          <button id="btn-quota-mode-both" class="ctx-seg-btn" type="button" data-quota-window-mode="both" data-i18n="settings.quotaBadgeMode.both">5h+周双显</button>
+        </div>
+        <div class="ctx-small-label" style="margin-top:8px" data-i18n="settings.palette.label">主题调色与外观定制</div>
+        <div style="display:flex;align-items:center;justify-content:flex-start;gap:8px">
+          <button id="btn-panel-palette" class="unlock-btn unlock-btn-secondary" type="button" style="padding:3px 9px;font-size:11px"
+            data-i18n="settings.palette.openBtn">🎨 调色与外观</button>
+        </div>
+      </div>
+
       <!-- 1. 一键推荐配置与总览（默认不自动应用，需用户预览勾选并确认） -->
       <div class="ctx-settings-card" id="enhance-preset-card">
         <div class="ctx-settings-card-hdr">
           <div class="ctx-settings-card-title" data-i18n="enhance.preset.title">✨ 一键推荐配置（按需勾选预览）</div>
           <span id="enhance-global-badge" class="key-pill pill-muted" data-i18n="settings.common.reading">读取中…</span>
         </div>
-        <div class="ctx-settings-card-desc" data-i18n="enhance.preset.desc">正常安装默认保持客户端原样。下方列出推荐增强组合；只有你勾选并确认后才会实际写入。
+        <div class="ctx-settings-card-desc" data-i18n="enhance.preset.desc">勾选为开，未勾选为关。安装默认全部关闭；只有磁盘上已经打开的项才会显示为开。确认前不会写入。
         </div>
         <div class="ctx-preset-checklist">
           <label class="ctx-preset-check-item">
-            <input id="chk-rec-prompt" type="checkbox" checked>
+            <input id="chk-rec-prompt" type="checkbox">
             <div class="ctx-preset-check-meta">
               <strong data-i18n="enhance.preset.itemPrompt">系统提示词 4 档（极简防幻觉）</strong>
               <span data-i18n="enhance.preset.itemPromptSub">精简模板套话并保留真实工具契约；仅作用于系统提示，不能保证模型永不犯错。</span>
             </div>
           </label>
           <label class="ctx-preset-check-item">
-            <input id="chk-rec-title" type="checkbox" checked>
+            <input id="chk-rec-title" type="checkbox">
             <div class="ctx-preset-check-meta">
               <strong data-i18n="enhance.preset.itemTitle">自动中文会话标题</strong>
               <span data-i18n="enhance.preset.itemTitleSub">新会话自动生成简体中文标题（等长替换指令文本，不破坏结构）。</span>
             </div>
           </label>
           <label class="ctx-preset-check-item">
-            <input id="chk-rec-lang" type="checkbox" checked>
+            <input id="chk-rec-lang" type="checkbox">
             <div class="ctx-preset-check-meta">
               <strong data-i18n="enhance.preset.itemLang">客户端简体中文界面（Antigravity 本身）</strong>
               <span data-i18n="enhance.preset.itemLangSub">仅改变桌面端壳层中文，不影响你选择的插件面板语言。</span>
             </div>
           </label>
           <label class="ctx-preset-check-item">
-            <input id="chk-rec-ctx" type="checkbox" checked>
+            <input id="chk-rec-ctx" type="checkbox">
             <div class="ctx-preset-check-meta">
               <strong data-i18n="enhance.preset.itemCtx">上下文模式：跟随模型</strong>
               <span data-i18n="enhance.preset.itemCtxSub">按模型各自支持的最大长度运行，不硬锁固定 983,040 或 512,000。</span>
@@ -3709,6 +3862,23 @@
       </div>
     </div>
   </div>
+
+  <!-- 7. 版本更新与项目链接 -->
+  <div class="ctx-settings-card" id="settings-about-update-card">
+    <div class="ctx-settings-card-hdr">
+      <div class="ctx-settings-card-title" data-i18n="settings.aboutUpdate.channelTitle">🔄 版本更新通道与设置</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-top:6px;font-size:11px">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--ag-text-secondary)">
+        <input id="check-auto-update" type="checkbox" checked>
+        <span data-i18n="tokens.update.auto">启动时自动检查更新（不自动安装）</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--ag-text-secondary)">
+        <input id="check-allow-beta-updates" type="checkbox">
+        <span data-i18n="tokens.update.allowBeta">接收预发布版本推送（Beta 通道）</span>
+      </label>
+    </div>
+  </div>
   </div>
   </div>
 
@@ -3743,27 +3913,10 @@
       <span id="panel-tokens-title"
         style="font-size:13px;font-weight:600;color:var(--ag-custom-token-accent,var(--ag-token-accent-default))"
         data-i18n="tokens.title">本机已记录用量</span>
+      <span id="v-tokens" class="version-pill-btn" role="button" tabindex="0" title="点击跳转到版本更新与关于设置"
+        data-i18n-title="header.versionBtn.title">0.8.9</span>
     </div>
     <div class="panel-header-actions">
-      <button id="btn-github-repo" class="panel-icon-btn" type="button" aria-label="打开 GitHub 仓库"
-        data-i18n-aria="header.github.aria" title="打开 GitHub 仓库" data-i18n-title="header.github.aria">
-        <svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor">
-          <path
-            d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z">
-          </path>
-        </svg>
-      </button>
-      <button id="btn-check-update" class="panel-icon-btn update-btn" type="button" aria-label="检查插件更新"
-        data-i18n-aria="header.update.aria" title="检查插件更新" data-i18n-title="header.update.aria"
-        style="position:relative">
-        <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.6"
-          stroke-linecap="round" stroke-linejoin="round">
-          <path d="M14 8A6 6 0 1 1 8 2M14 2v6h-6"></path>
-        </svg>
-        <span id="update-badge-dot" class="update-badge-dot" style="display:none"></span>
-      </button>
-      <button id="btn-panel-tokens-palette" class="panel-icon-btn" type="button" aria-label="外观与调色设置"
-        data-i18n-aria="header.palette.aria" title="外观与调色设置" data-i18n-title="header.palette.aria">🎨</button>
       <button id="theme-toggle-tokens" class="panel-icon-btn" type="button" aria-label="切换浅色/深色主题"
         data-i18n-aria="header.theme.aria" title="当前：跟随IDE（点击切换：浅色 / 深色 / 自动）"
         data-i18n-title="header.theme.title">🌓</button>
@@ -3833,12 +3986,37 @@
             AI 订阅与额度详情</span>
           <span id="plan-save-feedback" style="font-size:10px;color:var(--ag-text-muted);display:none"></span>
         </div>
-        <button id="btn-plan-detail-collapse-top" class="switch-pill-btn" type="button"
-          style="padding:2px 8px;font-size:10.5px" data-i18n="plan.detail.toggleClose">详情收回 ▲</button>
       </div>
       <dl class="plan-detail-dl">
         <dt data-i18n="plan.dt.plan">当前套餐：</dt>
-        <dd id="p-det-name" style="font-weight:600">Google AI Pro</dd>
+        <dd style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap">
+          <span id="p-det-name" style="display:none">Google AI Pro</span>
+          <select id="direct-tier-select" aria-label="套餐规格与子档覆盖" data-i18n-aria="plan.tier.aria" style="display:none">
+            <option value="auto" data-i18n="plan.tier.auto">✨ 自动检测 (Auto-detect)</option>
+            <option value="free" data-i18n="plan.tier.free">Free</option>
+            <option value="pro" data-i18n="plan.tier.pro">Google AI Pro</option>
+            <option value="ultra" data-i18n="plan.tier.ultra">Google AI Ultra</option>
+            <option value="ultra_5x" data-i18n="plan.tier.ultra5x">Google AI Ultra (5x)</option>
+            <option value="ultra_20x" data-i18n="plan.tier.ultra20x">Google AI Ultra (20x)</option>
+          </select>
+          <div id="direct-tier-wrap" class="ag-dropdown-wrapper" style="flex:1;min-width:0;max-width:270px">
+            <div id="direct-tier-trigger" class="ag-dropdown-trigger" tabindex="0"
+              title="套餐规格与子档覆盖 (可手动指定 5x/20x 子档或自动检测)" data-i18n-title="plan.tier.title">
+              <span id="direct-tier-label" class="ag-dropdown-label"
+                style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis" data-i18n="plan.tier.auto">✨ 自动检测 (Auto-detect)</span>
+              <div class="ag-dropdown-arrow">
+                <svg viewBox="0 0 10 6" width="10" height="6" fill="none" stroke="currentColor" stroke-width="1.5"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M1 1l4 4 4-4" />
+                </svg>
+              </div>
+            </div>
+            <div id="direct-tier-menu" class="ag-dropdown-menu"></div>
+          </div>
+          <span id="p-det-tier-tag" class="key-pill pill-muted"
+            style="font-size:9.5px;padding:1px 5px;display:none;flex-shrink:0;white-space:nowrap"
+            data-i18n="plan.tag.custom">自定义</span>
+        </dd>
         <dt data-i18n="plan.dt.account">当前账号：</dt>
         <dd id="p-det-account">—</dd>
         <dt data-i18n="plan.dt.country">账号所在地区：</dt>
@@ -4704,14 +4882,6 @@
             </div>
           </div>
 
-          <div
-            style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding-top:8px;border-top:1px dashed var(--ag-border-subcard);font-size:11px">
-            <span style="color:var(--ag-text-primary);font-weight:500" data-i18n="tokens.update.title">更新设置</span>
-            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:var(--ag-text-secondary)">
-              <input id="check-auto-update" type="checkbox" checked>
-              <span data-i18n="tokens.update.auto">启动时自动检查更新（不自动安装）</span>
-            </label>
-          </div>
         </div>
       </div>
     </div><!-- end #tokens-main-view -->
@@ -4798,7 +4968,7 @@
     <div style="display:flex;align-items:center;gap:6px">
       <span id="up-pop-title" style="font-weight:600;font-size:12px;color:var(--ag-text-primary)"
         data-i18n="update.title">🚀 检查更新</span>
-      <span id="up-pop-ver" class="key-pill pill-good" style="font-size:10px">0.8.8 α</span>
+      <span id="up-pop-ver" class="key-pill pill-good" style="font-size:10px">0.8.9</span>
     </div>
     <button id="btn-close-update-pop" class="panel-icon-btn" type="button"
       style="padding:1px 5px;font-size:13px">×</button>
@@ -4878,7 +5048,12 @@
           <div id="quota-cur-pool" class="quota-cur-pool-sub"></div>
           <div id="quota-cur-est" class="quota-cur-est" hidden></div>
         </div>
-        <span id="quota-cur-status" class="key-pill pill-muted" data-i18n="quota.state.unknown">未知</span>
+        <div style="display:flex;align-items:center;gap:5px;flex-shrink:0">
+          <button id="quota-basis-help" class="quota-help-btn" type="button"
+            data-i18n-title="quota.basisNote" data-i18n-aria="quota.basisNote"
+            title="百分比与重置时间来自宿主接口；「约剩余 Token」按本机输入+缓存+输出原始 Token 统计。">?</button>
+          <span id="quota-cur-status" class="key-pill pill-muted" data-i18n="quota.state.unknown">未知</span>
+        </div>
       </div>
       <div id="quota-cur-alert" class="quota-cur-alert" hidden></div>
       <div id="quota-cur-buckets" class="quota-buckets-list"></div>
@@ -4892,11 +5067,6 @@
         data-i18n="quota.pools.browseHint">点击可查看详情（不切换当前会话模型）</span>
     </div>
     <div id="quota-pools-list" class="quota-pools-list"></div>
-
-    <div id="quota-basis-note" class="quota-basis-note" data-i18n="quota.basisNote">百分比与重置时间来自宿主接口；「约剩余
-      Token」按本机输入+缓存+输出原始 Token 统计，受服务端计费权重、同池模型混用、他端消耗及周期采样覆盖度影响；校准过期或样本不足时不按有效推算展示。</div>
-    <div id="quota-usage-tip" class="quota-usage-tip" data-i18n="quota.usageTip">💡
-      用量提示：使用前可先查看各池剩余额度，优先选择余量充足且适合当前任务的模型。</div>
 
     <!-- 统一多账号切换、自动切号、共享额度对照(ELV-57)与缓存保活保障(ELV-52) -->
     <div id="quota-accounts-section" class="quota-accounts-section">
@@ -5026,7 +5196,16 @@
 </section>`;
 
   (document.body || document.documentElement).appendChild(host);
-  const el = id => shadow.getElementById(id);
+  const el = id => {
+    let node = shadow.getElementById(id);
+    if (!node) {
+      if (id === 'btn-github-repo-ctx') node = shadow.getElementById('btn-github-repo');
+      else if (id === 'btn-check-update-ctx') node = shadow.getElementById('btn-check-update');
+      else if (id === 'btn-github-repo') node = shadow.getElementById('btn-github-repo-ctx');
+      else if (id === 'btn-check-update') node = shadow.getElementById('btn-check-update-ctx');
+    }
+    return node;
+  };
 // =========================================================================
 // 模块 0: 插件面板三语言国际化 (简体中文 / 繁體中文 / English)
 // =========================================================================
@@ -5517,6 +5696,28 @@ const PANEL_I18N = {
   'tokens.colors.title': { 'zh-CN': '🎨 热力图色阶与面板外观自定义（默认跟随主题）', 'zh-TW': '🎨 熱力圖色階與面板外觀自訂（預設跟隨佈景主題）', en: '🎨 Heatmap Palette & Panel Appearance' },
   'tokens.update.title': { 'zh-CN': '更新设置', 'zh-TW': '更新設定', en: 'Update Settings' },
   'tokens.update.auto': { 'zh-CN': '启动时自动检查更新（不自动安装）', 'zh-TW': '啟動時自動檢查更新（不自動安裝）', en: 'Check for updates on startup (manual install)' },
+  'tokens.update.allowBeta': { 'zh-CN': '接收预发布版本推送（Beta 通道）', 'zh-TW': '接收預發布版本推送（Beta 通道）', en: 'Receive pre-release updates (Beta channel)' },
+  'header.versionBtn.title': { 'zh-CN': '点击跳转到版本更新与关于设置', 'zh-TW': '點擊跳轉到版本更新與關於設定', en: 'Click to open version updates & about settings' },
+  'settings.appearance.title': { 'zh-CN': '🎨 外观、停靠位置与顶栏偏好', 'zh-TW': '🎨 外觀、停靠位置與頂欄偏好', en: '🎨 Appearance, Dock & Topbar Preferences' },
+  'settings.dock.label': { 'zh-CN': '面板与顶栏停靠位置', 'zh-TW': '面板與頂欄停靠位置', en: 'Panel & Topbar Dock Position' },
+  'settings.dock.flow': { 'zh-CN': '顶栏默认靠在打开 IDE 左侧', 'zh-TW': '頂欄預設靠在開啟 IDE 左側', en: 'Top bar (Left of Open IDE)' },
+  'settings.quotaBadgeMode.label': { 'zh-CN': '顶栏额度窗口显示（右键/Alt+点击切换）', 'zh-TW': '頂欄額度視窗顯示（右鍵/Alt+點擊切換）', en: 'Topbar Quota Window (Right-click / Alt+Click)' },
+  'settings.quotaBadgeMode.auto': { 'zh-CN': '自动 (最紧缩)', 'zh-TW': '自動 (最緊縮)', en: 'Auto (Tightest)' },
+  'settings.quotaBadgeMode.5h': { 'zh-CN': '5h 窗口', 'zh-TW': '5h 視窗', en: '5h Window' },
+  'settings.quotaBadgeMode.weekly': { 'zh-CN': '周额度', 'zh-TW': '週額度', en: 'Weekly' },
+  'settings.quotaBadgeMode.both': { 'zh-CN': '5h+周双显', 'zh-TW': '5h+週雙顯', en: 'Dual 5h+7d' },
+  'settings.langAndPalette.label': { 'zh-CN': '面板语言与主题调色', 'zh-TW': '面板語言與佈景調色', en: 'Panel Language & Palette' },
+  'settings.palette.label': { 'zh-CN': '主题调色与外观定制', 'zh-TW': '佈景調色與外觀自訂', en: 'Theme Colors & Appearance' },
+  'settings.palette.openBtn': { 'zh-CN': '🎨 调色与外观', 'zh-TW': '🎨 調色與外觀', en: '🎨 Colors & Theme' },
+  'settings.aboutUpdate.title': { 'zh-CN': '🔄 版本更新与项目链接', 'zh-TW': '🔄 版本更新與專案連結', en: '🔄 Updates & Project Links' },
+  'settings.aboutUpdate.channelTitle': { 'zh-CN': '🔄 版本更新通道与设置', 'zh-TW': '🔄 版本更新通道與設定', en: '🔄 Update Channel & Preferences' },
+  'settings.aboutUpdate.checkBtn': { 'zh-CN': '检查插件更新', 'zh-TW': '檢查外掛更新', en: 'Check Updates' },
+  'settings.aboutUpdate.githubBtn': { 'zh-CN': '打开 GitHub 仓库', 'zh-TW': '開啟 GitHub 儲存庫', en: 'GitHub Repo' },
+  'quota.modeTag.auto': { 'zh-CN': '自动最紧缩', 'zh-TW': '自動最緊縮', en: 'Auto Tightest' },
+  'quota.modeTag.5h': { 'zh-CN': '固定 5h', 'zh-TW': '固定 5h', en: 'Fixed 5h' },
+  'quota.modeTag.weekly': { 'zh-CN': '固定周额度', 'zh-TW': '固定週額度', en: 'Fixed Weekly' },
+  'quota.modeTag.both': { 'zh-CN': '5h + 7d 双显', 'zh-TW': '5h + 7d 雙顯', en: 'Dual 5h + 7d' },
+  'badge.speedWaitTitle': { 'zh-CN': '正在等待模型首字响应 · 已等待 {elapsed}', 'zh-TW': '正在等待模型首字回應 · 已等待 {elapsed}', en: 'Waiting for first token · {elapsed}' },
   'cp.title': { 'zh-CN': '🎨 颜色选取器', 'zh-TW': '🎨 顏色選擇器', en: '🎨 Color Picker' },
   'cp.eyedropper': { 'zh-CN': '🖊 取色', 'zh-TW': '🖊 滴管取色', en: '🖊 Pick' },
   'cp.moreFormats': { 'zh-CN': '更多格式 (RGB / HSL)', 'zh-TW': '更多格式 (RGB / HSL)', en: 'More formats (RGB / HSL)' },
@@ -5836,6 +6037,14 @@ const PANEL_I18N = {
   'plan.summary.priceUnsetShort': { 'zh-CN': '待设置月费', 'zh-TW': '待設定月費', en: 'Fee unset' },
   'plan.summary.priceUnsetCny': { 'zh-CN': '(待填写实付)', 'zh-TW': '(待填寫實付)', en: '(not set)' },
   'plan.summary.priceBadgeTitle': { 'zh-CN': '当前订阅费用与最新汇率换算参考 (点击展开/收起详情)', 'zh-TW': '目前訂閱費用與最新匯率換算參考 (點擊展開/收起詳細資訊)', en: 'Current subscription fee and FX estimate (click to toggle details)' },
+  'plan.tier.aria': { 'zh-CN': '套餐规格与子档覆盖', 'zh-TW': '方案規格與子檔覆蓋', en: 'Plan tier and sub-tier override' },
+  'plan.tier.title': { 'zh-CN': '套餐规格与子档覆盖 (可手动指定 5x/20x 子档或自动检测)', 'zh-TW': '方案規格與子檔覆蓋 (可手動指定 5x/20x 子檔或自動檢測)', en: 'Plan tier and sub-tier override (select 5x/20x or auto-detect)' },
+  'plan.tier.auto': { 'zh-CN': '✨ 自动检测 (Auto-detect)', 'zh-TW': '✨ 自動檢測 (Auto-detect)', en: '✨ Auto-detect' },
+  'plan.tier.free': { 'zh-CN': 'Free (免费版)', 'zh-TW': 'Free (免費版)', en: 'Free' },
+  'plan.tier.pro': { 'zh-CN': 'Google AI Pro', 'zh-TW': 'Google AI Pro', en: 'Google AI Pro' },
+  'plan.tier.ultra': { 'zh-CN': 'Google AI Ultra', 'zh-TW': 'Google AI Ultra', en: 'Google AI Ultra' },
+  'plan.tier.ultra5x': { 'zh-CN': 'Google AI Ultra (5x)', 'zh-TW': 'Google AI Ultra (5x)', en: 'Google AI Ultra (5x)' },
+  'plan.tier.ultra20x': { 'zh-CN': 'Google AI Ultra (20x)', 'zh-TW': 'Google AI Ultra (20x)', en: 'Google AI Ultra (20x)' },
   'plan.dt.plan': { 'zh-CN': '当前套餐：', 'zh-TW': '目前方案：', en: 'Plan:' },
   'plan.dt.account': { 'zh-CN': '当前账号：', 'zh-TW': '目前帳號：', en: 'Account:' },
   'plan.dt.country': { 'zh-CN': '账号所在地区：', 'zh-TW': '帳號所在地區：', en: 'Account country:' },
@@ -6071,14 +6280,14 @@ const PANEL_I18N = {
   'diag.svc.tipDetail': { 'zh-CN': '服务端暂时过载或维护中，请稍后重试', 'zh-TW': '伺服器端暫時過載或維護中，請稍後重試', en: 'Server overloaded or under maintenance. Retry later.' },
   'diag.svc.status': { 'zh-CN': '模型服务暂不可用或处于高负载（503/Overloaded），请稍后重试。', 'zh-TW': '模型服務暫無法使用或處於高負載（503/Overloaded），請稍後重試。', en: 'Model service unavailable or overloaded (503). Retry later.' },
   'diag.svc.takeaway': { 'zh-CN': '⚠ 服务端暂时不可用或处于高负载（503/Overloaded），请稍后重试。', 'zh-TW': '⚠ 伺服器端暫時不可用或處於高負載（503/Overloaded），請稍後重試。', en: '⚠ Service unavailable or overloaded (503). Retry later.' },
-  'diag.cancel.badge': { 'zh-CN': '已取消', 'zh-TW': '已取消', en: 'Cancelled' },
-  'diag.cancel.amount': { 'zh-CN': '请求取消', 'zh-TW': '請求取消', en: 'Cancelled' },
-  'diag.cancel.hover': { 'zh-CN': ' · 请求已取消', 'zh-TW': ' · 請求已取消', en: ' · Request cancelled' },
-  'diag.cancel.tipTitle': { 'zh-CN': '请求状态（已取消）：', 'zh-TW': '請求狀態（已取消）：', en: 'Request Status (Cancelled):' },
-  'diag.cancel.tipPct': { 'zh-CN': '本次请求被中止或取消', 'zh-TW': '本次請求被中止或取消', en: 'Request aborted or cancelled' },
-  'diag.cancel.tipDetail': { 'zh-CN': '本次生成已被用户取消或中断，可重新发送消息', 'zh-TW': '本次生成已被使用者取消或中斷，可重新發送訊息', en: 'Generation cancelled. Resend message if needed.' },
-  'diag.cancel.status': { 'zh-CN': '请求已取消：当前轮次生成被中断。', 'zh-TW': '請求已取消：目前輪次生成被中斷。', en: 'Request cancelled: current generation aborted.' },
-  'diag.cancel.takeaway': { 'zh-CN': 'ℹ 本轮生成已被用户取消或中断，未完整输出。', 'zh-TW': 'ℹ 本輪生成已被使用者取消或中斷，未完整輸出。', en: 'ℹ Generation cancelled before completion.' },
+  'diag.cancel.badge': { 'zh-CN': '已中断', 'zh-TW': '已中斷', en: 'Interrupted' },
+  'diag.cancel.amount': { 'zh-CN': '上次中断', 'zh-TW': '上次中斷', en: 'Interrupted' },
+  'diag.cancel.hover': { 'zh-CN': ' · 最近一次请求已中断', 'zh-TW': ' · 最近一次請求已中斷', en: ' · Last recorded request interrupted' },
+  'diag.cancel.tipTitle': { 'zh-CN': '最近一次请求（已中断）：', 'zh-TW': '最近一次請求（已中斷）：', en: 'Last recorded request (Interrupted):' },
+  'diag.cancel.tipPct': { 'zh-CN': '该请求已中断或取消', 'zh-TW': '該請求已中斷或取消', en: 'That request was interrupted or cancelled' },
+  'diag.cancel.tipDetail': { 'zh-CN': '仅凭此记录无法确定取消来源或当前请求状态。', 'zh-TW': '僅憑此記錄無法確定取消來源或目前請求狀態。', en: 'This record does not identify who cancelled the request or describe the current request.' },
+  'diag.cancel.status': { 'zh-CN': '最近一次请求已中断；当前请求状态请以聊天界面为准。', 'zh-TW': '最近一次請求已中斷；目前請求狀態請以聊天介面為準。', en: 'Last recorded request interrupted; check the chat for the current request state.' },
+  'diag.cancel.takeaway': { 'zh-CN': 'ℹ 最近一次记录为请求中断，不代表当前请求失败。', 'zh-TW': 'ℹ 最近一次記錄為請求中斷，不代表目前請求失敗。', en: 'ℹ A recorded request was interrupted; check the chat for the current request state.' },
   'diag.quota.defPool': { 'zh-CN': '当前模型', 'zh-TW': '目前模型', en: 'Current model' },
   'diag.unknown.badge': { 'zh-CN': '待确认', 'zh-TW': '待確認', en: 'Error' },
   'diag.unknown.amount': { 'zh-CN': '请求异常', 'zh-TW': '請求異常', en: 'Request Error' },
@@ -6137,6 +6346,8 @@ const PANEL_I18N = {
   'colors.copied': { 'zh-CN': '✔ 已复制 {label}: {val}', 'zh-TW': '✔ 已複製 {label}: {val}', en: '✔ Copied {label}: {val}' },
   'dropdown.countrySearch': { 'zh-CN': '🔍 搜索账号所在地区或代码 (如: 美国、TW、JP)...', 'zh-TW': '🔍 搜尋帳號所在地區或代碼 (如: 美國、TW、JP)...', en: '🔍 Search country or code (e.g. US, TW, JP)...' },
   'dropdown.countryEmpty': { 'zh-CN': '未找到匹配的账号所在地区', 'zh-TW': '找不到相符的帳號所在地區', en: 'No matching country found' },
+  'dropdown.tierSearch': { 'zh-CN': '🔍 搜索套餐规格与子档 (如: Ultra、5x、Pro)...', 'zh-TW': '🔍 搜尋方案規格與子檔 (如: Ultra、5x、Pro)...', en: '🔍 Search plan tier or sub-tier (e.g. Ultra, 5x, Pro)...' },
+  'dropdown.tierEmpty': { 'zh-CN': '未找到匹配的套餐规格', 'zh-TW': '找不到相符的方案規格', en: 'No matching plan tier found' },
   'dropdown.regionSearch': { 'zh-CN': '🔍 搜索订阅国家/地区、货币或缩写 (如: 台湾、澳、USD)...', 'zh-TW': '🔍 搜尋訂閱國家/地區、幣別或縮寫 (如: 台灣、澳、USD)...', en: '🔍 Search billing region or currency (e.g. TW, USD)...' },
   'dropdown.regionEmpty': { 'zh-CN': '未找到匹配的订阅国家/地区', 'zh-TW': '找不到相符的訂閱國家/地區', en: 'No matching billing region found' },
   'dropdown.currencySearch': { 'zh-CN': '🔍 搜索币种名称或代码 (如: USD、NTD、人民币)...', 'zh-TW': '🔍 搜尋幣別名稱或代碼 (如: USD、NTD、台幣)...', en: '🔍 Search currency code or name (e.g. USD, CNY)...' },
@@ -6207,7 +6418,7 @@ const PANEL_I18N = {
 
       // 推荐配置 / 提示词档位 / 品牌标题 / 增强设置
       'enhance.preset.title': { 'zh-CN': '✨ 推荐配置（按需主动应用）', 'zh-TW': '✨ 推薦設定（依需求主動套用）', en: '✨ Recommended Setup (Opt-In)' },
-      'enhance.preset.desc': { 'zh-CN': '只安装插件不会暗中改写您的提示词、标题、语言或上下文。勾选需要开启的能力，点击下方按钮查看改动清单并确认后再执行。', 'zh-TW': '僅安裝外掛不會暗中改寫您的提示詞、標題、語言或上下文。勾選需要開啟的功能，點擊下方按鈕檢視變更清單並確認後再執行。', en: 'Installing never alters prompts, titles, UI language, or context secretly. Select items below and confirm the preview before applying.' },
+      'enhance.preset.desc': { 'zh-CN': '勾选为开，未勾选为关。安装默认全部关闭；只有磁盘上已经打开的项才会显示为开。确认前不会写入。', 'zh-TW': '勾選為開，未勾選為關。安裝預設全部關閉；只有磁碟上已經開啟的項才會顯示為開。確認前不會寫入。', en: 'Checked is on, unchecked is off. Install defaults to all off; only items already written on disk show as on. Nothing is written before confirmation.' },
       'enhance.preset.itemPrompt': { 'zh-CN': '精简防幻觉增强提示词 (4档)', 'zh-TW': '精簡防幻覺增強提示詞 (4檔)', en: 'Lean Anti-Hallucination Prompt (Tier 4)' },
       'enhance.preset.itemPromptSub': { 'zh-CN': '保留原生任务工具规范，注入工具契约与事实校验准则（写入验证，非保证模型不出错）', 'zh-TW': '保留原生任務工具規範，注入工具契約與事實校驗準則（寫入驗證，非保證模型不出錯）', en: 'Keeps native tools, adds verification & tool discipline (template write only; does not guarantee zero errors)' },
       'enhance.preset.itemTitle': { 'zh-CN': '自动中文会话标题', 'zh-TW': '自動中文工作階段標題', en: 'Auto Chinese Chat Titles' },
@@ -9226,13 +9437,23 @@ function formatPeriodCalendarLabel(currentPeriod) {
   let activeCostModel = 'gemini-3.8-flash';
   let activeCostMode = 'ref';
   let autoCheckUpdate = true;
+  let allowBetaUpdates = false;
   let cachedLatestRelease = null;
 
-  const METER_RENDERER_VERSION = typeof METER_VERSION !== 'undefined' ? METER_VERSION : '0.8.8';
+  const METER_RENDERER_VERSION = typeof METER_VERSION !== 'undefined' ? METER_VERSION : '0.8.9';
   function formatDisplayVersion(rawVer) {
     const clean = String(rawVer ?? METER_RENDERER_VERSION).replace(/^v/i, '').trim();
-    if (!clean) return '0.8.8 α';
+    const buildDisplay = typeof METER_DISPLAY_VERSION !== 'undefined' && METER_DISPLAY_VERSION
+      ? String(METER_DISPLAY_VERSION).trim()
+      : '0.8.9';
+    if (!clean) return buildDisplay;
+    const normalizedCurrent = String(METER_RENDERER_VERSION || '').replace(/^v/i, '').trim();
+    if (normalizedCurrent && clean === normalizedCurrent) return buildDisplay;
     if (clean === '0.8.8') return '0.8.8 α';
+    const betaMatch = clean.match(/^(\d+\.\d+\.\d+)-beta(?:\.(\d+))?$/i);
+    if (betaMatch) {
+      return betaMatch[2] && betaMatch[2] !== '1' ? `${betaMatch[1]} β.${betaMatch[2]}` : `${betaMatch[1]} β`;
+    }
     return `v${clean}`;
   }
   const backendStatus = {
@@ -9833,7 +10054,7 @@ function formatPeriodCalendarLabel(currentPeriod) {
 
   function getContinuousScaleStops() {
     const scale = getEffectiveHeatmapScale();
-    const isLight = typeof resolveEffectiveTheme === 'function' && resolveEffectiveTheme() === 'light';
+    const isLight = resolveTheme() === 'light';
     const hasCustomHeat = Boolean(
       customColors.heatLow ||
       customColors.heatHigh ||
@@ -10640,28 +10861,102 @@ function formatPeriodCalendarLabel(currentPeriod) {
   let cachedMeasuredAvailAt = 0;
   let cachedMeasuredWinWidth = 0;
 
+  function isNonConversationSubview() {
+    try {
+      if (typeof document?.querySelector !== 'function') return false;
+      const hasCustomization = Boolean(
+        document.querySelector('[data-testid*="customization"], [class*="customization"], [aria-label*="Customization"], [aria-label*="自定义"]')
+      );
+      const hasBackBtn = Boolean(
+        document.querySelector('button[aria-label*="Back"], button[aria-label*="返回"], [data-testid*="back"]')
+      );
+      return hasCustomization || (hasBackBtn && !document.querySelector('[data-testid="composer"], textarea'));
+    } catch { return false; }
+  }
+
+  function findAuxSidebarContainer() {
+    try {
+      if (typeof document?.querySelector !== 'function') return null;
+      const auxScope = document.querySelector('[data-aux-pane-focus-scope="true"]');
+      if (auxScope) {
+        const tabContent = auxScope.querySelector('div[data-active-tab-id]') || auxScope;
+        return tabContent;
+      }
+      return document.querySelector(
+        '[data-testid="aux-sidebar"], [id="workbench.parts.auxiliarybar"], .auxiliary-bar, .part.auxiliarybar'
+      );
+    } catch { return null; }
+  }
+
+  function findEditorPageContainer() {
+    try {
+      if (typeof document?.querySelector !== 'function') return null;
+      return document.querySelector('[id="workbench.parts.editor"], .editor-group-container, main[role="main"], .monaco-workbench .part.editor');
+    } catch { return null; }
+  }
+
+  function syncDockPositionUi() {
+    const seg = el('dock-pos-segmented');
+    if (seg) {
+      for (const btn of Array.from(seg.children || [])) {
+        const mode = btn.getAttribute?.('data-dock-mode');
+        const active = mode === 'flow' || mode === dockPosition;
+        btn.classList?.toggle?.('active', active);
+        btn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+      }
+    }
+    const noteEl = el('dock-fallback-note');
+    if (noteEl) {
+      noteEl.hidden = true;
+      noteEl.textContent = '';
+    }
+  }
+
+  function syncDockedPanelsAttribute() {
+    for (const id of ['panel', 'panel-tokens', 'panel-quota']) {
+      const p = el(id);
+      if (!p) continue;
+      p.removeAttribute?.('data-panel-docked');
+    }
+  }
+
+  function setDockPosition(mode, opts = {}) {
+    const next = 'flow';
+    dockPosition = next;
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.setItem('ag_dock_position', next);
+    } catch { }
+    layoutMeasurementDirty = true;
+    ensureHostDocked();
+    syncDockPositionUi();
+    syncDockedPanelsAttribute();
+    if (opts.persist !== false && (typeof window?.contextMeterAPI?.saveSettings === 'function' || hasLiveHttpBridge())) {
+      void saveSettingsPayloadBridge({ dockPosition: next });
+    }
+    return dockPosition;
+  }
+
   function ensureHostDocked() {
     if (state.disposed) return;
     if (globalThis.__AGContextMeterActiveHost && globalThis.__AGContextMeterActiveHost !== host) {
       earlyForceDispose();
       return;
     }
-    // 热路径短路：宿主已稳固停靠在预期标题栏内且尺寸未标脏时，跳过 DOM 遍历与强制布局查询
-    if (
-      !layoutMeasurementDirty
-      && host.isConnected
-      && host.getAttribute('data-dock') === 'flow'
-      && observedTitlebar
-      && observedTitlebar.isConnected
-      && observedTitlebar.contains(host)
-      && host.parentElement
-    ) {
-      return;
-    }
+    dockFallbackReason = '';
+
+    try {
+      host.style.removeProperty?.('z-index');
+      host.style.removeProperty?.('pointer-events');
+      host.style.removeProperty?.('left');
+    } catch { }
+    host.style.zIndex = '';
+    host.style.pointerEvents = '';
+    host.style.left = '';
+
+    // 默认或回退模式：始终内联锚定在会话标题栏右侧打开 IDE 左侧三个点的左边同一水平线上
     syncWindowControlsOverlay();
     const titlebar = findHostTitlebar();
     if (titlebar) {
-      // 自愈保护：若主对话区（div.flex[style*="min-width"]）的 inline flex-grow 被意外清空，立即恢复为 1，绝不覆写其他分栏属性
       try {
         const convPane = titlebar.closest?.('div.flex[style*="min-width"]');
         if (convPane?.style && (!convPane.style.flexGrow || convPane.style.flexGrow === '0')) {
@@ -10677,9 +10972,10 @@ function formatPeriodCalendarLabel(currentPeriod) {
         }
       } catch { }
 
-      if (host.parentElement !== targetContainer) {
-        if (targetContainer.firstChild && targetContainer !== titlebar) {
-          targetContainer.insertBefore(host, targetContainer.firstChild);
+      const firstRef = targetContainer.firstElementChild || targetContainer.firstChild || targetContainer.children?.[0];
+      if (host.parentElement !== targetContainer || (firstRef && firstRef !== host && targetContainer !== titlebar)) {
+        if (firstRef && targetContainer !== titlebar) {
+          targetContainer.insertBefore(host, firstRef);
         } else {
           targetContainer.appendChild(host);
         }
@@ -10688,9 +10984,13 @@ function formatPeriodCalendarLabel(currentPeriod) {
       try {
         host.style.removeProperty?.('right');
         host.style.removeProperty?.('top');
+        host.style.removeProperty?.('bottom');
+        host.style.removeProperty?.('position');
       } catch { }
       host.style.right = '';
       host.style.top = '';
+      host.style.bottom = '';
+      host.style.position = '';
 
       if (observedTitlebar !== titlebar) {
         observedTitlebar = titlebar;
@@ -10703,13 +11003,33 @@ function formatPeriodCalendarLabel(currentPeriod) {
         } catch { }
       }
     } else {
-      const fallbackParent = document.body || document.documentElement;
-      if (fallbackParent && host.parentElement !== fallbackParent) {
-        fallbackParent.appendChild(host);
+      // 若未能通过标准类名定位标题栏（如全屏子视图），尝试通过右侧打开 IDE 按钮所在容器内联插入
+      const nativeAnchor = findNativeTopRightAnchor();
+      if (nativeAnchor && nativeAnchor !== document.body && nativeAnchor !== document.documentElement) {
+        if (host.parentElement !== nativeAnchor) {
+          if (nativeAnchor.firstChild) nativeAnchor.insertBefore(host, nativeAnchor.firstChild);
+          else nativeAnchor.appendChild(host);
+        }
+        host.setAttribute('data-dock', 'flow');
+        host.style.right = '';
+        host.style.top = '';
+        host.style.bottom = '';
+        host.style.position = '';
+      } else {
+        // 绝不飞到窗口最上方标题栏 top: 6px！若当前没有任何可用容器，挂载到 body 但保持内联流式样式
+        const fallbackParent = document.body || document.documentElement;
+        if (fallbackParent && host.parentElement !== fallbackParent) {
+          fallbackParent.appendChild(host);
+        }
+        host.setAttribute('data-dock', 'flow');
+        host.style.position = 'relative';
+        host.style.top = '';
+        host.style.right = '';
+        host.style.bottom = '';
       }
-      host.setAttribute('data-dock', 'fixed');
-      updateFixedFallbackPosition();
     }
+    syncDockPositionUi();
+    syncDockedPanelsAttribute();
     updateResponsiveLayout(layoutMeasurementDirty);
   }
 
@@ -10736,28 +11056,13 @@ function formatPeriodCalendarLabel(currentPeriod) {
   }
 
   function updateFixedFallbackPosition() {
-    if (host.getAttribute?.('data-dock') === 'flow') {
-      try {
-        host.style.removeProperty?.('right');
-        host.style.removeProperty?.('top');
-      } catch { }
-      host.style.right = '';
-      host.style.top = '';
-      return;
-    }
+    // 彻底废除 fixed 模式，宿主始终内联锚定，严禁设置 top: 6px 飞至最上方标题栏
     try {
-      const vw = (typeof window !== 'undefined' && window.innerWidth) || 1280;
-      let rightOffset = 144;
-      const anchor = findNativeTopRightAnchor();
-      if (anchor?.getBoundingClientRect) {
-        const r = anchor.getBoundingClientRect();
-        if (r.width > 0 && r.left > 0 && r.left < vw) {
-          rightOffset = Math.max(144, Math.ceil(vw - r.left + 6));
-        }
-      }
-      host.style.top = '6px';
-      host.style.right = `${rightOffset}px`;
+      host.style.removeProperty?.('right');
+      host.style.removeProperty?.('top');
     } catch { }
+    host.style.right = '';
+    host.style.top = '';
   }
 
   // 带迟滞区间（Hysteresis）的四阶段渐进收缩计算，防止临界宽度抖动
@@ -10809,17 +11114,18 @@ function formatPeriodCalendarLabel(currentPeriod) {
       if (titlebar?.getBoundingClientRect) {
         const tbRect = titlebar.getBoundingClientRect();
         if (tbRect.width > 0) {
+          const inSubview = isNonConversationSubview();
           const titleEl = titlebar.firstElementChild;
           const titleInner = titleEl?.firstElementChild;
           const contentStart = titleInner?.getBoundingClientRect
-            ? Math.max(8, titleInner.getBoundingClientRect().left - tbRect.left)
-            : (tbRect.left < 168 ? (168 - tbRect.left) : 12);
+            ? Math.max(inSubview ? 48 : 8, titleInner.getBoundingClientRect().left - tbRect.left)
+            : (inSubview ? 56 : (tbRect.left < 168 ? (168 - tbRect.left) : 12));
           const titleRealW = titleEl?.scrollWidth ? Math.min(320, titleEl.scrollWidth) : 160;
-          const minTitleWidth = tbRect.width < 760
-            ? Math.max(96, Math.min(180, titleRealW))
-            : Math.max(150, titleRealW);
-          let nativeButtonsWidth = 64;
-          let rightPad = 8;
+          const minTitleWidth = inSubview
+            ? Math.max(160, titleRealW)
+            : (tbRect.width < 760 ? Math.max(96, Math.min(180, titleRealW)) : Math.max(150, titleRealW));
+          let nativeButtonsWidth = inSubview ? 120 : 64;
+          let rightPad = inSubview ? 16 : 8;
           let titlebarOwnPadRight = 0;
           if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
             titlebarOwnPadRight = parseFloat(window.getComputedStyle(titlebar).paddingRight) || 0;
@@ -10833,9 +11139,9 @@ function formatPeriodCalendarLabel(currentPeriod) {
               : null;
             const rightClusterVar = root?.style?.getPropertyValue?.('--right-cluster-width')?.trim() || '';
             if (auxOpen) {
-              rightPad = 8;
+              rightPad = inSubview ? 16 : 8;
             } else if (rightClusterVar) {
-              rightPad = Math.max(8, (parseFloat(rightClusterVar) || 44) - 4);
+              rightPad = Math.max(inSubview ? 16 : 8, (parseFloat(rightClusterVar) || 44) - 4);
             } else if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
               rightPad = parseFloat(window.getComputedStyle(rightGroup).paddingRight) || 0;
             }
@@ -10846,7 +11152,7 @@ function formatPeriodCalendarLabel(currentPeriod) {
                   sum += child.getBoundingClientRect().width;
                 }
               }
-              if (sum > 0) nativeButtonsWidth = sum + 6;
+              if (sum > 0) nativeButtonsWidth = sum + (inSubview ? 14 : 6);
             }
           }
           const effectiveRightReserve = Math.max(rightPad, titlebarOwnPadRight);
@@ -11034,6 +11340,18 @@ function formatPeriodCalendarLabel(currentPeriod) {
 
       const placePanel = (panelEl, targetW, anchorBtn) => {
         if (!panelEl) return;
+        const effectiveDock = host.getAttribute?.('data-dock') || 'fixed';
+        if ((effectiveDock === 'aux' || effectiveDock === 'page') && panelEl.id !== 'overflow-menu') {
+          panelEl.setAttribute?.('data-panel-docked', 'true');
+          panelEl.style.position = 'static';
+          panelEl.style.top = '';
+          panelEl.style.left = '';
+          panelEl.style.right = '';
+          panelEl.style.maxWidth = '100%';
+          panelEl.style.maxHeight = '';
+          return;
+        }
+        panelEl.removeAttribute?.('data-panel-docked');
         const bRect = (anchorBtn && anchorBtn.getBoundingClientRect && anchorBtn !== host && anchorBtn.getBoundingClientRect().right > hRect.left)
           ? anchorBtn.getBoundingClientRect()
           : hRect;
@@ -11097,8 +11415,8 @@ function formatPeriodCalendarLabel(currentPeriod) {
   function flushHostDomMutationCheck() {
     domMutationThrottleTimer = null;
     if (state.disposed) return;
-    if (!host.isConnected || host.getAttribute('data-dock') !== 'flow' || !findHostTitlebar()?.contains?.(host)) {
-      scheduleLayoutSync();
+    if (!host.isConnected || (dockPosition === 'flow' && !findHostTitlebar()?.contains?.(host))) {
+      ensureHostDocked();
     }
     scheduleHostModelSync();
   }
@@ -11111,13 +11429,12 @@ function formatPeriodCalendarLabel(currentPeriod) {
     if (typeof MutationObserver !== 'undefined' && document.body) {
       hostDomObserver = new MutationObserver(() => {
         if (state.disposed) return;
-        // 轻量 O(1) 检查优先，其余全量/选择器查询合并节流至低频窗口，防止聊天吐字与切会话卡顿
-        if (!host.isConnected || host.getAttribute('data-dock') !== 'flow') {
+        if (!host.isConnected) {
           layoutMeasurementDirty = true;
-          scheduleLayoutSync();
+          ensureHostDocked();
         }
         if (!domMutationThrottleTimer) {
-          domMutationThrottleTimer = setTimeout(flushHostDomMutationCheck, 180);
+          domMutationThrottleTimer = setTimeout(flushHostDomMutationCheck, 120);
         }
       });
       hostDomObserver.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['aria-label'] });
@@ -11331,6 +11648,7 @@ function formatPeriodCalendarLabel(currentPeriod) {
       hidePopover();
       syncHostStackingElevation(false);
     }
+    syncDockedPanelsAttribute();
   }
 
   let activeContextAnchorId = 'badge';
@@ -11389,6 +11707,27 @@ function formatPeriodCalendarLabel(currentPeriod) {
     openContextSettings?.({ openColors: true });
   });
   el('btn-panel-tokens-palette')?.addEventListener('click', () => toggleTokenColorsDrawer());
+  el('dock-pos-segmented')?.addEventListener('click', e => {
+    const btn = e.target?.closest?.('[data-dock-mode]');
+    const mode = btn?.getAttribute?.('data-dock-mode');
+    if (mode) setDockPosition(mode, { persist: true });
+  });
+  el('quota-mode-segmented')?.addEventListener('click', e => {
+    const btn = e.target?.closest?.('[data-quota-window-mode]');
+    const mode = btn?.getAttribute?.('data-quota-window-mode');
+    if (mode) setQuotaBadgeWindowMode(mode, { persist: true });
+  });
+  const onVersionBadgeActivate = () => {
+    openContextSettings?.({ scrollToUpdate: true });
+  };
+  el('v')?.addEventListener('click', onVersionBadgeActivate);
+  el('v')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onVersionBadgeActivate(); }
+  });
+  el('v-tokens')?.addEventListener('click', onVersionBadgeActivate);
+  el('v-tokens')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onVersionBadgeActivate(); }
+  });
 
   // =========================================================================
   // 统一定制下拉组件控制器 (国家 / 订阅地区 / 币种 / 增强 Select)
@@ -11951,6 +12290,34 @@ function closeAllDropdowns(exceptWrap = null) {
     return opt.label;
   }
 
+  const PLAN_TIER_OPTIONS = [
+    { value: 'auto', label: '✨ 自动检测 (Auto-detect)', labelZh: '✨ 自动检测 (Auto-detect)', labelTw: '✨ 自動檢測 (Auto-detect)', labelEn: '✨ Auto-detect' },
+    { value: 'free', label: 'Free (免费版)', labelZh: 'Free (免费版)', labelTw: 'Free (免費版)', labelEn: 'Free' },
+    { value: 'pro', label: 'Google AI Pro', labelZh: 'Google AI Pro', labelTw: 'Google AI Pro', labelEn: 'Google AI Pro' },
+    { value: 'ultra', label: 'Google AI Ultra', labelZh: 'Google AI Ultra', labelTw: 'Google AI Ultra', labelEn: 'Google AI Ultra' },
+    { value: 'ultra_5x', label: 'Google AI Ultra (5x)', labelZh: 'Google AI Ultra (5x)', labelTw: 'Google AI Ultra (5x)', labelEn: 'Google AI Ultra (5x)' },
+    { value: 'ultra_20x', label: 'Google AI Ultra (20x)', labelZh: 'Google AI Ultra (20x)', labelTw: 'Google AI Ultra (20x)', labelEn: 'Google AI Ultra (20x)' }
+  ];
+
+  // 刷新套餐规格直接选择器显示
+  function refreshDirectPlanTierDisplay(currentVal) {
+    const label = el('direct-tier-label');
+    const tag = el('p-det-tier-tag');
+    if (!label) return;
+    const ps = ANTIGRAVITY_TOKEN_DATA.planStatus || {};
+    const email = ps.email || 'default';
+    const effectiveCustom = (typeof getStoredCustomPlanSnapshot === 'function') ? getStoredCustomPlanSnapshot(email) : null;
+    const override = currentVal || ps.planTierOverride || effectiveCustom?.planTierOverride || 'auto';
+    const matched = PLAN_TIER_OPTIONS.find(o => o.value === override);
+    if (override && override !== 'auto') {
+      label.textContent = matched ? formatOptionLabelByLang(matched) : override;
+      if (tag) tag.style.display = 'inline-block';
+    } else {
+      label.textContent = formatOptionLabelByLang(PLAN_TIER_OPTIONS[0]);
+      if (tag) tag.style.display = 'none';
+    }
+  }
+
   // 刷新国家直接选择器显示
   function refreshDirectCountryDisplay(currentCountryVal) {
     const label = el('direct-country-label');
@@ -12495,6 +12862,53 @@ function closeAllDropdowns(exceptWrap = null) {
     void persistSettingsToHost({ email, customPlan: customObj });
   }
 
+  function applyDirectPlanTierSelection(tierVal) {
+    ++userActionSeq;
+    const ps = ANTIGRAVITY_TOKEN_DATA.planStatus || {};
+    const email = ps.email || 'default';
+    const prevCustom = (typeof getStoredCustomPlanSnapshot === 'function') ? getStoredCustomPlanSnapshot(email) : null;
+    const customObj = {
+      ...(prevCustom || {})
+    };
+    if (tierVal && tierVal !== 'auto') {
+      customObj.planTierOverride = tierVal;
+    } else {
+      delete customObj.planTierOverride;
+    }
+    applyCustomPlanObjectLocally(customObj, email);
+    void persistSettingsToHost({ email, customPlan: customObj });
+    refreshDirectPlanTierDisplay(tierVal);
+  }
+
+  el('direct-tier-select')?.addEventListener('change', (e) => {
+    if (isHydratingUiControls) return;
+    applyDirectPlanTierSelection(e.target?.value || 'auto');
+  });
+
+  function initDirectPlanTierDropdown() {
+    return initDropdownController({
+      wrapId: 'direct-tier-wrap',
+      triggerId: 'direct-tier-trigger',
+      labelId: 'direct-tier-label',
+      menuId: 'direct-tier-menu',
+      selectId: 'direct-tier-select',
+      getAriaLabel: () => t('plan.tier.aria'),
+      searchPlaceholder: () => t('dropdown.tierSearch'),
+      getOptions: () => PLAN_TIER_OPTIONS.map(o => ({ ...o, label: formatOptionLabelByLang(o) })),
+      getSelectedValue: () => {
+        const ps = ANTIGRAVITY_TOKEN_DATA.planStatus || {};
+        const email = ps.email || 'default';
+        const effectiveCustom = (typeof getStoredCustomPlanSnapshot === 'function') ? getStoredCustomPlanSnapshot(email) : null;
+        return ps.planTierOverride || effectiveCustom?.planTierOverride || 'auto';
+      },
+      getLabelText: (opt) => formatOptionLabelByLang(opt),
+      onSelect: (opt) => {
+        applyDirectPlanTierSelection(opt.value);
+      },
+      emptyText: () => t('dropdown.tierEmpty')
+    });
+  }
+
   el('direct-country-select')?.addEventListener('change', (e) => {
     if (isHydratingUiControls) return;
     applyDirectCountrySelection(e.target?.value || '');
@@ -12610,7 +13024,8 @@ function closeAllDropdowns(exceptWrap = null) {
     });
   }
 
-  // 立即触发初始化三大原生定制下拉
+  // 立即触发初始化四大原生定制下拉
+  initDirectPlanTierDropdown();
   initDirectCountryDropdown();
   initDirectRegionDropdown();
   initDirectCurrencyDropdown();
@@ -12631,17 +13046,11 @@ function closeAllDropdowns(exceptWrap = null) {
     });
   }
 
-  // 套餐详情卡片展开与收回（统一走 setPlanDetailExpanded）
-  el('plan-summary-price-badge')?.addEventListener('click', () => {
-    setPlanDetailExpanded(!planDetailExpanded);
-  });
+  // 套餐详情卡片展开与收回（统一单入口 #btn-plan-detail-toggle 与底部 #btn-plan-detail-collapse）
   el('btn-plan-detail-toggle')?.addEventListener('click', () => {
     const card = el('plan-detail-card');
     const currentlyHidden = !card || card.style.display === 'none' || !card.style.display;
     setPlanDetailExpanded(currentlyHidden);
-  });
-  el('btn-plan-detail-collapse-top')?.addEventListener('click', () => {
-    setPlanDetailExpanded(false);
   });
   el('btn-plan-detail-collapse')?.addEventListener('click', () => {
     setPlanDetailExpanded(false);
@@ -12766,7 +13175,7 @@ function closeAllDropdowns(exceptWrap = null) {
       const ctrl = enhancedDropdowns.get(spec.selectId) || initNativeSelectDropdown(spec.selectId, spec);
       ctrl?.refresh?.();
     }
-    for (const wrapId of ['direct-country-wrap', 'direct-region-wrap', 'direct-currency-wrap']) {
+    for (const wrapId of ['direct-country-wrap', 'direct-region-wrap', 'direct-currency-wrap', 'direct-tier-wrap']) {
       el(wrapId)?._controller?.refresh?.();
     }
   }
@@ -13509,6 +13918,13 @@ function closeAllDropdowns(exceptWrap = null) {
 
     const detCountry = el('p-det-country');
     const tagCountry = el('p-det-country-tag');
+    const tagTier = el('p-det-tier-tag');
+    if (tagTier) {
+      const isCustomTier = ps.sources?.tier === 'custom' || (ps.planTierOverride && ps.planTierOverride !== 'auto');
+      tagTier.style.display = isCustomTier ? 'inline-block' : 'none';
+      tagTier.textContent = isCustomTier ? t('plan.tag.custom') : '';
+    }
+    const directTierSel = el('direct-tier-select');
     const directCountrySel = el('direct-country-select');
     const rawCountryStr = ps.country ? String(ps.country).trim() : '';
     const isCountryUnknown = !rawCountryStr || rawCountryStr === '未知' || rawCountryStr === 'Unknown' || rawCountryStr.includes('未设置');
@@ -13543,6 +13959,9 @@ function closeAllDropdowns(exceptWrap = null) {
 
     // 使用纯同步回填守卫同步更新详情面板内的下拉控件值
     runWithUiHydration(() => {
+      if (directTierSel) {
+        directTierSel.value = ps.planTierOverride || 'auto';
+      }
       if (directCountrySel) {
         if (countryText !== '未知' && directCountrySel.options) {
           const exists = Array.from(directCountrySel.options).some(o => o.value === countryText);
@@ -13560,7 +13979,10 @@ function closeAllDropdowns(exceptWrap = null) {
       }
     });
 
-    // 刷新国家、订阅地区与币种直接选择器标签与选中高亮
+    // 刷新套餐规格、国家、订阅地区与币种直接选择器标签与选中高亮
+    if (typeof refreshDirectPlanTierDisplay === 'function') {
+      refreshDirectPlanTierDisplay(ps.planTierOverride || 'auto');
+    }
     if (typeof refreshDirectCountryDisplay === 'function') {
       refreshDirectCountryDisplay(countryText);
     }
@@ -13569,6 +13991,18 @@ function closeAllDropdowns(exceptWrap = null) {
     }
     if (typeof refreshDirectCurrencyDisplay === 'function') {
       refreshDirectCurrencyDisplay(curText);
+    }
+
+    // 同步更新额度面板顶部套餐胶囊 (#quota-plan-tier-pill)
+    const tierPill = el('quota-plan-tier-pill');
+    if (tierPill && ps.tierName && ps.tierName !== '未知') {
+      setQuotaHiddenIfChanged(tierPill, false);
+      setQuotaTextIfChanged(tierPill, ps.tierName);
+    }
+
+    // 同步刷新多账号列表中展示的套餐名
+    if (typeof renderAccountsOverviewSection === 'function' && accountsUiState?.overview) {
+      try { renderAccountsOverviewSection(); } catch {}
     }
 
     const detAcq = el('p-det-acq');
@@ -14427,7 +14861,48 @@ function closeAllDropdowns(exceptWrap = null) {
   }
   el('overflow-cli-btn')?.addEventListener('click', () => { void triggerLaunchCli(); });
 
-  el('badge-quota')?.addEventListener('click', () => toggleQuota('badge-quota'));
+  function syncQuotaWindowModeUi() {
+    const seg = el('quota-mode-segmented');
+    if (seg) {
+      for (const btn of Array.from(seg.children || [])) {
+        const mode = btn.getAttribute?.('data-quota-window-mode');
+        const active = mode === quotaBadgeWindowMode;
+        btn.classList?.toggle?.('active', active);
+        btn.setAttribute?.('aria-pressed', active ? 'true' : 'false');
+      }
+    }
+  }
+
+  function setQuotaBadgeWindowMode(mode, opts = {}) {
+    const next = VALID_QUOTA_WINDOW_MODES.includes(mode) ? mode : 'auto';
+    quotaBadgeWindowMode = next;
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.setItem('ag_quota_badge_window_mode', next);
+    } catch { }
+    syncQuotaWindowModeUi();
+    if (typeof renderQuotaBoard === 'function') {
+      renderQuotaBoard(Date.now(), { animate: false });
+    }
+    if (opts.persist !== false && (typeof window?.contextMeterAPI?.saveSettings === 'function' || hasLiveHttpBridge())) {
+      void saveSettingsPayloadBridge({ quotaBadgeWindowMode: next });
+    }
+    return quotaBadgeWindowMode;
+  }
+
+  function cycleQuotaBadgeWindowMode() {
+    const idx = VALID_QUOTA_WINDOW_MODES.indexOf(quotaBadgeWindowMode);
+    const next = VALID_QUOTA_WINDOW_MODES[(idx + 1) % VALID_QUOTA_WINDOW_MODES.length];
+    return setQuotaBadgeWindowMode(next, { persist: true });
+  }
+
+  el('badge-quota')?.addEventListener('click', e => {
+    if (e?.altKey) {
+      e.preventDefault?.();
+      cycleQuotaBadgeWindowMode();
+      return;
+    }
+    toggleQuota('badge-quota');
+  });
   el('badge').addEventListener('click', () => toggleContext('badge'));
   el('badge-speed')?.addEventListener('click', () => toggleContext('badge-speed'));
   el('badge-tokens').addEventListener('click', () => toggleTokens('badge-tokens'));
@@ -14447,7 +14922,7 @@ function closeAllDropdowns(exceptWrap = null) {
   el('close').addEventListener('click', () => showPanel('none'));
   el('close-tokens')?.addEventListener('click', () => showPanel('none'));
   el('close-quota')?.addEventListener('click', () => showPanel('none'));
-  el('badge-quota')?.addEventListener('contextmenu', e => { e.preventDefault(); cycleTheme(); });
+  el('badge-quota')?.addEventListener('contextmenu', e => { e.preventDefault(); cycleQuotaBadgeWindowMode(); });
 
   // 上下文圆环悬停与键盘聚焦气泡（面板打开时不通过悬停误切，必须通过显式左键点击切换）
   el('badge').addEventListener('mouseenter', () => {
@@ -15808,6 +16283,9 @@ function closeAllDropdowns(exceptWrap = null) {
     switchContextTab('settings');
     if (opts.openColors) {
       toggleColorsDrawer(true);
+    }
+    if (opts.scrollToUpdate) {
+      try { el('settings-about-update-card')?.scrollIntoView?.({ block: 'nearest' }); } catch { }
     }
     positionFloatingPanels();
   }
@@ -18104,6 +18582,7 @@ function closeAllDropdowns(exceptWrap = null) {
       if (!res || !res.ok || !res.data) {
         unlockStatusFetchError = true;
         currentUnlockStatus = null;
+        syncRecommendedCheckboxes();
         if (unlockStatusDesc) unlockStatusDesc.textContent = t('status.client.unavailable');
         renderCompactSessionCard();
         renderClientStatusBar();
@@ -18114,6 +18593,7 @@ function closeAllDropdowns(exceptWrap = null) {
       unlockStatusFetchError = false;
       const data = res.data;
       currentUnlockStatus = data;
+      syncRecommendedCheckboxes();
       lastPartialReason = data.partialMatchReason || data.error || '';
       if (typeof data.hostSupportsRestart === 'boolean') {
         hostSupportsRestart = data.hostSupportsRestart;
@@ -18979,6 +19459,7 @@ function closeAllDropdowns(exceptWrap = null) {
         if (locReg) regInp.value = locReg;
       }
       if (typeof refreshRegionPresetSelectOptions === 'function') refreshRegionPresetSelectOptions();
+      if (typeof refreshDirectPlanTierDisplay === 'function') refreshDirectPlanTierDisplay();
       if (typeof refreshDirectCountryDisplay === 'function') refreshDirectCountryDisplay();
       if (typeof refreshDirectRegionDisplay === 'function') refreshDirectRegionDisplay();
       if (typeof refreshDirectCurrencyDisplay === 'function') refreshDirectCurrencyDisplay();
@@ -19209,6 +19690,56 @@ function closeAllDropdowns(exceptWrap = null) {
   let enhancePromptResultState = null; // { ok, resolveMessage }
   let brandFeedbackState = null;       // { mode, isSuccess, resolveMessage, isApplied }
   let lastProxyTestState = null;       // { pending, thrownErr, res }
+  const recDirty = { prompt: false, title: false, lang: false, ctx: false };
+
+  function recommendedPromptOn() {
+    const s = currentEnhanceStatus?.summary || currentEnhanceStatus;
+    return Number(s?.promptTier) === 4;
+  }
+  function recommendedTitleOn() {
+    const s = currentEnhanceStatus?.summary || currentEnhanceStatus;
+    return s?.chineseTitleMode === 'zh';
+  }
+  function recommendedLangOn() {
+    return Boolean(currentChineseEnabled);
+  }
+  function recommendedCtxOn() {
+    return currentUnlockStatus?.configuredMode === 'dynamic';
+  }
+
+  function getRecommendedDiff() {
+    const diff = [];
+    if (Boolean(chkPresetPrompt?.checked) !== recommendedPromptOn()) diff.push({ key: 'prompt', enable: Boolean(chkPresetPrompt?.checked) });
+    if (Boolean(chkPresetTitle?.checked) !== recommendedTitleOn()) diff.push({ key: 'title', enable: Boolean(chkPresetTitle?.checked) });
+    if (Boolean(chkPresetLang?.checked) !== recommendedLangOn()) diff.push({ key: 'lang', enable: Boolean(chkPresetLang?.checked) });
+    if (Boolean(chkPresetCtx?.checked) !== recommendedCtxOn()) diff.push({ key: 'ctx', enable: Boolean(chkPresetCtx?.checked) });
+    return diff;
+  }
+
+  function syncRecommendedCheckboxes({ force = false } = {}) {
+    const unsupported = Boolean(currentEnhanceStatus && currentEnhanceStatus.supported === false);
+    const ctxUnsupported = Boolean(
+      currentUnlockStatus &&
+      currentUnlockStatus.isPlatformSupported === false &&
+      currentUnlockStatus.status === 'unsupported'
+    );
+    if (chkPresetPrompt && (force || !recDirty.prompt)) {
+      chkPresetPrompt.checked = !unsupported && recommendedPromptOn();
+      if (force) recDirty.prompt = false;
+    }
+    if (chkPresetTitle && (force || !recDirty.title)) {
+      chkPresetTitle.checked = !unsupported && recommendedTitleOn();
+      if (force) recDirty.title = false;
+    }
+    if (chkPresetLang && (force || !recDirty.lang)) {
+      chkPresetLang.checked = recommendedLangOn();
+      if (force) recDirty.lang = false;
+    }
+    if (chkPresetCtx && (force || !recDirty.ctx)) {
+      chkPresetCtx.checked = !ctxUnsupported && recommendedCtxOn();
+      if (force) recDirty.ctx = false;
+    }
+  }
 
   function syncBrandTitleButtons(mode = currentBrandTitle) {
     for (const [k, btn] of Object.entries(brandTitleBtns)) {
@@ -19434,12 +19965,13 @@ function closeAllDropdowns(exceptWrap = null) {
   }
 
   function getSelectedPresetLabelResolvers() {
-    const resolvers = [];
-    if (chkPresetPrompt?.checked) resolvers.push(() => t('enhance.preset.itemPrompt'));
-    if (chkPresetTitle?.checked) resolvers.push(() => t('enhance.preset.itemTitle'));
-    if (chkPresetLang?.checked) resolvers.push(() => t('enhance.preset.itemLang'));
-    if (chkPresetCtx?.checked) resolvers.push(() => t('enhance.preset.itemCtx'));
-    return resolvers;
+    const labels = {
+      prompt: () => t('enhance.preset.itemPrompt'),
+      title: () => t('enhance.preset.itemTitle'),
+      lang: () => t('enhance.preset.itemLang'),
+      ctx: () => t('enhance.preset.itemCtx')
+    };
+    return getRecommendedDiff().map((item) => labels[item.key]);
   }
 
   function renderEnhancePresetConfirmText() {
@@ -19523,6 +20055,7 @@ function closeAllDropdowns(exceptWrap = null) {
         }));
       }
     }
+    syncRecommendedCheckboxes({ force: forceSyncDrafts });
     renderEnhanceSectionUI();
   }
 
@@ -19661,6 +20194,12 @@ function closeAllDropdowns(exceptWrap = null) {
     }
   });
 
+  [['prompt', chkPresetPrompt], ['title', chkPresetTitle], ['lang', chkPresetLang], ['ctx', chkPresetCtx]].forEach(([key, box]) => {
+    box?.addEventListener('change', () => {
+      recDirty[key] = true;
+    });
+  });
+
   btnEnhancePresetApply?.addEventListener('click', () => {
     if (isEnhanceBusy) return;
     const selectedResolvers = getSelectedPresetLabelResolvers();
@@ -19691,10 +20230,11 @@ function closeAllDropdowns(exceptWrap = null) {
     if (enhancePresetConfirm) enhancePresetConfirm.hidden = true;
     if (!mode || isEnhanceBusy) return;
 
-    const wantPrompt = Boolean(chkPresetPrompt?.checked);
-    const wantTitle = Boolean(chkPresetTitle?.checked);
-    const wantLang = Boolean(chkPresetLang?.checked);
-    const wantCtx = Boolean(chkPresetCtx?.checked);
+    const presetDiff = mode === 'preset' ? getRecommendedDiff() : [];
+    const wantPrompt = presetDiff.find((item) => item.key === 'prompt');
+    const wantTitle = presetDiff.find((item) => item.key === 'title');
+    const wantLang = presetDiff.find((item) => item.key === 'lang');
+    const wantCtx = presetDiff.find((item) => item.key === 'ctx');
 
     isEnhanceBusy = true;
     syncEnhanceInteractiveDisabledState();
@@ -19714,8 +20254,8 @@ function closeAllDropdowns(exceptWrap = null) {
           const resolveItemLabel = () => [wantPrompt ? t('enhance.preset.itemPrompt') : '', wantTitle ? t('enhance.preset.itemTitle') : ''].filter(Boolean).join(t('list.sep'));
           try {
             const payload = {};
-            if (wantPrompt) payload.promptTier = 4;
-            if (wantTitle) payload.chineseTitle = true;
+            if (wantPrompt) payload.promptTier = wantPrompt.enable ? 4 : 0;
+            if (wantTitle) payload.chineseTitle = Boolean(wantTitle.enable);
             const eRes = await invokeEnhanceApi('apply', payload);
             if (!eRes || !eRes.ok) {
               const errPayload = eRes;
@@ -19737,9 +20277,9 @@ function closeAllDropdowns(exceptWrap = null) {
 
         if (wantLang) {
           try {
-            const lRes = await invokeModulesApi('toggle', 'chinese', true, {
-              language: 'zh-CN',
-              brandTitle: currentBrandTitle
+            const lRes = await invokeModulesApi('toggle', 'chinese', Boolean(wantLang.enable), {
+              language: wantLang.enable ? 'zh-CN' : 'en',
+              brandTitle: wantLang.enable ? currentBrandTitle : 'english'
             });
             if (!lRes || !lRes.ok) {
               const errPayload = lRes;
@@ -19757,7 +20297,9 @@ function closeAllDropdowns(exceptWrap = null) {
 
         if (wantCtx) {
           try {
-            const cRes = await invokeUnlockApi('apply', { mode: 'dynamic', limitTokens: null });
+            const cRes = wantCtx.enable
+              ? await invokeUnlockApi('apply', { mode: 'dynamic', limitTokens: null })
+              : await invokeUnlockApi('restore', {});
             if (!cRes || !cRes.ok) {
               const rawErr = cRes?.error;
               failedResolvers.push(() => `${t('enhance.preset.itemCtx')}: ${buildFriendlyWriteError(rawErr)}`);
@@ -20198,6 +20740,7 @@ function closeAllDropdowns(exceptWrap = null) {
       }
 
       currentChineseEnabled = Boolean(cfg.modules?.chinese?.enabled);
+      syncRecommendedCheckboxes();
       currentBrandTitle = cfg.modules?.chinese?.brandTitle || 'english';
       syncBrandTitleButtons(currentBrandTitle);
       syncRuntimeBrandConfig(currentBrandTitle);
@@ -21987,6 +22530,26 @@ function closeAllDropdowns(exceptWrap = null) {
           const chk = el('check-auto-update');
           if (chk) chk.checked = autoCheckUpdate;
         }
+        const savedAllowBeta = settingsRes.allowBetaUpdates !== undefined
+          ? settingsRes.allowBetaUpdates
+          : settingsRes.uiPreferences?.allowBetaUpdates;
+        if (savedAllowBeta !== undefined) {
+          allowBetaUpdates = savedAllowBeta === true;
+          const chkBeta = el('check-allow-beta-updates');
+          if (chkBeta) chkBeta.checked = allowBetaUpdates;
+        }
+        const savedDock = settingsRes.dockPosition || settingsRes.uiPreferences?.dockPosition;
+        if (savedDock && savedDock !== 'flow') {
+          setDockPosition('flow', { persist: true });
+        } else {
+          syncDockPositionUi();
+        }
+        const savedQuotaMode = settingsRes.quotaBadgeWindowMode || settingsRes.uiPreferences?.quotaBadgeWindowMode;
+        if (savedQuotaMode && VALID_QUOTA_WINDOW_MODES.includes(savedQuotaMode) && savedQuotaMode !== quotaBadgeWindowMode) {
+          setQuotaBadgeWindowMode(savedQuotaMode, { persist: false });
+        } else {
+          syncQuotaWindowModeUi();
+        }
         const savedLang = settingsRes.panelLanguage || settingsRes.uiPreferences?.panelLanguage;
         if (savedLang && ['zh-CN', 'zh-TW', 'en'].includes(savedLang) && savedLang !== currentPanelLanguage) {
           await applyPanelLanguage(savedLang, { persist: false });
@@ -22129,7 +22692,9 @@ function closeAllDropdowns(exceptWrap = null) {
   function positionUpdatePopover(trigger = currentUpdateTrigger) {
     const pop = el('update-popover');
     if (!pop) return;
-    const triggerBtn = trigger === 'ctx' ? el('btn-check-update-ctx') : el('btn-check-update');
+    const triggerBtn = trigger === 'ctx'
+      ? (el('btn-check-update-ctx') || el('v') || el('btn-check-update'))
+      : (el('btn-check-update') || el('v'));
     if (!triggerBtn || typeof triggerBtn.getBoundingClientRect !== 'function') return;
     const rect = triggerBtn.getBoundingClientRect();
     const winW = typeof window !== 'undefined' ? (window.innerWidth || 1024) : 1024;
@@ -22219,7 +22784,7 @@ function closeAllDropdowns(exceptWrap = null) {
     }
 
     try {
-      const checkReq = { force: manual, currentVersion: currentVer };
+      const checkReq = { force: manual, currentVersion: currentVer, allowBetaUpdates };
       const out = await callBackendWithPriority({
         ipcCall: hasIpcUpdateBridge ? () => window.contextMeterAPI.checkUpdate(checkReq) : null,
         liveRoute: '/check-update',
@@ -22438,6 +23003,17 @@ function closeAllDropdowns(exceptWrap = null) {
       void saveSettingsPayloadBridge({ autoCheckUpdate });
     }
   });
+
+  const chkBetaInit = el('check-allow-beta-updates');
+  if (chkBetaInit) {
+    chkBetaInit.checked = allowBetaUpdates;
+    chkBetaInit.addEventListener('change', e => {
+      allowBetaUpdates = e.target.checked === true;
+      if (typeof window?.contextMeterAPI?.saveSettings === 'function' || hasLiveHttpBridge()) {
+        void saveSettingsPayloadBridge({ allowBetaUpdates });
+      }
+    });
+  }
 
 var cumLockedKey = null;
   var cumHoveredKey = null;
@@ -24070,7 +24646,9 @@ var cumLockedKey = null;
     const isTw = currentPanelLanguage === 'zh-TW';
     const activeColor = evalRes.badge?.color || '';
 
+    const bSpeed = el('badge-speed');
     const speedAmount = el('speed-amount');
+    const waitSvgWrap = el('badge-speed-wait-svg');
     const overflowSpeedVal = el('overflow-speed-val');
     const topBolt = el('badge-speed-icon');
     const cardBolt = el('speed-summary-bolt');
@@ -24081,22 +24659,35 @@ var cumLockedKey = null;
 
     const isCompact = state.layoutMode === 'compact';
     const shortSampleText = t('session.speed.shortSampleBadge');
-    if (speedAmount) {
-      if (evalRes.phase === 'waiting') {
-        speedAmount.textContent = isCompact ? evalRes.elapsedFormatted : (isEn ? `Wait ${evalRes.elapsedFormatted}` : `等待 ${evalRes.elapsedFormatted}`);
-        if (overflowSpeedVal) overflowSpeedVal.textContent = `${evalRes.elapsedFormatted}`;
-      } else if (evalRes.isSampleSparse) {
-        speedAmount.textContent = shortSampleText;
-        if (overflowSpeedVal) overflowSpeedVal.textContent = shortSampleText;
-      } else if (evalRes.streamSpeed != null) {
-        speedAmount.textContent = isCompact ? `${evalRes.streamSpeed}` : `${evalRes.streamSpeed} tok/s`;
-        if (overflowSpeedVal) overflowSpeedVal.textContent = `${evalRes.streamSpeed} tok/s`;
-      } else if (evalRes.overallTps != null) {
-        speedAmount.textContent = isCompact ? `${evalRes.overallTps}` : `${evalRes.overallTps} tok/s`;
-        if (overflowSpeedVal) overflowSpeedVal.textContent = `${evalRes.overallTps} tok/s`;
-      } else {
-        speedAmount.textContent = isCompact ? '--' : '-- tok/s';
-        if (overflowSpeedVal) overflowSpeedVal.textContent = '-- tok/s';
+    if (evalRes.phase === 'waiting') {
+      // ELV-93: 等待态顶栏纯 SVG 沙漏动效，去除每秒文字变化导致的横向抖动
+      bSpeed?.setAttribute?.('data-speed-phase', 'waiting');
+      if (waitSvgWrap) waitSvgWrap.hidden = false;
+      if (speedAmount) speedAmount.textContent = '';
+      if (overflowSpeedVal) overflowSpeedVal.textContent = `${evalRes.elapsedFormatted || '0s'}`;
+      if (bSpeed) {
+        const waitTip = t('badge.speedWaitTitle', { elapsed: evalRes.elapsedFormatted || '0s' });
+        bSpeed.title = waitTip;
+        bSpeed.setAttribute?.('aria-label', waitTip);
+      }
+    } else {
+      bSpeed?.removeAttribute?.('data-speed-phase');
+      if (waitSvgWrap) waitSvgWrap.hidden = true;
+      bSpeed?.setAttribute?.('aria-label', t('badge.speed.aria'));
+      if (speedAmount) {
+        if (evalRes.isSampleSparse) {
+          speedAmount.textContent = shortSampleText;
+          if (overflowSpeedVal) overflowSpeedVal.textContent = shortSampleText;
+        } else if (evalRes.streamSpeed != null) {
+          speedAmount.textContent = isCompact ? `${evalRes.streamSpeed}` : `${evalRes.streamSpeed} tok/s`;
+          if (overflowSpeedVal) overflowSpeedVal.textContent = `${evalRes.streamSpeed} tok/s`;
+        } else if (evalRes.overallTps != null) {
+          speedAmount.textContent = isCompact ? `${evalRes.overallTps}` : `${evalRes.overallTps} tok/s`;
+          if (overflowSpeedVal) overflowSpeedVal.textContent = `${evalRes.overallTps} tok/s`;
+        } else {
+          speedAmount.textContent = isCompact ? '--' : '-- tok/s';
+          if (overflowSpeedVal) overflowSpeedVal.textContent = '-- tok/s';
+        }
       }
     }
 
@@ -25071,7 +25662,7 @@ var cumLockedKey = null;
       }
     }
 
-    const status = disp.isError
+    const status = disp.isError || disp.kind === 'canceled'
       ? disp.statusText
       : stale ? t('badge.status.stale')
         : state.scanError ? t('badge.status.scanErr', { err: translateBackendText(state.scanError) })
@@ -25173,7 +25764,12 @@ var cumLockedKey = null;
             }
           }
         }
-        if (keyTakeaway) keyTakeaway.textContent = disp.keyTakeaway;
+        if (keyTakeaway) {
+          keyTakeaway.textContent = disp.keyTakeaway;
+          const showErrTakeaway = Boolean(disp.isError);
+          keyTakeaway.hidden = !showErrTakeaway;
+          keyTakeaway.style.display = showErrTakeaway ? '' : 'none';
+        }
       } else if (d?.actual != null && pct != null) {
         const limitVal = d.budget || 256000;
         const remainVal = Math.max(0, limitVal - d.actual);
@@ -25190,10 +25786,16 @@ var cumLockedKey = null;
         if (keyTakeaway) {
           if (pct >= 90) {
             keyTakeaway.textContent = t('key.takeaway.90', { pct: pct.toFixed(1), rem: short(remainVal) });
+            keyTakeaway.hidden = false;
+            keyTakeaway.style.display = '';
           } else if (pct >= 75) {
             keyTakeaway.textContent = t('key.takeaway.75', { pct: pct.toFixed(1), rem: short(remainVal) });
+            keyTakeaway.hidden = false;
+            keyTakeaway.style.display = '';
           } else {
             keyTakeaway.textContent = t('key.takeaway.ok', { pct: pct.toFixed(1), rem: short(remainVal) });
+            keyTakeaway.hidden = true;
+            keyTakeaway.style.display = 'none';
           }
         }
       } else {
@@ -25201,7 +25803,11 @@ var cumLockedKey = null;
         if (keyUsed) keyUsed.textContent = d?.estimate ? t('key.estPrefix', { val: short(d.estimate) }) : (session?.total ? short(session.total.low) : '—');
         if (keyLimit) keyLimit.textContent = d?.budget ? short(d.budget) : '—';
         if (keyRemaining) keyRemaining.textContent = t('key.pending');
-        if (keyTakeaway) keyTakeaway.textContent = t('key.takeaway.est');
+        if (keyTakeaway) {
+          keyTakeaway.textContent = t('key.takeaway.est');
+          keyTakeaway.hidden = true;
+          keyTakeaway.style.display = 'none';
+        }
       }
     }
 
@@ -26199,6 +26805,7 @@ var cumLockedKey = null;
   function computeQuotaVisualSignature(view) {
     if (!view || !Array.isArray(view.pools)) return 'empty';
     const parts = [
+      quotaBadgeWindowMode || 'auto',
       view.currentModel?.productKey || '',
       view.activeStatus || '',
       view.badge?.fraction == null ? 'null' : view.badge.fraction.toFixed(4)
@@ -26493,6 +27100,64 @@ var cumLockedKey = null;
     return applied?.snapshot || view;
   }
 
+  function applyQuotaBadgeWindowModeToView(view, core) {
+    if (!view || !Array.isArray(view.pools) || !view.pools.length) return view;
+    const mode = VALID_QUOTA_WINDOW_MODES.includes(quotaBadgeWindowMode) ? quotaBadgeWindowMode : 'auto';
+    const targetPool = (view.currentModel?.poolKey
+      ? view.pools.find(p => p.poolKey === view.currentModel.poolKey)
+      : null) || view.pools[0] || null;
+    if (!targetPool || !Array.isArray(targetPool.buckets) || !targetPool.buckets.length) {
+      return { ...view, badge: { ...(view.badge || {}), windowMode: mode, dualBuckets: null } };
+    }
+    const selFn = typeof selectPrimaryQuotaBucket === 'function' ? selectPrimaryQuotaBucket : core?.selectPrimaryQuotaBucket;
+    const pickMode = mode === 'both' ? 'auto' : mode;
+    const sel = selFn ? selFn(targetPool.buckets, pickMode) : null;
+    const pb = sel?.primaryBucket || targetPool.primaryBucket || targetPool.buckets[0] || null;
+    if (pb) {
+      targetPool.primaryBucket = pb;
+      targetPool.selectionReason = sel?.selectionReason || targetPool.selectionReason;
+    }
+
+    const fmtPct = f => (core?.formatQuotaPercentText ? core.formatQuotaPercentText(f) : `${Math.round(Number(f) * 100)}%`);
+    let dualBuckets = null;
+    const pairFn = typeof resolveQuotaWindowBucketPair === 'function' ? resolveQuotaWindowBucketPair : core?.resolveQuotaWindowBucketPair;
+    if (mode === 'both' && pairFn && view.activeStatus !== 'error' && view.activeStatus !== 'no_permission') {
+      const pair = pairFn(targetPool.buckets);
+      if (pair?.bucket5h && pair?.bucket7d && pair.bucket5h.remainingFraction != null && pair.bucket7d.remainingFraction != null) {
+        dualBuckets = [
+          { key: '5h', text: `5h ${fmtPct(pair.bucket5h.remainingFraction)}` },
+          { key: '7d', text: `7d ${fmtPct(pair.bucket7d.remainingFraction)}` }
+        ];
+      }
+    }
+
+    const nextBadge = { ...(view.badge || {}), windowMode: mode, dualBuckets };
+    let nextActiveReset = view.activeReset;
+    if (pb && pb.remainingFraction != null && view.activeStatus !== 'error' && view.activeStatus !== 'no_permission') {
+      nextBadge.fraction = pb.remainingFraction;
+      if (pb.isExhausted || pb.remainingFraction === 0) {
+        nextBadge.text = t('quota.short.exhausted');
+      } else {
+        nextBadge.text = fmtPct(pb.remainingFraction);
+      }
+      nextBadge.tag = view.syncState === 'stale' ? t('quota.short.stale') : (pb.windowShort || '');
+      nextActiveReset = {
+        hasResetTime: Boolean(pb.hasResetTime),
+        resetTimeIso: pb.resetTimeIso ?? null,
+        resetAtMs: pb.resetAtMs ?? null,
+        resetTimeText: pb.resetTimeText ?? null,
+        countdownText: pb.countdownText ?? null,
+        isResetPassed: Boolean(pb.isResetPassed)
+      };
+    }
+
+    return {
+      ...view,
+      badge: nextBadge,
+      activeReset: nextActiveReset
+    };
+  }
+
   function computeEffectiveQuotaView(nowMs = Date.now()) {
     const core = typeof __AGContextMeterCore !== 'undefined' ? __AGContextMeterCore : null;
     const currentModelInput = getActiveQuotaModelInput();
@@ -26512,7 +27177,7 @@ var cumLockedKey = null;
         },
         nowMs
       });
-      return attachTokenEstimatesToQuotaView(built, nowMs);
+      return applyQuotaBadgeWindowModeToView(attachTokenEstimatesToQuotaView(built, nowMs), core);
     }
 
     // 2. 基于主进程返回的标准化 snapshot 重新结合当前会话模型与实时 nowMs 刷新视图状态
@@ -26557,13 +27222,14 @@ var cumLockedKey = null;
           isResetPassed: rm.isResetPassed
         };
       });
+      const pickMode = quotaBadgeWindowMode === 'both' ? 'auto' : quotaBadgeWindowMode;
       const sel = (typeof selectPrimaryQuotaBucket === 'function')
-        ? selectPrimaryQuotaBucket(nextBuckets)
+        ? selectPrimaryQuotaBucket(nextBuckets, pickMode)
         : (() => {
             const priced = nextBuckets.filter(b => b.remainingFraction !== null).sort((a, b) => a.remainingFraction - b.remainingFraction);
             return { primaryBucket: priced[0] || nextBuckets[0] || null, selectionReason: priced.length <= 1 ? 'single_window' : 'tighter_window' };
           })();
-      const pb = sel.primaryBucket || p.primaryBucket || null;
+      const pb = sel.primaryBucket || p.primaryBucket || nextBuckets[0] || null;
       return {
         ...p,
         buckets: nextBuckets,
@@ -26682,7 +27348,7 @@ var cumLockedKey = null;
       badgeText = t('quota.short.stale');
     }
 
-    return attachTokenEstimatesToQuotaView({
+    const baseOut = attachTokenEstimatesToQuotaView({
       ...base,
       syncState,
       fetchedAtMs: lastOkMs,
@@ -26713,6 +27379,7 @@ var cumLockedKey = null;
       browsePoolKey: quotaState.browsePoolKey || matchedPool?.poolKey || updatedPools[0]?.poolKey || null,
       pools: updatedPools
     }, nowMs);
+    return applyQuotaBadgeWindowModeToView(baseOut, core);
   }
 
   function formatBucketTokenEstimateLine(est) {
@@ -26978,6 +27645,7 @@ var cumLockedKey = null;
     const qFill = el('quota-ring-fill');
     const qVal = el('quota-badge-val');
     const qTag = el('quota-badge-tag');
+    const qDual = el('quota-badge-dual');
     const oQuotaVal = el('overflow-quota-val');
 
     if (bQuota) {
@@ -26987,7 +27655,9 @@ var cumLockedKey = null;
       const reasonMap = {
         tighter_window: currentPanelLanguage === 'en' ? 'tightest window' : (currentPanelLanguage === 'zh-TW' ? '最緊縮視窗優先' : '最紧缩窗口优先'),
         tie_window: currentPanelLanguage === 'en' ? '5h priority on tie' : (currentPanelLanguage === 'zh-TW' ? '同餘量優先短視窗' : '同余量优先短窗口'),
-        single_window: currentPanelLanguage === 'en' ? 'single window' : (currentPanelLanguage === 'zh-TW' ? '單一限額視窗' : '单一限额窗口')
+        single_window: currentPanelLanguage === 'en' ? 'single window' : (currentPanelLanguage === 'zh-TW' ? '單一限額視窗' : '单一限额窗口'),
+        user_5h: t('quota.modeTag.5h'),
+        user_weekly: t('quota.modeTag.weekly')
       };
       const winLines = (matchedPoolObj?.buckets || []).map(b => {
         const wTag = b.windowShort || formatQuotaWindowTitle(b);
@@ -26997,13 +27667,14 @@ var cumLockedKey = null;
       const selNote = matchedPoolObj?.primaryBucket
         ? `${matchedPoolObj.primaryBucket.windowShort || formatQuotaWindowTitle(matchedPoolObj.primaryBucket)} · ${reasonMap[matchedPoolObj.selectionReason] || ''}`
         : '';
+      const modeTag = t(`quota.modeTag.${quotaBadgeWindowMode}`);
       const updatedStr = view.fetchedAtMs ? new Date(view.fetchedAtMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : t('quota.time.unknown');
       const poolHeader = matchedPoolObj?.title ? ` · ${matchedPoolObj.title}` : '';
       const tipReset = view.activeReset?.hasResetTime
         ? `${view.activeReset.resetTimeText} (${formatCountdownMsCompact((view.activeReset.resetAtMs || 0) - nowMs)})`
         : t('quota.time.unknown');
       const nextTitle = [
-        `${tipModel}${poolHeader} · ${view.activeStatusLabel} (${view.badge.text})${selNote ? ` [${selNote}]` : ''}`,
+        `${tipModel}${poolHeader} · ${view.activeStatusLabel} (${view.badge.text})${selNote ? ` [${selNote}]` : ''} · [${modeTag}]`,
         winLines.length ? winLines.join(' | ') : `${t('quota.time.reset')}: ${tipReset}`,
         `${currentPanelLanguage === 'en' ? 'Updated' : '更新'}: ${updatedStr}`
       ].filter(Boolean).join('\n');
@@ -27033,38 +27704,71 @@ var cumLockedKey = null;
         quotaBadgeLastHasFraction = true;
       }
     }
-    if (qVal) {
-      const hasNumericPct = view.activeStatus !== 'exhausted' && view.activeStatus !== 'no_permission' && view.activeStatus !== 'error' && view.activeStatus !== 'unknown' && view.badge.fraction != null;
-      if (hasNumericPct) {
-        animateQuotaPercentNode(qVal, view.badge.fraction, shouldAnimate, view.badge.text);
-      } else {
-        let dispVal = view.badge.text;
-        if (view.activeStatus === 'exhausted') dispVal = t('quota.short.exhausted');
-        else if (view.activeStatus === 'no_permission') dispVal = t('quota.short.no_permission');
-        else if (view.activeStatus === 'error') dispVal = t('quota.short.error');
-        else if (view.activeStatus === 'unknown' || view.badge.fraction == null) {
-          dispVal = view.activeStatus === 'stale' ? t('quota.short.stale') : t('quota.short.unknown');
-        }
-        animateQuotaPercentNode(qVal, null, false, dispVal);
-      }
+    const useDualDisplay = quotaBadgeWindowMode === 'both'
+      && state.layoutMode !== 'compact'
+      && Array.isArray(view.badge.dualBuckets)
+      && view.badge.dualBuckets.length === 2;
+    if (bQuota) {
+      if (useDualDisplay) bQuota.setAttribute?.('data-quota-dual', 'true');
+      else bQuota.removeAttribute?.('data-quota-dual');
     }
-    if (qTag) {
-      let dispTag = view.badge.tag;
-      if (view.activeStatus === 'error') dispTag = t('quota.retry');
-      else if (view.activeStatus === 'stale' && view.badge.fraction != null) dispTag = t('quota.short.stale');
-      if (dispTag) {
-        setQuotaHiddenIfChanged(qTag, false);
-        setQuotaTextIfChanged(qTag, dispTag);
-      } else {
-        setQuotaHiddenIfChanged(qTag, true);
-        setQuotaTextIfChanged(qTag, '');
+    if (useDualDisplay && qDual) {
+      if (qVal) setQuotaHiddenIfChanged(qVal, true);
+      if (qTag) setQuotaHiddenIfChanged(qTag, true);
+      setQuotaHiddenIfChanged(qDual, false);
+      const line0 = qDual.children?.[0] || document.createElement('span');
+      line0.className = 'quota-dual-line';
+      line0.textContent = view.badge.dualBuckets[0].text;
+      const line1 = qDual.children?.[1] || document.createElement('span');
+      line1.className = 'quota-dual-line is-secondary';
+      line1.textContent = view.badge.dualBuckets[1].text;
+      if (qDual.children?.length !== 2) {
+        qDual.replaceChildren?.();
+        qDual.appendChild?.(line0);
+        qDual.appendChild?.(line1);
+      }
+    } else {
+      if (qDual) setQuotaHiddenIfChanged(qDual, true);
+      if (qVal) {
+        setQuotaHiddenIfChanged(qVal, false);
+        const hasNumericPct = view.activeStatus !== 'exhausted' && view.activeStatus !== 'no_permission' && view.activeStatus !== 'error' && view.badge.fraction != null;
+        if (hasNumericPct) {
+          animateQuotaPercentNode(qVal, view.badge.fraction, shouldAnimate, view.badge.text);
+          if (!shouldAnimate) {
+            setQuotaTextIfChanged(qVal, view.badge.text);
+          }
+        } else {
+          let dispVal = view.badge.text;
+          if (view.activeStatus === 'exhausted') dispVal = t('quota.short.exhausted');
+          else if (view.activeStatus === 'no_permission') dispVal = t('quota.short.no_permission');
+          else if (view.activeStatus === 'error') dispVal = t('quota.short.error');
+          else if (view.activeStatus === 'unknown' || view.badge.fraction == null) {
+            dispVal = view.activeStatus === 'stale' ? t('quota.short.stale') : (view.badge.text || t('quota.short.unknown'));
+          }
+          animateQuotaPercentNode(qVal, null, false, dispVal);
+          setQuotaTextIfChanged(qVal, dispVal);
+        }
+      }
+      if (qTag) {
+        let dispTag = view.badge.tag;
+        if (view.activeStatus === 'error') dispTag = t('quota.retry');
+        else if (view.activeStatus === 'stale' && view.badge.fraction != null) dispTag = t('quota.short.stale');
+        if (dispTag) {
+          setQuotaHiddenIfChanged(qTag, false);
+          setQuotaTextIfChanged(qTag, dispTag);
+        } else {
+          setQuotaHiddenIfChanged(qTag, true);
+          setQuotaTextIfChanged(qTag, '');
+        }
       }
     }
     if (oQuotaVal) {
-      const dispTxt = view.badge.fraction != null && view.activeStatus !== 'exhausted' && view.activeStatus !== 'no_permission' && view.activeStatus !== 'error'
-        ? view.badge.text
-        : (qVal ? qVal.textContent : view.badge.text);
-      const dispTag = (qTag && !qTag.hidden) ? qTag.textContent : '';
+      const dispTxt = useDualDisplay
+        ? view.badge.dualBuckets.map(b => b.text).join(' / ')
+        : (view.badge.fraction != null && view.activeStatus !== 'exhausted' && view.activeStatus !== 'no_permission' && view.activeStatus !== 'error'
+          ? view.badge.text
+          : (qVal ? qVal.textContent : view.badge.text));
+      const dispTag = (!useDualDisplay && qTag && !qTag.hidden) ? qTag.textContent : '';
       setQuotaTextIfChanged(oQuotaVal, dispTag ? `${dispTxt} · ${dispTag}` : dispTxt);
     }
 
@@ -27938,7 +28642,17 @@ var cumLockedKey = null;
           topRow.className = 'quota-subcard-row';
           const left = document.createElement('span');
           left.className = 'quota-acct-email';
-          left.textContent = `${acc.email}${acc.tierId ? ` · ${acc.tierId}` : ''}`;
+          const resolveAccountTierLabel = (a) => {
+            if (!a) return '';
+            const curEmail = ANTIGRAVITY_TOKEN_DATA.planStatus?.email;
+            if (a.isActive && curEmail && (typeof normalizeEmail === 'function' ? normalizeEmail(a.email) === normalizeEmail(curEmail) : a.email === curEmail)) {
+              const curName = ANTIGRAVITY_TOKEN_DATA.planStatus?.tierName;
+              if (curName && curName !== '未知') return curName;
+            }
+            return a.tierName || a.tierId || '';
+          };
+          const accTierLabel = resolveAccountTierLabel(acc);
+          left.textContent = `${acc.email}${accTierLabel ? ` · ${accTierLabel}` : ''}`;
           left.title = acc.email;
           const right = document.createElement('div');
           right.className = 'quota-subsec-actions';
@@ -27977,13 +28691,66 @@ var cumLockedKey = null;
           topRow.appendChild(right);
           card.appendChild(topRow);
 
-          const poolSummaries = (acc.quotaSnapshot?.pools || []).map(p => {
-            const pName = p.poolKey === 'shared_gemini_main' ? 'Hydrogen' : (p.poolKey === 'shared_3p_pool' ? 'Claude/3P' : (p.poolKey === 'shared_gemini_argon' ? 'Argon' : 'Carbon'));
-            const pVal = p.noPermission
-              ? t('accounts.poolNoAccess')
-              : (p.percentText && p.percentText !== '未知' ? p.percentText : t('accounts.poolUnknown'));
-            return `${pName}: ${pVal}`;
-          });
+          const CORE_POOL_NAMES = {
+            shared_gemini_main: 'Hydrogen',
+            shared_3p_pool: 'Claude/3P',
+            shared_gemini_argon: 'Argon',
+            shared_gemini_carbon: 'Carbon'
+          };
+
+          const poolSummaries = [];
+          for (const p of (acc.quotaSnapshot?.pools || [])) {
+            if (!p || typeof p !== 'object') continue;
+            const pName = CORE_POOL_NAMES[p.poolKey];
+            // 严禁使用 else 'Carbon' 兜底！只展示四大核心共享池，过滤掉历史快照中已残留的 shared_chat_* / shared_gemini-25-pro* 等非核心杂项池
+            if (!pName) continue;
+
+            // Carbon 显示规则：
+            // 当 shared_gemini_carbon 具有真实可用权限（!p.noPermission 且有配额数据，即 Ultra 用户）时，必须正常显示 Carbon 额度；
+            // 当 p.noPermission === true（无权限，如 Free / Pro 用户）时，在多账号卡片摘要行中直接隐藏该无权限项，不显示 "Carbon: 无模型权限"，更不能把别的池显示成 Carbon。
+            if (p.poolKey === 'shared_gemini_carbon') {
+              if (p.noPermission) continue;
+              const hasQuotaData = (Array.isArray(p.buckets) && p.buckets.some(b => b && b.remainingFraction !== null && b.remainingFraction !== undefined && Number.isFinite(Number(b.remainingFraction))))
+                || (p.remainingFraction !== null && p.remainingFraction !== undefined && Number.isFinite(Number(p.remainingFraction)));
+              if (!hasQuotaData) continue;
+            }
+
+            if (p.noPermission) {
+              poolSummaries.push(`${pName}: ${t('accounts.poolNoAccess')}`);
+              continue;
+            }
+
+            const buckets = Array.isArray(p.buckets) ? p.buckets.filter(Boolean) : [];
+            const b5h = buckets.find(b => b.windowKey === '5h' || b.windowShort === '5h') || null;
+            const b7d = buckets.find(b => b.windowKey === 'weekly' || b.windowShort === '7d') || null;
+
+            const formatBucketPct = (b) => {
+              if (!b) return '';
+              if (b.percentText && b.percentText !== '未知') return b.percentText;
+              if (b.remainingFraction !== null && b.remainingFraction !== undefined && Number.isFinite(Number(b.remainingFraction))) {
+                return `${Math.round(b.remainingFraction * 100)}%`;
+              }
+              return '—';
+            };
+
+            if (b5h && b7d) {
+              // 若同时存在 5h 与 7d 桶，格式明确显示为 "Hydrogen: 5h 0% / 7d 70%"、"Claude/3P: 5h 100% / 7d 87%"
+              poolSummaries.push(`${pName}: 5h ${formatBucketPct(b5h)} / 7d ${formatBucketPct(b7d)}`);
+            } else if (b5h) {
+              const tag = b5h.windowShort || '5h';
+              poolSummaries.push(`${pName}: ${tag} ${formatBucketPct(b5h)}`);
+            } else if (b7d) {
+              // 若仅存在单一窗口桶（如 Argon 仅有 7d 桶，或 free-tier 仅有 7d 桶），明确带上窗口短标显示为 "Argon: 7d 70%"、"Hydrogen: 7d 100%"
+              const tag = b7d.windowShort || '7d';
+              poolSummaries.push(`${pName}: ${tag} ${formatBucketPct(b7d)}`);
+            } else if (buckets.length === 1 && buckets[0]?.windowShort) {
+              poolSummaries.push(`${pName}: ${buckets[0].windowShort} ${formatBucketPct(buckets[0])}`);
+            } else {
+              // 仅在 bucket 无 windowShort 时回退 p.percentText
+              const pVal = p.percentText && p.percentText !== '未知' ? p.percentText : t('accounts.poolUnknown');
+              poolSummaries.push(`${pName}: ${pVal}`);
+            }
+          }
           const metaRow = document.createElement('div');
           metaRow.className = 'quota-acct-meta';
           const updRaw = acc.lastQuotaUpdatedAtMs ? new Date(acc.lastQuotaUpdatedAtMs).toLocaleTimeString() : '—';
@@ -28946,9 +29713,16 @@ var cumLockedKey = null;
       tokensVal: el('speed-tokens')?.textContent || '',
       subLabel: el('speed-sub-label')?.textContent || '',
       takeaway: el('speed-takeaway')?.textContent || '',
+      topSpeedText: el('speed-amount')?.textContent || '',
+      topSpeedPhase: el('badge-speed')?.getAttribute?.('data-speed-phase') || null,
+      topWaitSvgVisible: Boolean(el('badge-speed-wait-svg') && !el('badge-speed-wait-svg').hidden),
       breakdownOpen: state.speedBreakdownOpen,
       lastEval: state.lastSpeedEval
     }),
+    setDockPosition: (mode, opts = {}) => setDockPosition(mode, opts),
+    getDockPosition: () => ({ dockPosition, actualDock: host.getAttribute('data-dock'), fallbackReason: dockFallbackReason }),
+    setQuotaBadgeWindowMode: (mode, opts = {}) => setQuotaBadgeWindowMode(mode, opts),
+    getQuotaBadgeWindowMode: () => quotaBadgeWindowMode,
     getTokenCacheBreakdownForTest: () => ({
       input: el('tcb-input-val')?.textContent || '',
       cacheRead: el('tcb-cache-val')?.textContent || '',
@@ -29033,6 +29807,9 @@ var cumLockedKey = null;
     }
   };
   syncPanelLanguageButtons(currentPanelLanguage);
+  if (el('v-tokens')) el('v-tokens').textContent = formatDisplayVersion(METER_RENDERER_VERSION);
+  syncDockPositionUi();
+  syncQuotaWindowModeUi();
   applyStaticPanelTranslations(shadow);
   refreshRegionPresetSelectOptions();
   renderEnhanceSectionUI();

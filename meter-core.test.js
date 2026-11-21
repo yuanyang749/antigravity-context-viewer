@@ -1153,6 +1153,48 @@ test('unrecognized server errors are marked unknown with sanitized diagnostic in
   assert.doesNotMatch(s.errorClassification.diagnostic, /https:\/\/daily-cloudcode-pa/);
 });
 
+test('plain Go cancellations are recognized without attributing them to the user', () => {
+  const messages = [
+    'stream reading error: context canceled',
+    'request failed: Post "https://example.invalid/private-api": context canceled',
+    'rpc error: code = Canceled desc = context cancelled',
+    'context canceled by user',
+    'user cancelled',
+    'request was aborted',
+    'AbortError'
+  ];
+  const previous = summarize(entry({ inputTokens: 12000, outputTokens: 200 }, { maxContextTokens: 512000 }));
+  for (const error of messages) {
+    const d = entry({}, { maxContextTokens: 512000 });
+    d.chatModel.retryInfos = [{ error }];
+    const result = summarize(d, { previousValidContext: previous });
+    assert.equal(result.status, 'canceled', error);
+    assert.equal(result.errorClassification.kind, 'canceled', error);
+    assert.equal(result.errorClassification.badgeText, '已中断');
+    assert.doesNotMatch(result.errorClassification.detail, /已由用户|用户主动|用户取消/);
+    assert.doesNotMatch(result.errorClassification.diagnostic, /https:\/\/example/);
+    assert.equal(result.actual, previous.actual);
+    assert.equal(result.budget, previous.budget);
+    assert.equal(result.exceeded, false);
+    assert.equal(result.network, false);
+  }
+  assert.equal(classifyRequestError('context deadline exceeded').kind, 'network_error');
+  assert.equal(classifyRequestError('unexpected internal error').kind, 'unknown');
+});
+
+test('cancelled requests are not relabeled exhausted from quota snapshot alone', () => {
+  const options = {
+    currentModel: 'gemini-4-argon-high',
+    cascadeModelConfigs: [{
+      modelId: 'gemini-4-argon-high', label: 'Gemini 4 Argon (High)',
+      quotaInfo: { remainingFraction: 0 }
+    }]
+  };
+  assert.equal(classifyRequestError('request failed: context canceled', options).kind, 'canceled');
+  assert.equal(classifyRequestError('weekly quota exceeded; context canceled', options).kind, 'quota_exhausted');
+  assert.equal(classifyRequestError(exceeded + '; context canceled', options).kind, 'context_overflow');
+});
+
 test('getLvlForRange: accurate thresholds for day, week and month ranges', () => {
   // 1. day: 绝对阈值 (0, <3M, <15M, <60M, >=60M)
   assert.equal(getLvlForRange(0, 'day'), 0);
@@ -1240,6 +1282,39 @@ test('semver & update filtering: strictly accepts v0.x tags, ignores asset filen
   assert.equal(compareVersions('0.7.0', '0.8.0'), -1);
   assert.equal(compareVersions('0.8.8', '0.8.8'), 0);
   assert.equal(compareVersions('0.8.9', '0.8.8'), 1);
+
+  // 预发布版本比较规则：0.8.8 < 0.8.9-beta.1 < 0.8.9-beta.2 < 0.8.9
+  assert.deepEqual(parseSemver('v0.8.9-beta.1'), { major: 0, minor: 8, patch: 9, prerelease: 'beta.1' });
+  assert.equal(compareVersions('0.8.8', '0.8.9-beta.1'), -1);
+  assert.equal(compareVersions('0.8.9-beta.1', '0.8.9-beta.2'), -1);
+  assert.equal(compareVersions('0.8.9-beta.2', '0.8.9'), -1);
+  assert.equal(compareVersions('0.8.9', '0.8.9-beta.2'), 1);
+  assert.equal(compareVersions('0.8.9-beta.1', '0.8.9-beta.1'), 0);
+  assert.equal(compareVersions('0.8.9-beta.10', '0.8.9-beta.2'), 1);
+
+  // Release 通道隔离与 beta 升级到正式版
+  const preReleases = [
+    { tag_name: 'v0.8.9-beta.1', draft: false, prerelease: true, html_url: 'https://github.com/.../v0.8.9-beta.1', assets: [] },
+    { tag_name: 'v0.8.9-beta.2', draft: false, prerelease: true, html_url: 'https://github.com/.../v0.8.9-beta.2', assets: [] }
+  ];
+  // 正式版用户默认不推送 beta
+  assert.equal(filterReleases(preReleases, '0.8.8').length, 0);
+  assert.equal(filterReleases(preReleases, '0.8.8', { allowBetaUpdates: false }).length, 0);
+  // 正式版用户开启 beta 开关时可收到 beta.2
+  const optInForStable = filterReleases(preReleases, '0.8.8', { allowBetaUpdates: true });
+  assert.equal(optInForStable.length, 2);
+  assert.equal(optInForStable[0].version, '0.8.9-beta.2');
+  // beta.1 用户可升级到 beta.2 与正式版 0.8.9（且 0.8.9 排在最前）
+  const withStable = [
+    ...preReleases,
+    { tag_name: 'v0.8.9', draft: false, prerelease: false, html_url: 'https://github.com/.../v0.8.9', assets: [] }
+  ];
+  const forBetaUser = filterReleases(withStable, '0.8.9-beta.1');
+  assert.equal(forBetaUser.length, 2);
+  assert.equal(forBetaUser[0].version, '0.8.9');
+  assert.equal(forBetaUser[0].prerelease, false);
+  assert.equal(forBetaUser[1].version, '0.8.9-beta.2');
+  assert.equal(forBetaUser[1].prerelease, true);
 
   // Release 过滤测试：包含历史 Release（ZIP 中仍可能带有 2.7.x 文件名）
   const mockReleases = [
@@ -4790,4 +4865,83 @@ test('v0.8.8 i18n/货币基础能力: 48国预设含完整 nameTw/nameEn 且无�
   const norm = normalizeTokenHistoryPayload({ dailyMap: {}, dailyMapBySource: { all: {}, desktop: {}, cli: {} } });
   assert.equal(norm.currentPeriod.periodType, 'calendar_month');
   assert.doesNotMatch(norm.currentPeriod.label, /[\u4e00-\u9fff]/);
+});
+
+test('Issue #41 & ELV-94 settings: selectPrimaryQuotaBucket supports auto/5h/weekly and dockPosition/quotaBadgeWindowMode persist safely', () => {
+  const { selectPrimaryQuotaBucket, resolveQuotaWindowBucketPair } = require('./meter-core');
+  const { getPluginSettings, savePluginSettings } = require('./meter-collector');
+  const buckets = [
+    { bucketId: 'b5h', windowKey: '5h', windowShort: '5h', remainingFraction: 0.92 },
+    { bucketId: 'b7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.64 }
+  ];
+  assert.equal(selectPrimaryQuotaBucket(buckets, 'auto').primaryBucket.windowShort, '7d');
+  assert.equal(selectPrimaryQuotaBucket(buckets, '5h').primaryBucket.windowShort, '5h');
+  assert.equal(selectPrimaryQuotaBucket(buckets, 'weekly').primaryBucket.windowShort, '7d');
+  const pair = resolveQuotaWindowBucketPair(buckets);
+  assert.equal(pair.bucket5h.remainingFraction, 0.92);
+  assert.equal(pair.bucket7d.remainingFraction, 0.64);
+
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-ui-prefs-'));
+  try {
+    const defSettings = getPluginSettings({ agDir: tmpDir });
+    assert.equal(defSettings.dockPosition, 'flow');
+    assert.equal(defSettings.quotaBadgeWindowMode, 'auto');
+
+    savePluginSettings({ dockPosition: 'aux', quotaBadgeWindowMode: 'both' }, { agDir: tmpDir });
+    const next = getPluginSettings({ agDir: tmpDir });
+    assert.equal(next.dockPosition, 'aux');
+    assert.equal(next.quotaBadgeWindowMode, 'both');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Issue #49: parseUserPlanStatus 自动提取 5x/20x 倍率子档与 resolveEffectivePlanStatus 手动覆盖', () => {
+  // 1. 服务端返回 5x 明确子档倍率（字符串）
+  const res5x = parseUserPlanStatus({
+    userStatus: {
+      userTier: { id: 'g1-ultra-5x-tier', name: 'Google AI Ultra 5x' }
+    }
+  });
+  assert.equal(res5x.tierKey, 'ultra');
+  assert.equal(res5x.tierName, 'Google AI Ultra (5x)');
+  assert.equal(res5x.multiplier, 5);
+
+  // 2. 服务端返回 20x 明确子档倍率（数值 multiplier）
+  const res20x = parseUserPlanStatus({
+    userStatus: {
+      userTier: { id: 'g1-ultra-tier', name: 'Google AI Ultra', multiplier: 20 }
+    }
+  });
+  assert.equal(res20x.tierKey, 'ultra');
+  assert.equal(res20x.tierName, 'Google AI Ultra (20x)');
+  assert.equal(res20x.multiplier, 20);
+
+  // 3. 用户手动选择覆盖：优先于服务端返回值
+  const effManual5x = resolveEffectivePlanStatus(res20x, {
+    planTierOverride: 'ultra_5x'
+  });
+  assert.equal(effManual5x.tierKey, 'ultra');
+  assert.equal(effManual5x.tierName, 'Google AI Ultra (5x)');
+  assert.equal(effManual5x.multiplier, 5);
+  assert.equal(effManual5x.sources.tier, 'custom');
+
+  // 4. 手动覆盖为 Free / Pro / Ultra 20x
+  const effFree = resolveEffectivePlanStatus(res20x, { planTierOverride: 'free' });
+  assert.equal(effFree.tierKey, 'free');
+  assert.equal(effFree.tierName, 'Free');
+
+  const effPro = resolveEffectivePlanStatus(res20x, { planTierOverride: 'pro' });
+  assert.equal(effPro.tierKey, 'pro');
+  assert.equal(effPro.tierName, 'Google AI Pro');
+
+  // 5. 手动选择 auto 时，恢复以服务端返回为准
+  const effAuto = resolveEffectivePlanStatus(res20x, { planTierOverride: 'auto' });
+  assert.equal(effAuto.tierKey, 'ultra');
+  assert.equal(effAuto.tierName, 'Google AI Ultra (20x)');
+  assert.equal(effAuto.multiplier, 20);
+  assert.equal(effAuto.sources.tier, 'live');
 });

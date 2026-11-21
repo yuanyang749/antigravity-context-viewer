@@ -94,7 +94,37 @@ function harness(scanSession = session(), extraSandbox = null) {
   };
   const host = element(); host.attachShadow = () => ({ set innerHTML(value) {}, getElementById(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); } });
   const pending = [], scans = [], timers = [];
-  const sandbox = { location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/c/11111111-1111-1111-1111-111111111111' }, document: { createElement: () => element(), getElementById: id => docElements.get(id) || null, documentElement: { appendChild() {} }, addEventListener() {}, removeEventListener() {}, hidden: false }, window: { __APP_CONFIG__: { csrfToken: 'test' }, contextMeterAPI: { scan: id => new Promise(resolve => scans.push({ id, resolve })) } }, __AGContextMeterCore: core, AbortController, Date, setTimeout: () => 1, clearTimeout() {}, setInterval(callback) { timers.push(callback); return 1; }, clearInterval() {}, fetch(url, options) { return new Promise(resolve => pending.push({ url, options, resolve })); }, ...(extraSandbox && typeof extraSandbox === 'object' ? extraSandbox : {}) };
+  const docListeners = new Map();
+  const sandbox = {
+    location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/c/11111111-1111-1111-1111-111111111111' },
+    document: {
+      createElement: () => element(),
+      getElementById: id => docElements.get(id) || null,
+      documentElement: { appendChild() {} },
+      addEventListener(type, fn) {
+        if (!docListeners.has(type)) docListeners.set(type, new Set());
+        docListeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        docListeners.get(type)?.delete(fn);
+      },
+      dispatchEvent(ev) {
+        const type = ev?.type || ev;
+        for (const fn of (docListeners.get(type) || [])) fn(ev);
+      },
+      hidden: false
+    },
+    window: { __APP_CONFIG__: { csrfToken: 'test' }, contextMeterAPI: { scan: id => new Promise(resolve => scans.push({ id, resolve })) } },
+    __AGContextMeterCore: core,
+    AbortController,
+    Date,
+    setTimeout: () => 1,
+    clearTimeout() {},
+    setInterval(callback) { timers.push(callback); return 1; },
+    clearInterval() {},
+    fetch(url, options) { return new Promise(resolve => pending.push({ url, options, resolve })); },
+    ...(extraSandbox && typeof extraSandbox === 'object' ? extraSandbox : {})
+  };
   // First createElement call is the host; later calls are safe text-only file rows.
   let first = true; sandbox.document.createElement = () => { if (first) { first = false; return host; } return element(); };
   vm.createContext(sandbox); vm.runInContext(source, sandbox);
@@ -540,6 +570,45 @@ test('custom background color (panelBg), custom Color Picker HEX->RGB/HSL sync, 
   api.resetCustomColors();
   assert.equal(h.host.getAttribute('data-panel-tone'), null);
   api.dispose();
+});
+
+test('daily heatmap repaints low and high usage with the active purple theme', t => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  t.after(() => api.dispose());
+
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const lowDay = yesterday.toLocaleDateString('en-CA');
+  const highDay = today.toLocaleDateString('en-CA');
+  api.setTokenHistoryForTest({
+    firstUseDate: lowDay,
+    dailyMap: { [lowDay]: { total: 145700 }, [highDay]: { total: 131110000 } }
+  });
+  api.switchHeatView('daily');
+
+  function cellColors() {
+    const cells = h.elements.get('h-grid-cols').children.flatMap(col => col.children);
+    return [lowDay, highDay].map(day =>
+      cells.find(cell => cell.getAttribute('data-date') === day).style.backgroundColor);
+  }
+
+  api.setTheme('dark');
+  assert.deepEqual(cellColors(), ['#5f27b2', '#d8b4fe']);
+
+  api.setTheme('light');
+  const legendStops = [1, 2, 3, 4].map(i => h.elements.get(`heat-leg-${i}`).style.background);
+  const lowResponse = core.computeColorScaleResponse(145700, 'heat');
+  const lightColors = [core.interpolateScaleColorHsl(lowResponse, legendStops), legendStops[3]];
+  assert.deepEqual(cellColors(), lightColors);
+
+  h.sandbox.document.documentElement.style = { colorScheme: 'dark' };
+  api.setTheme('auto');
+  assert.deepEqual(cellColors(), ['#5f27b2', '#d8b4fe']);
+  h.sandbox.document.documentElement.style.colorScheme = 'light';
+  api.setTheme('auto');
+  assert.deepEqual(cellColors(), lightColors);
 });
 
 test('timeline starts at actual firstUseDate with zero leading blank cells and supports multi-year archive pagination', () => {
@@ -1061,11 +1130,10 @@ test('tray/root startup visibility, settings save/restore (country, subscription
   assert.match(h.elements.get('plan-save-feedback').textContent, /保存失败.*模拟磁盘只读/);
   shouldFailSave = false;
 
-  // 3. 验证 AI Pro 详情展开、手动“详情收回”按钮、切换预估费用自动关闭详情及异步返回防重开
+  // 3. 验证 AI Pro 详情单入口展开/收起、切换预估费用自动关闭详情及异步返回防重开
   h.elements.get('badge-tokens').click();
   const detailCard = h.elements.get('plan-detail-card');
   const toggleBtn = h.elements.get('btn-plan-detail-toggle');
-  const collapseTopBtn = h.elements.get('btn-plan-detail-collapse-top');
   const collapseBottomBtn = h.elements.get('btn-plan-detail-collapse');
   const customForm = h.elements.get('plan-custom-form');
 
@@ -1078,8 +1146,8 @@ test('tray/root startup visibility, settings save/restore (country, subscription
   h.elements.get('btn-edit-plan-custom').click();
   assert.equal(customForm.style.display, 'block');
 
-  // 点击顶部“详情收回 ▲”按钮手动关闭
-  collapseTopBtn.click();
+  // 再次点击单一展开/收起按钮手动关闭
+  toggleBtn.click();
   assert.equal(detailCard.style.display, 'none');
   assert.equal(customForm.style.display, 'none');
   assert.equal(api.getPlanDetailExpanded(), false);
@@ -1239,6 +1307,49 @@ test('network errors are consistently displayed across badge, tooltip, and key s
   assert.notEqual(h.elements.get('key-remaining').textContent, '0 (已溢出)');
 
   h.sandbox.__AGContextMeter.dispose();
+});
+
+test('cancellation status is muted, describes the recorded request, and clears after success', async () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  h.finishScan();
+  h.pending[0].resolve(response({
+    usage: { inputTokens: 12000, outputTokens: 200 },
+    chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } }
+  }));
+  await h.flush();
+  try {
+    const previous = api.snapshot().latest;
+    const canceled = core.summarize({ chatModel: {
+      retryInfos: [{ error: 'request failed: Post "https://example.invalid/api": context canceled' }],
+      chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 512000 } }
+    } }, { previousValidContext: previous });
+    api.setContextLatestForTest(canceled);
+    h.elements.get('badge').trigger('mouseenter');
+    assert.equal(h.elements.get('badge-pct-val').textContent, '已中断');
+    assert.equal(h.elements.get('amount').textContent, '上次中断');
+    assert.equal(h.host.getAttribute('data-occupancy'), 'normal');
+    assert.equal(h.elements.get('key-badge').className, 'key-pill pill-muted');
+    assert.match(h.elements.get('ctx-tip-title').textContent, /最近一次/);
+    assert.match(h.elements.get('ctx-tip-detail').textContent, /无法确定/);
+    assert.doesNotMatch(h.elements.get('ctx-tip-detail').textContent, /用户取消|重新发送/);
+    assert.match(h.elements.get('status').textContent, /最近一次.*中断/);
+    assert.notEqual(h.elements.get('key-used').textContent, '—');
+    assert.equal(h.elements.get('key-limit').textContent, '512K');
+    assert.equal(api.snapshot().latest.actual, previous.actual);
+    for (const [language, title] of [['en', /Last recorded request/], ['zh-TW', /最近一次/]]) {
+      api.setPanelLanguage(language, { persist: false });
+      h.elements.get('badge').trigger('mouseenter');
+      assert.match(h.elements.get('ctx-tip-title').textContent, title);
+      assert.equal(h.elements.get('key-badge').className, 'key-pill pill-muted');
+    }
+    api.setPanelLanguage('zh-CN', { persist: false });
+    api.setContextLatestForTest(previous);
+    assert.doesNotMatch(h.elements.get('badge-pct-val').textContent, /中断|待确认/);
+    assert.doesNotMatch(h.elements.get('key-takeaway').textContent, /中断|原因未知/);
+  } finally {
+    api.dispose();
+  }
 });
 
 test('quota exhaustion status across badge, tooltip, and summary displays affected pool and reset time', async () => {
@@ -5314,54 +5425,68 @@ test('v0.8.8 chart visual redesign E2E: single 1.82M vs heavy 100..3.64B, cross-
   }
 });
 
-test('v0.8.8 α 版本展示与更新比较隔离: 界面展示 0.8.8 α 且无正式版字样, 0.8.8==0.8.8 判最新, 0.8.9 判有更新', async () => {
+test('v0.8.9 (0.8.9) 稳定正式版展示与更新检查', async () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
-  assert.equal(pkg.version, '0.8.8');
+  assert.equal(pkg.version, '0.8.9');
+  assert.equal(pkg.displayVersion, '0.8.9');
 
-  // 1. 默认构建模板中 #v 与 #up-pop-ver 均为 0.8.8 α，且渲染源码中不含“正式版”字样
+  // 1. 默认构建模板中 #v 与 #up-pop-ver 均为 0.8.9，且 beta 通道开关默认未勾选
   const builtCode = fs.readFileSync(path.join(__dirname, 'meter-renderer.js'), 'utf8');
-  assert.match(builtCode, /<span id="v">0\.8\.8 α<\/span>/);
-  assert.match(builtCode, /<span id="up-pop-ver"[^>]*>0\.8\.8 α<\/span>/);
-  assert.equal(builtCode.includes('正式版'), false);
+  assert.match(builtCode, /<span id="v"[^>]*>0\.8\.9<\/span>/);
+  assert.match(builtCode, /<span id="up-pop-ver"[^>]*>0\.8\.9<\/span>/);
+  assert.equal(builtCode.includes('id="check-allow-beta-updates"'), true);
 
-  // 2. 0.8.8 vs 0.8.8 判为已是最新，且文案展示 0.8.8 α
+  // 2. 0.8.9 vs 0.8.9 判为已是最新，且文案展示 0.8.9
   {
     const h = harness();
     const api = h.sandbox.__AGContextMeter;
+    assert.equal(h.elements.get('check-allow-beta-updates').checked, false);
     h.sandbox.window.contextMeterAPI = {
       ...h.sandbox.window.contextMeterAPI,
       checkUpdate: async (req) => {
-        assert.equal(req.currentVersion, '0.8.8');
-        return { ok: true, hasUpdate: false, currentVersion: '0.8.8', installedVersion: '0.8.8' };
+        assert.equal(req.currentVersion, '0.8.9');
+        assert.equal(req.allowBetaUpdates, false);
+        return { ok: true, hasUpdate: false, currentVersion: '0.8.9', installedVersion: '0.8.9' };
       }
     };
     try {
       await api.checkUpdate(true);
       await h.flush();
-      assert.equal(h.elements.get('up-pop-ver').textContent, '0.8.8 α (已是最新)');
-      assert.match(h.elements.get('up-pop-body').textContent, /0\.8\.8 α/);
-      assert.equal(h.elements.get('up-pop-body').textContent.includes('正式版'), false);
+      assert.equal(h.elements.get('up-pop-ver').textContent, '0.8.9 (已是最新)');
+      assert.match(h.elements.get('up-pop-body').textContent, /0\.8\.9/);
     } finally {
       api.dispose();
     }
   }
 
-  // 3. 0.8.8 vs 0.8.9 判为有更新，且展示 0.8.8 α → v0.8.9
+  // 3. 0.8.9 -> 0.9.0 展示格式，以及开启 beta 通道开关持久化
   {
+    const savedPayloads = [];
     const h = harness();
     const api = h.sandbox.__AGContextMeter;
     h.sandbox.window.contextMeterAPI = {
       ...h.sandbox.window.contextMeterAPI,
+      saveSettings: async (payload) => {
+        savedPayloads.push(payload);
+        return { ok: true };
+      },
       checkUpdate: async (req) => {
-        assert.equal(req.currentVersion, '0.8.8');
-        return { ok: true, hasUpdate: true, currentVersion: '0.8.8', latestVersion: '0.8.9', releaseNotes: 'v0.8.9 test' };
+        assert.equal(req.currentVersion, '0.8.9');
+        assert.equal(req.allowBetaUpdates, true);
+        return { ok: true, hasUpdate: true, currentVersion: '0.8.9', latestVersion: '0.9.0', releaseNotes: 'v0.9.0 stable' };
       }
     };
+    const chkBeta = h.elements.get('check-allow-beta-updates');
+    chkBeta.checked = true;
+    chkBeta.trigger('change', { target: chkBeta });
+    await h.flush();
+    assert.equal(savedPayloads.some(p => p.allowBetaUpdates === true), true);
+
     try {
       await api.checkUpdate(true);
       await h.flush();
-      assert.equal(h.elements.get('up-pop-ver').textContent, '0.8.8 α → v0.8.9');
-      assert.match(h.elements.get('up-pop-body').textContent, /v0\.8\.9/);
+      assert.equal(h.elements.get('up-pop-ver').textContent, '0.8.9 → v0.9.0');
+      assert.match(h.elements.get('up-pop-body').textContent, /v0\.9\.0/);
       assert.equal(h.elements.get('btn-apply-update').style.display, 'inline-block');
     } finally {
       api.dispose();
@@ -5722,6 +5847,8 @@ function htmlAwareRendererHarness(extraSandbox = null) {
   const sandbox = {
     location: { protocol: 'https:', hostname: '127.0.0.1', pathname: '/c/11111111-1111-1111-1111-111111111111' },
     document: {
+      head: makeEl('head'),
+      body: makeEl('body'),
       createElement: (tag) => makeEl(tag || 'div'),
       createElementNS: (_ns, tag) => makeEl(tag || 'svg'),
       getElementById: id => docElements.get(id) || null,
@@ -6010,6 +6137,657 @@ test('v0.8.8 三语货币参考规则（en 纯 USD / zh-CN USD+CNY / zh-TW 四�
     h.elements.get('btn-custom-plan-save').click();
     const lastSave = h.savedSettings[h.savedSettings.length - 1];
     assert.equal(lastSave?.customPlan?.validEndDate, todayYmd);
+  } finally {
+    try { api.dispose(); } catch {}
+  }
+});
+
+test('v0.8.9 UI 精简 4 项实装: 标题栏/卡片瘦身、ELV-94 五态停靠、Issue #41 额度窗口四态、ELV-93 纯 SVG 等待沙漏', async () => {
+  const tpl = fs.readFileSync(path.join(__dirname, 'src', 'renderer', 'template.html'), 'utf8');
+  // 1. 面板瘦身结构断言
+  assert.equal(tpl.includes('id="ctx-compact-card"'), false, '应移除独立 #ctx-compact-card 并合并入 #key-summary 头部胶囊');
+  assert.equal(tpl.includes('id="speed-active-test-note"'), false, '应移除 #speed-active-test-note');
+  assert.equal(tpl.includes('id="quota-usage-tip"'), false, '应移除 #quota-usage-tip');
+  assert.equal(tpl.includes('id="quota-basis-note"'), false, '应移除静态大段 #quota-basis-note');
+  assert.equal(tpl.includes('id="btn-plan-detail-collapse-top"'), false, '应移除重复的 #btn-plan-detail-collapse-top');
+  assert.ok(tpl.includes('id="btn-check-update"'), '主面板标题栏应回迁检查更新按钮');
+  assert.ok(tpl.includes('id="btn-github-repo"'), '主面板标题栏应回迁 GitHub 按钮');
+  assert.ok(tpl.includes('id="panel-lang-top-segmented"'), '主面板标题栏应回迁三语言切换按钮');
+  assert.ok(tpl.includes('id="settings-about-update-card"'), '配置 Tab 应包含统一的更新与项目链接卡');
+  assert.ok(tpl.includes('id="ui-slim-prefs-card"'), '配置 Tab 应包含外观、停靠与顶栏偏好卡');
+  assert.ok(tpl.includes('id="badge-speed-wait-svg"'), '顶栏速度单元应包含等待态纯 SVG 沙漏容器');
+
+  // 2. #key-takeaway 仅告警/异常时显示（<75% 隐藏，>=75% 显示），点击 #v 直达设置更新
+  const savedPayloads = [];
+  const auxContainer = {
+    children: [],
+    appendChild(n) { this.children.push(n); n.parentElement = this; },
+    insertBefore(n) { this.children.unshift(n); n.parentElement = this; },
+    removeChild(n) { this.children = this.children.filter(x => x !== n); }
+  };
+  const pageContainer = {
+    children: [],
+    appendChild(n) { this.children.push(n); n.parentElement = this; },
+    insertBefore(n) { this.children.unshift(n); n.parentElement = this; },
+    removeChild(n) { this.children = this.children.filter(x => x !== n); }
+  };
+  let mockQueryMode = 'none';
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  h.sandbox.document.querySelector = (sel) => {
+    if (mockQueryMode === 'aux' && sel.includes('aux-sidebar')) return auxContainer;
+    if (mockQueryMode === 'page' && sel.includes('workbench.parts.editor')) return pageContainer;
+    return null;
+  };
+  h.sandbox.window.contextMeterAPI = {
+    ...h.sandbox.window.contextMeterAPI,
+    saveSettings: async (payload) => { savedPayloads.push(payload); return { ok: true }; }
+  };
+  try {
+    h.finishScan();
+    // 50% 安全状态 -> #key-takeaway 隐藏
+    h.pending[0].resolve(response({ usage: { inputTokens: 128000 }, chatStartMetadata: { contextWindowMetadata: { maxContextTokens: 256000 } } }));
+    await h.flush();
+    assert.equal(h.elements.get('key-takeaway').hidden, true, '正常 <75% 占用时 #key-takeaway 应隐藏');
+
+    // 点击版本号胶囊 #v 自动展开主面板并切至设置 Tab
+    assert.equal(h.elements.get('panel').hidden, true);
+    h.elements.get('v').click();
+    assert.equal(h.elements.get('panel').hidden, false);
+    assert.equal(h.elements.get('pane-ctx-settings').hidden, false);
+
+    // 3. 停靠位置收口为顶栏默认靠在打开 IDE 左侧 (安全回退 flow)
+    mockQueryMode = 'none';
+    api.setDockPosition('aux');
+    assert.equal(api.getDockPosition().dockPosition, 'flow', '历史或外部传入 aux 自动安全回退到 flow');
+    assert.equal(api.getDockPosition().actualDock, 'flow');
+
+    mockQueryMode = 'aux';
+    api.setDockPosition('hide');
+    assert.equal(api.getDockPosition().dockPosition, 'flow', '历史或外部传入 hide 自动安全回退到 flow');
+    assert.equal(api.getDockPosition().actualDock, 'flow');
+
+    api.setDockPosition('flow');
+    assert.equal(api.getDockPosition().dockPosition, 'flow');
+
+    // 4. Issue #41 顶栏额度窗口模式 4 选 1 (auto / 5h / weekly / both) 逐一点按 DOM 按钮与右键/Alt+点击切换
+    const nowQuotaTs = Date.now();
+    api.setContextLatestForTest({ model: 'Gemini 4 Hydrogen (High)', modelId: 'gemini-4-hydrogen-high', actual: 12000, budget: 256000 });
+    api.setQuotaSnapshotForTest({
+      snapshot: {
+        fetchedAtMs: nowQuotaTs,
+        currentModel: { productKey: 'product:google:gemini-4-hydrogen', productLabel: 'Gemini 4 Hydrogen (High)', poolKey: 'shared_gemini_main' },
+        activeStatus: 'available',
+        pools: [{
+          poolKey: 'shared_gemini_main',
+          title: 'Gemini 模型',
+          models: [{ productKey: 'product:google:gemini-4-hydrogen', productLabel: 'Gemini 4 Hydrogen', modelIds: ['gemini-4-hydrogen-high'] }],
+          buckets: [
+            { bucketId: 'b5h', windowKey: '5h', windowShort: '5h', remainingFraction: 0.92, percentText: '92%' },
+            { bucketId: 'b7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.64, percentText: '64%' }
+          ]
+        }]
+      }
+    }, nowQuotaTs);
+    assert.equal(h.elements.get('quota-badge-val').textContent, '64%', 'auto 模式默认显示更紧缩的 7d 64%');
+
+    // 逐一点按 4 个 DOM 按钮断言顶栏文本即时变化
+    const segQuota = h.elements.get('quota-mode-segmented');
+    const clickQuotaMode = (mode) => {
+      segQuota.trigger('click', {
+        target: {
+          closest: (sel) => ({ getAttribute: (k) => (k === 'data-quota-window-mode' ? mode : null) })
+        }
+      });
+    };
+
+    clickQuotaMode('5h');
+    assert.equal(h.elements.get('quota-badge-val').textContent, '92%', '点按 5h 按钮立即刷新为 92%');
+    assert.equal(h.elements.get('quota-badge-tag').textContent, '5h');
+
+    clickQuotaMode('weekly');
+    assert.equal(h.elements.get('quota-badge-val').textContent, '64%', '点按周额度按钮立即刷新为 64%');
+    assert.equal(h.elements.get('quota-badge-tag').textContent, '7d');
+
+    clickQuotaMode('both');
+    assert.equal(h.elements.get('quota-badge-dual').hidden, false, '点按双显按钮立即展示双行额度');
+    assert.equal(h.elements.get('quota-badge-dual').children[0].textContent, '5h 92%');
+    assert.equal(h.elements.get('quota-badge-dual').children[1].textContent, '7d 64%');
+
+    clickQuotaMode('auto');
+    assert.equal(h.elements.get('quota-badge-dual').hidden, true, '点按自动按钮双显隐藏并恢复单显');
+    assert.equal(h.elements.get('quota-badge-val').textContent, '64%');
+
+    // 右键 #badge-quota 从 auto 轮转到 5h 并当场刷新
+    h.elements.get('badge-quota').trigger('contextmenu', { preventDefault() {} });
+    assert.equal(api.getQuotaBadgeWindowMode(), '5h');
+    assert.equal(h.elements.get('quota-badge-val').textContent, '92%');
+
+    // Alt+点击 #badge-quota 切换到 weekly 且不打开额度面板
+    assert.equal(h.elements.get('panel-quota').hidden, true);
+    h.elements.get('badge-quota').trigger('click', { altKey: true, preventDefault() {} });
+    assert.equal(api.getQuotaBadgeWindowMode(), 'weekly');
+    assert.equal(h.elements.get('quota-badge-val').textContent, '64%');
+    assert.equal(h.elements.get('panel-quota').hidden, true);
+    assert.ok(savedPayloads.some(p => p.quotaBadgeWindowMode === 'both'));
+
+    // 5. ELV-93 顶栏等待状态改为纯 SVG 沙漏动效（去除 Wait Xs / 等待 Xs 文本抖动）
+    api.setSpeedEvaluationForTest({ phase: 'waiting', elapsedSec: 4 });
+    const spWait = api.getSpeedPanelStateForTest();
+    assert.equal(spWait.topSpeedPhase, 'waiting');
+    assert.equal(spWait.topWaitSvgVisible, true);
+    assert.equal(spWait.topSpeedText, '', '等待期顶栏不得显示每秒跳动文字');
+    assert.match(h.elements.get('badge-speed').title, /4s/);
+
+    api.setSpeedEvaluationForTest({
+      phase: 'final',
+      ttftSec: 0.7,
+      streamingSec: 2.0,
+      totalDurationSec: 2.7,
+      streamSpeed: 145.2,
+      overallTps: 108.0,
+      outputTokens: 290
+    });
+    const spDone = api.getSpeedPanelStateForTest();
+    assert.equal(spDone.topSpeedPhase, null);
+    assert.equal(spDone.topWaitSvgVisible, false);
+    assert.match(spDone.topSpeedText, /145\.2/);
+  } finally {
+    try { api.dispose(); } catch {}
+  }
+});
+
+test('多账号卡片配额展示回归: Pro/Free 账号不出现假 Carbon、Ultra 账号正常显示 Carbon 5h/7d、双窗口与单窗口格式对齐、过滤历史残留杂项池', async () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  try {
+    const mockOverview = {
+      accounts: [
+        // 1. Pro 账号：Hydrogen 双窗口 (5h 0%, 7d 70%), Claude/3P 双窗口 (5h 100%, 7d 87%), Argon 单窗口 (7d 70%), Carbon 无权限 (noPermission: true),
+        // 且包含历史残留 shared_chat_23310 与 shared_gemini-25-pro 杂项池
+        {
+          email: 'pro-user@example.com',
+          isActive: true,
+          hasRefreshToken: true,
+          tierId: 'g1-pro-tier',
+          lastQuotaUpdatedAtMs: 1760000000000,
+          quotaSnapshot: {
+            pools: [
+              {
+                poolKey: 'shared_gemini_main',
+                title: 'Gemini 4 Hydrogen',
+                percentText: '0%',
+                buckets: [
+                  { bucketId: 'b5h', windowKey: '5h', windowShort: '5h', remainingFraction: 0, percentText: '0%' },
+                  { bucketId: 'b7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.70, percentText: '70%' }
+                ]
+              },
+              {
+                poolKey: 'shared_3p_pool',
+                title: 'Claude/3P',
+                percentText: '87%',
+                buckets: [
+                  { bucketId: 'b5h_3p', windowKey: '5h', windowShort: '5h', remainingFraction: 1.0, percentText: '100%' },
+                  { bucketId: 'b7d_3p', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.87, percentText: '87%' }
+                ]
+              },
+              {
+                poolKey: 'shared_gemini_argon',
+                title: 'Gemini 4 Argon',
+                percentText: '70%',
+                buckets: [
+                  { bucketId: 'barg', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.70, percentText: '70%' }
+                ]
+              },
+              {
+                poolKey: 'shared_gemini_carbon',
+                title: 'Gemini 4 Carbon',
+                noPermission: true,
+                remainingFraction: null,
+                percentText: '无权限',
+                buckets: []
+              },
+              {
+                poolKey: 'shared_chat_23310',
+                title: 'Internal Chat 23310',
+                remainingFraction: 1.0,
+                percentText: '100%',
+                buckets: []
+              },
+              {
+                poolKey: 'shared_gemini-25-pro',
+                title: 'Gemini 2.5 Pro',
+                remainingFraction: 1.0,
+                percentText: '100%',
+                buckets: []
+              }
+            ]
+          }
+        },
+        // 2. Free 账号：仅有 Hydrogen 单窗口 7d 100%，Carbon 无权限
+        {
+          email: 'free-user@example.com',
+          isActive: false,
+          hasRefreshToken: true,
+          tierId: 'free-tier',
+          lastQuotaUpdatedAtMs: 1760000000000,
+          quotaSnapshot: {
+            pools: [
+              {
+                poolKey: 'shared_gemini_main',
+                title: 'Gemini 4 Hydrogen',
+                percentText: '100%',
+                buckets: [
+                  { bucketId: 'bfree_7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 1.0, percentText: '100%' }
+                ]
+              },
+              {
+                poolKey: 'shared_gemini_carbon',
+                title: 'Gemini 4 Carbon',
+                noPermission: true,
+                remainingFraction: null,
+                percentText: '无权限',
+                buckets: []
+              }
+            ]
+          }
+        },
+        // 3. Ultra 账号：Carbon 具有真实可用权限且存在双窗口配额 (5h 100%, 7d 100%)
+        {
+          email: 'ultra-user@example.com',
+          isActive: false,
+          hasRefreshToken: true,
+          tierId: 'g1-ultra-tier',
+          lastQuotaUpdatedAtMs: 1760000000000,
+          quotaSnapshot: {
+            pools: [
+              {
+                poolKey: 'shared_gemini_main',
+                title: 'Gemini 4 Hydrogen',
+                percentText: '90%',
+                buckets: [
+                  { bucketId: 'u_5h', windowKey: '5h', windowShort: '5h', remainingFraction: 0.90, percentText: '90%' },
+                  { bucketId: 'u_7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.95, percentText: '95%' }
+                ]
+              },
+              {
+                poolKey: 'shared_gemini_carbon',
+                title: 'Gemini 4 Carbon',
+                noPermission: false,
+                remainingFraction: 1.0,
+                percentText: '100%',
+                buckets: [
+                  { bucketId: 'c_5h', windowKey: '5h', windowShort: '5h', remainingFraction: 1.0, percentText: '100%' },
+                  { bucketId: 'c_7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 1.0, percentText: '100%' }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    };
+
+    api.setAccountsOverviewForTest(mockOverview);
+    const listEl = h.elements.get('quota-accounts-list');
+    assert.equal(listEl.children.length, 3);
+
+    // 1) 验证 Pro 账号卡片
+    const proCard = listEl.children[0];
+    const proMeta = proCard.children.find(c => c.className === 'quota-acct-meta');
+    assert.ok(proMeta, 'Pro 卡片应有 meta 摘要行');
+    const proText = proMeta.textContent;
+    // 验证双窗口与单窗口格式
+    assert.match(proText, /Hydrogen: 5h 0% \/ 7d 70%/);
+    assert.match(proText, /Claude\/3P: 5h 100% \/ 7d 87%/);
+    assert.match(proText, /Argon: 7d 70%/);
+    // 严禁出现假 Carbon（shared_chat_23310 或 gemini-2.5-pro 绝不能变成 Carbon）
+    assert.doesNotMatch(proText, /Carbon: 100%/);
+    // Pro 用户无 Carbon 权限，Carbon 应直接隐藏，不显示 "Carbon: 无模型权限"
+    assert.doesNotMatch(proText, /Carbon/);
+    assert.doesNotMatch(proText, /chat_23310/);
+    assert.doesNotMatch(proText, /gemini-25-pro/);
+
+    // 2) 验证 Free 账号卡片
+    const freeCard = listEl.children[1];
+    const freeMeta = freeCard.children.find(c => c.className === 'quota-acct-meta');
+    assert.ok(freeMeta);
+    const freeText = freeMeta.textContent;
+    assert.match(freeText, /Hydrogen: 7d 100%/);
+    assert.doesNotMatch(freeText, /Carbon/);
+
+    // 3) 验证 Ultra 账号卡片
+    const ultraCard = listEl.children[2];
+    const ultraMeta = ultraCard.children.find(c => c.className === 'quota-acct-meta');
+    assert.ok(ultraMeta);
+    const ultraText = ultraMeta.textContent;
+    assert.match(ultraText, /Hydrogen: 5h 90% \/ 7d 95%/);
+    assert.match(ultraText, /Carbon: 5h 100% \/ 7d 100%/);
+  } finally {
+    try { api.dispose(); } catch {}
+  }
+});
+
+test('Issue #49: 套餐规格与 5x/20x 子档覆盖下拉选择、立即保存及三端 UI 同步展示', async () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  let savedSettingsPayload = null;
+  h.sandbox.window.contextMeterAPI.saveSettings = async (payload) => {
+    savedSettingsPayload = payload;
+    return { ok: true, customPlan: payload.customPlan };
+  };
+
+  try {
+    const mockPlan = {
+      status: 'identified',
+      tierKey: 'ultra',
+      tierName: 'Google AI Ultra',
+      email: 'ultra-user@example.com'
+    };
+    api.applyTokenHistoryPayload({
+      planStatus: mockPlan,
+      rawPlanStatus: mockPlan,
+      dailyMap: {}
+    });
+
+    // 1. 验证存在紫光风格下拉选择器包裹容器与 trigger
+    const wrap = h.elements.get('direct-tier-wrap');
+    assert.ok(wrap, '必须渲染 direct-tier-wrap 下拉包裹器');
+    const labelEl = h.elements.get('direct-tier-label');
+    assert.ok(labelEl, '必须渲染 direct-tier-label');
+
+    // 2. 选择 Google AI Ultra (5x) 并触发 change
+    const sel = h.elements.get('direct-tier-select');
+    assert.ok(sel, '必须存在原生 direct-tier-select');
+    sel.value = 'ultra_5x';
+    sel.trigger('change', { target: { value: 'ultra_5x' } });
+
+    // 3. 验证触发了 saveSettings 保存，且 customPlan 包含 planTierOverride
+    assert.ok(savedSettingsPayload, '必须调用 saveSettings');
+    assert.equal(savedSettingsPayload.customPlan.planTierOverride, 'ultra_5x');
+
+    // 4. 验证 Token 面板订阅摘要条展示带子档套餐名
+    const sumTxt = h.elements.get('plan-summary-text');
+    assert.match(sumTxt.textContent, /Google AI Ultra \(5x\)/);
+
+    // 5. 验证额度面板顶部套餐胶囊展示带子档套餐名
+    const quotaPill = h.elements.get('quota-plan-tier-pill');
+    assert.equal(quotaPill.hidden, false);
+    assert.equal(quotaPill.textContent, 'Google AI Ultra (5x)');
+
+    // 6. 验证多账号列表展示带子档套餐名
+    const mockOverview = {
+      accounts: [
+        {
+          email: 'ultra-user@example.com',
+          isActive: true,
+          hasRefreshToken: true,
+          tierId: 'g1-ultra-tier',
+          quotaSnapshot: { pools: [] }
+        }
+      ]
+    };
+    api.setAccountsOverviewForTest(mockOverview);
+    const listEl = h.elements.get('quota-accounts-list');
+    assert.ok(listEl.children.length > 0);
+    const acctEmail = listEl.children[0].children.find(c => c.className === 'quota-subcard-row')?.children?.find(c => c.className === 'quota-acct-email');
+    assert.ok(acctEmail);
+    assert.match(acctEmail.textContent, /ultra-user@example\.com · Google AI Ultra \(5x\)/);
+
+    // 7. 验证切换英文 en 模式下，全 DOM 零汉字门禁通过
+    await api.setPanelLanguage('en', { persist: false });
+    assert.doesNotMatch(labelEl.textContent, /[\u4e00-\u9fff]/);
+    assert.doesNotMatch(sumTxt.textContent, /[\u4e00-\u9fff]/);
+  } finally {
+    try { api.dispose(); } catch {}
+  }
+});
+
+test('Issue #54 & Issue #59: 顶栏内联锚定打开 IDE 左侧、右侧辅助栏开关零飞移、Customizations 避让与 4 额度窗口即时重算刷新', async () => {
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+
+  // 1. 模拟会话标题栏 DOM 结构：左侧标题，右侧按钮组（包含打开 IDE 与三个点按钮）
+  const openIdeBtn = { textContent: 'Open IDE', getBoundingClientRect: () => ({ top: 10, left: 800, right: 880, width: 80 }) };
+  const moreBtn = { textContent: '...', getBoundingClientRect: () => ({ top: 10, left: 884, right: 914, width: 30 }) };
+  const rightGroup = {
+    className: 'shrink-0 flex items-center',
+    children: [openIdeBtn, moreBtn],
+    get firstChild() { return this.children[0]; },
+    get firstElementChild() { return this.children[0]; },
+    appendChild(n) { this.children.push(n); n.parentElement = this; },
+    insertBefore(n, ref) {
+      const idx = this.children.indexOf(ref);
+      if (idx >= 0) this.children.splice(idx, 0, n);
+      else this.children.unshift(n);
+      n.parentElement = this;
+    },
+    getBoundingClientRect: () => ({ top: 10, left: 800, right: 920, width: 120 })
+  };
+  const titlebarEl = {
+    className: 'flex items-center justify-between @container/titlebar',
+    firstElementChild: { scrollWidth: 140, firstElementChild: { getBoundingClientRect: () => ({ left: 20 }) } },
+    lastElementChild: rightGroup,
+    querySelector(sel) { return sel.includes('shrink-0') ? rightGroup : null; },
+    contains(n) { return rightGroup.children.includes(n) || n.parentElement === rightGroup; },
+    getBoundingClientRect: () => ({ top: 10, left: 0, right: 1200, width: 1200 })
+  };
+
+  h.sandbox.document.querySelector = (sel) => {
+    if (sel.includes('@container/titlebar')) return titlebarEl;
+    if (sel.includes('toggle-aux-sidebar')) return { click() {} };
+    return null;
+  };
+
+  api.setDockPosition('flow');
+  const pos = api.getDockPosition();
+  assert.equal(pos.dockPosition, 'flow');
+  assert.equal(pos.actualDock, 'flow');
+
+  // 断言宿主挂在右侧组最前面，即处于“打开 IDE”与“三个点”按钮左侧，同一水平线上
+  const activeHost = h.sandbox.__AGContextMeterActiveHost;
+  assert.ok(activeHost);
+  assert.equal(activeHost.parentElement, rightGroup);
+  assert.equal(rightGroup.children[0], activeHost, '顶栏组件必须作为 targetContainer.firstChild 锚定在打开 IDE 左侧');
+  assert.equal(rightGroup.children[1], openIdeBtn);
+
+  // 2. 开关右侧辅助面板（模拟 DOM 发生变动且尺寸改变），宿主依然稳固锚定在打开 IDE 左侧，严禁飞到 fixed 或 top: 6px
+  for (let i = 0; i < 3; i++) {
+    api.setDockPosition('flow');
+    assert.equal(api.getDockPosition().actualDock, 'flow', '开关辅助栏期间 actualDock 始终为 flow 零飞移');
+    assert.equal(activeHost.style.top, '', '严禁设置 top: 6px');
+    assert.equal(activeHost.style.right, '', '严禁设置 fixed right 偏移动态乱飞');
+  }
+
+  // 3. 适配 Antigravity 2.33 的 Customizations 自定义扩展等非会话全屏子视图顶栏避让 (Issue #59)
+  if (!h.sandbox.document.head) {
+    h.sandbox.document.head = h.sandbox.document.createElement();
+  }
+  h.sandbox.navigator = { platform: 'Win32' };
+  h.sandbox.window.innerWidth = 1200;
+  h.sandbox.window.outerWidth = 1200;
+  titlebarEl.getBoundingClientRect = () => ({ top: 10, left: 0, right: 1200, width: 1200, height: 40 });
+  let inCustomizationView = true;
+  const backBtn = { getBoundingClientRect: () => ({ top: 10, left: 8, right: 36, width: 28, height: 28 }) };
+  h.sandbox.document.querySelector = (sel) => {
+    if (inCustomizationView && (sel.includes('customization') || sel.includes('Back'))) {
+      return backBtn;
+    }
+    if (sel.includes('@container/titlebar')) return titlebarEl;
+    return null;
+  };
+
+  // 触发布局测量，在 Customizations 视图下自动预留原生返回与搜索空间，绝不遮挡原生按钮
+  h.sandbox.__AGContextMeter.syncWindowControlsOverlayForTest?.();
+  const styleFix = h.sandbox.document.getElementById('ag-topbar-host-fix');
+  assert.ok(styleFix, '必须注入避让样式表');
+  assert.match(styleFix.textContent, /#ag-context-meter[\s\S]*-webkit-app-region:\s*no-drag/);
+
+  // 4. 自动化 DOM 测试逐一点按 4 个额度窗口按钮立即从 buckets 重算 5h 与 7d 数值并当场刷新 #badge-quota
+  const nowTs = Date.now();
+  api.setQuotaSnapshotForTest({
+    snapshot: {
+      fetchedAtMs: nowTs,
+      activeStatus: 'available',
+      pools: [{
+        poolKey: 'shared_gemini_main',
+        title: 'Gemini 模型',
+        buckets: [
+          { bucketId: 'b5h', windowKey: '5h', windowShort: '5h', remainingFraction: 0.85, percentText: '85%' },
+          { bucketId: 'b7d', windowKey: 'weekly', windowShort: '7d', remainingFraction: 0.42, percentText: '42%' }
+        ]
+      }]
+    }
+  }, nowTs);
+
+  const segQuota = h.elements.get('quota-mode-segmented');
+  const clickQuotaMode = (mode) => {
+    segQuota.trigger('click', {
+      target: {
+        closest: (sel) => ({ getAttribute: (k) => (k === 'data-quota-window-mode' ? mode : null) })
+      }
+    });
+  };
+
+  // a) 点按 5h 窗口
+  clickQuotaMode('5h');
+  assert.equal(h.elements.get('quota-badge-val').textContent, '85%', '点按 5h 按钮后 #badge-quota 文本即时变化为 85%');
+  assert.equal(h.elements.get('quota-badge-tag').textContent, '5h');
+
+  // b) 点按周额度
+  clickQuotaMode('weekly');
+  assert.equal(h.elements.get('quota-badge-val').textContent, '42%', '点按周额度按钮后 #badge-quota 文本即时变化为 42%');
+  assert.equal(h.elements.get('quota-badge-tag').textContent, '7d');
+
+  // c) 点按 5h+周双显
+  clickQuotaMode('both');
+  assert.equal(h.elements.get('quota-badge-dual').hidden, false, '点按双显按钮后双显行立即展示');
+  assert.equal(h.elements.get('quota-badge-dual').children[0].textContent, '5h 85%');
+  assert.equal(h.elements.get('quota-badge-dual').children[1].textContent, '7d 42%');
+
+  // d) 点按自动（最紧缩）
+  clickQuotaMode('auto');
+  assert.equal(h.elements.get('quota-badge-dual').hidden, true);
+  assert.equal(h.elements.get('quota-badge-val').textContent, '42%', '点按自动按钮立即根据 buckets 选出最紧缩 42%');
+});
+
+test('停靠模式最小化收口: 历史写入 hide 或 aux 自动安全回退为顶栏默认 flow 显示, 界面仅保留验稳选项', async () => {
+  const extraSandbox = {
+    localStorage: {
+      _store: new Map([['ag_dock_position', 'hide']]),
+      getItem(k) { return this._store.get(k) || null; },
+      setItem(k, v) { this._store.set(k, String(v)); },
+      removeItem(k) { this._store.delete(k); }
+    }
+  };
+  const h = harness(undefined, extraSandbox);
+  const api = h.sandbox.__AGContextMeter;
+
+  try {
+    // 1. 初始化时历史配置 hide 自动纠偏为 flow
+    assert.equal(api.getDockPosition().dockPosition, 'flow', '本地历史写入 hide 时初始化自动回退到 flow');
+    assert.equal(api.getDockPosition().actualDock, 'flow', '实际挂载始终保持为顶栏默认显示');
+    assert.equal(extraSandbox.localStorage.getItem('ag_dock_position'), 'flow', 'localStorage 纠偏写回 flow');
+
+    // 2. 外部即使再尝试设置 aux 或 hide，也一律安全规范为 flow
+    api.setDockPosition('aux');
+    assert.equal(api.getDockPosition().dockPosition, 'flow');
+    assert.equal(api.getDockPosition().actualDock, 'flow');
+
+    api.setDockPosition('hide');
+    assert.equal(api.getDockPosition().dockPosition, 'flow');
+    assert.equal(api.getDockPosition().actualDock, 'flow');
+
+    // 3. 静态模板门禁: 验证 template.html 中已彻底移除未成熟的 aux、hide 及展开挂载提示条
+    const templatePath = path.resolve(__dirname, 'src/renderer/template.html');
+    const templateHtml = fs.readFileSync(templatePath, 'utf8');
+    assert.ok(templateHtml.includes('id="btn-dock-flow"'), '必须保留默认顶栏按钮 btn-dock-flow');
+    assert.ok(!templateHtml.includes('id="btn-dock-aux"'), '必须移除 btn-dock-aux');
+    assert.ok(!templateHtml.includes('id="btn-dock-hide"'), '必须移除 btn-dock-hide');
+    assert.ok(!templateHtml.includes('id="dock-fallback-note"'), '必须移除 dock-fallback-note');
+    assert.ok(!templateHtml.includes('id="badge-dock-wake"'), '必须移除 badge-dock-wake');
+    assert.ok(!templateHtml.includes('id="dock-toast"'), '必须移除 dock-toast');
+  } finally {
+    try { api.dispose(); } catch {}
+  }
+});
+
+test('弹窗顶栏布局回迁: 简繁EN语言切换、GitHub入口与检查更新按钮紧凑并排且点击可用, 配置页无重复区块', async () => {
+  let openedUrl = null;
+  let checkedUpdateOpts = null;
+  const h = harness();
+  h.sandbox.window.contextMeterAPI = {
+    ...h.sandbox.window.contextMeterAPI,
+    openExternal: url => { openedUrl = url; },
+    checkUpdate: opts => {
+      checkedUpdateOpts = opts;
+      return {
+        hasUpdate: true,
+        version: '0.8.9-beta.1',
+        tagName: 'v0.8.9-beta.1',
+        releaseNotes: '新特性说明',
+        htmlUrl: 'https://github.com/elviscjn-cjn/antigravity-context-viewer/releases/tag/v0.8.9-beta.1'
+      };
+    }
+  };
+  const api = h.sandbox.__AGContextMeter;
+
+  try {
+    // 1. 结构与位置断言：读取 template.html 验证 #panel 标题栏容器包含回迁的组件
+    const templatePath = path.resolve(__dirname, 'src/renderer/template.html');
+    const templateHtml = fs.readFileSync(templatePath, 'utf8');
+    const panelHeaderMatch = templateHtml.match(/<section id="panel"[\s\S]*?<div id="view-context">/);
+    assert.ok(panelHeaderMatch, '必须存在 #panel 顶部区域');
+    const headerHtml = panelHeaderMatch[0];
+
+    assert.ok(headerHtml.includes('id="panel-lang-top-segmented"'), '顶栏必须包含三语言分段按钮');
+    assert.ok(headerHtml.includes('id="btn-top-lang-zh-CN"'), '顶栏必须包含简中按钮');
+    assert.ok(headerHtml.includes('id="btn-top-lang-zh-TW"'), '顶栏必须包含繁中按钮');
+    assert.ok(headerHtml.includes('id="btn-top-lang-en"'), '顶栏必须包含EN按钮');
+    assert.ok(headerHtml.includes('id="btn-github-repo"'), '顶栏必须包含 GitHub 按钮');
+    assert.ok(headerHtml.includes('id="btn-check-update"'), '顶栏必须包含检查更新按钮');
+    assert.ok(headerHtml.includes('id="theme-toggle"'), '顶栏必须包含主题切换按钮');
+    assert.ok(headerHtml.includes('id="close"'), '顶栏必须包含关闭按钮');
+
+    // 2. 配置页清理断言：配置页内不得存在重复的语言分段按钮和重复的 GitHub/更新按钮
+    const settingsPaneMatch = templateHtml.match(/<div id="pane-ctx-settings"[\s\S]*?<\/div>\s*<\/div>\s*<\/div>/);
+    assert.ok(settingsPaneMatch, '必须存在配置页容器');
+    const settingsHtml = settingsPaneMatch[0];
+    assert.equal(settingsHtml.includes('id="panel-lang-top-segmented"'), false, '配置页内不得残留重复的语言分段按钮');
+    assert.equal(settingsHtml.includes('id="btn-top-lang-zh-CN"'), false, '配置页内不得残留重复简中按钮');
+    assert.equal(settingsHtml.includes('id="btn-check-update"'), false, '配置页卡片内不得残留重复检查更新按钮');
+    assert.equal(settingsHtml.includes('id="btn-github-repo"'), false, '配置页卡片内不得残留重复 GitHub 按钮');
+
+    // 3. 点击可用性验证：点击 GitHub 入口
+    const btnGithub = h.elements.get('btn-github-repo');
+    assert.ok(btnGithub, 'DOM 中必须解析出 btn-github-repo');
+    btnGithub.click();
+    assert.equal(openedUrl, 'https://github.com/elviscjn-cjn/antigravity-context-viewer');
+
+    // 4. 点击可用性验证：点击检查更新入口
+    const btnUpdate = h.elements.get('btn-check-update');
+    assert.ok(btnUpdate, 'DOM 中必须解析出 btn-check-update');
+    btnUpdate.click();
+    await h.flush();
+    assert.ok(checkedUpdateOpts, '点击检查更新必须触发更新检查逻辑');
+    assert.equal(checkedUpdateOpts.force, true);
+
+    // 5. 点击可用性验证：语言切换简 繁 EN
+    const btnEn = h.elements.get('btn-top-lang-en');
+    const btnTw = h.elements.get('btn-top-lang-zh-TW');
+    const btnCn = h.elements.get('btn-top-lang-zh-CN');
+    assert.ok(btnEn && btnTw && btnCn, 'DOM 中必须解析出三语言切换按钮');
+
+    btnEn.click();
+    await h.flush();
+    assert.equal(api.getPanelLanguage(), 'en');
+
+    btnTw.click();
+    await h.flush();
+    assert.equal(api.getPanelLanguage(), 'zh-TW');
+
+    btnCn.click();
+    await h.flush();
+    assert.equal(api.getPanelLanguage(), 'zh-CN');
   } finally {
     try { api.dispose(); } catch {}
   }

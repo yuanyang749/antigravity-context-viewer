@@ -370,222 +370,118 @@ test('stopWatchDaemon 清理锁文件并支持单实例接管信号中断', asyn
   assert.equal(stopRes.watchPid, null);
 });
 
-test('watch --persistent 常驻自连生命周期：启动超时不退出、窗口关闭清桥接保常驻、重启换端口后再次自动热挂载', async (t) => {
-  assert.deepEqual(
-    cli.parseCliArgs(['watch', '--persistent']),
-    { cmd: 'watch', showHelp: false, exitCode: 0, reason: null, unknownArg: null }
+test('Issue #42: v2.33 免 CDP 时通过 daemon hub 发现运行中 origin、不自动杀进程且仅提示手动带端口重启', async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-issue42-nocdp-'));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const daemonDir = path.join(tmpDir, 'daemon');
+  const appSupportDir = path.join(tmpDir, 'AppSupport');
+  const stateDir = path.join(tmpDir, 'state');
+  fs.mkdirSync(daemonDir, { recursive: true });
+  fs.mkdirSync(path.join(appSupportDir, 'Antigravity'), { recursive: true });
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  // 1. 模拟 v2.33.0 macOS 正常启动：无 DevToolsActivePort，但 ~/.gemini/antigravity/daemon/hub_*.json 存在存活语言服务
+  fs.writeFileSync(path.join(daemonDir, 'hub_1.json'), JSON.stringify({
+    pid: process.pid,
+    httpsPort: 54399,
+    csrfToken: 'mock-daemon-csrf'
+  }), 'utf8');
+
+  const liveSnap = await cli.queryLiveWindow({
+    appDataDir: appSupportDir,
+    daemonDir,
+    stateDir,
+    includeCandidatePorts: false
+  });
+  assert.equal(liveSnap.running, true);
+  assert.equal(liveSnap.cdpEnabled, false);
+  assert.equal(liveSnap.pageFound, false);
+  assert.equal(liveSnap.discoverySource, 'daemon_hub');
+  assert.deepEqual(liveSnap.origins, ['https://127.0.0.1:54399']);
+
+  // 2. runLiveCommand 在 running && cdpEnabled===false 时不自动结束进程，只抛出含手动重启命令的提示
+  await assert.rejects(
+    cli.runLiveCommand({
+      platform: 'darwin',
+      _hostTarget: { platform: 'darwin', appBundlePath: '/Applications/Antigravity.app', execPath: '/Applications/Antigravity.app/Contents/MacOS/Antigravity' },
+      _queryLiveWindow: async () => liveSnap
+    }),
+    (err) => {
+      assert.equal(err.code, 'CDP_NOT_ENABLED');
+      assert.match(err.message, /不会自动结束您的客户端进程/);
+      assert.match(err.message, /open -a Antigravity --args --remote-debugging-port=58321/);
+      return true;
+    }
   );
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-watch-persistent-'));
-  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
-  const stateDir = path.join(tmpDir, 'state');
-  fs.mkdirSync(stateDir, { recursive: true });
-  const pkgVer = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
-  const { spawn } = require('child_process');
-  const dummyChildren = [];
-  t.after(() => {
-    for (const c of dummyChildren) {
-      try { c.kill('SIGKILL'); } catch {}
-    }
-  });
-
-  let phase = 'init';
-  let initCycles = 0;
-  let closedCycles = 0;
-  let ensureCalls = 0;
-  let injectCalls = 0;
-  let windowActive = false;
-  let attachedPort = null;
-  let currentOrigin = 'https://127.0.0.1:51001';
-  let currentBridgePort = 62001;
-
-  const waitUntil = async (pred, timeoutMs = 4000) => {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (pred()) return;
-      await new Promise(r => setTimeout(r, 10));
-    }
-    throw new Error('Timed out waiting for persistent watch condition');
-  };
-
-  const ac = new AbortController();
-  const watchPromise = cli.runWatchDaemon({
+  // 3. watch 在前两轮看到 running && !cdpEnabled 时仅提示手动操作，用户手动带端口重启后第三轮顺利接入注入
+  let cycle = 0;
+  let injected = 0;
+  const watchRes = await cli.runWatchDaemon({
     stateDir,
-    persistent: true,
-    expectedVersion: pkgVer,
-    expectedBuildId: 'test-build',
     silent: true,
     handleSignals: false,
-    signal: ac.signal,
-    startupTimeoutMs: 5,
-    startupPollMs: 5,
-    idlePollMs: 5,
     pollIntervalMs: 5,
-    maxConsecutiveMisses: 2,
+    startupPollMs: 5,
+    startupTimeoutMs: 500,
+    maxConsecutiveMisses: 1,
+    maxCycles: 5,
     _discoverWindow: async () => {
-      if (phase === 'init') {
-        initCycles++;
-        return { running: false, pageFound: false };
+      cycle++;
+      if (cycle <= 2) return liveSnap;
+      if (cycle === 3) {
+        return {
+          running: true,
+          cdpEnabled: true,
+          pageFound: true,
+          active: false,
+          origin: 'https://127.0.0.1:54399',
+          origins: ['https://127.0.0.1:54399'],
+          hasIpcBridge: false
+        };
       }
-      if (phase === 'closed') {
-        closedCycles++;
-        return { running: false, pageFound: false };
-      }
-      return {
-        running: true,
-        pageFound: true,
-        cdpPort: phase === 'open2' ? 58322 : 58321,
-        origin: currentOrigin,
-        origins: [currentOrigin],
-        active: windowActive,
-        version: windowActive ? pkgVer : null,
-        hasIpcBridge: false,
-        liveBridgeAttached: attachedPort
-          ? { version: pkgVer, port: attachedPort, backendSource: 'live-host' }
-          : null
-      };
+      return { running: false, pageFound: false };
     },
-    _ensureBridge: async (liveSnap) => {
-      ensureCalls++;
-      const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 15000)'], { stdio: 'ignore' });
-      dummyChildren.push(child);
-      const info = {
-        pid: child.pid,
-        version: pkgVer,
-        port: currentBridgePort,
-        token: `tok-${currentBridgePort}`,
-        origin: liveSnap.origin,
-        origins: liveSnap.origins
-      };
-      fs.writeFileSync(path.join(stateDir, '.live-session.json'), JSON.stringify(info), 'utf8');
-      return { ready: true, reused: false, backendSource: 'live-host', liveInfo: info };
-    },
-    _hotInject: async () => {
-      injectCalls++;
-      windowActive = true;
-      attachedPort = currentBridgePort;
-      return { ok: true, injectedCount: 1 };
-    }
+    _ensureBridge: async () => ({ ready: true, reused: true, backendSource: 'live-host', backendVersion: '0.8.8', liveInfo: { pid: process.pid, port: 54321, token: 't', origins: ['https://127.0.0.1:54399'] } }),
+    _hotInject: async () => { injected++; return { ok: true, injectedCount: 1, windowCount: 1 }; },
+    _hotDispose: async () => true
   });
-
-  // 1. 超过 startupTimeoutMs 且无窗口时保持常驻不退出
-  await waitUntil(() => initCycles >= 4);
-  assert.equal(fs.existsSync(cli.getWatchPidPath(stateDir)), true);
-  assert.equal(injectCalls, 0);
-
-  // 2. 窗口开启 -> 拉起桥接并首次注入
-  phase = 'open1';
-  await waitUntil(() => injectCalls === 1 && fs.existsSync(path.join(stateDir, '.live-session.json')));
-  assert.equal(ensureCalls, 1);
-
-  // 3. 窗口关闭 >= maxConsecutiveMisses -> 清理 .live-session.json，但 watch.pid 保持常驻
-  windowActive = false;
-  attachedPort = null;
-  phase = 'closed';
-  await waitUntil(() => closedCycles >= 3 && !fs.existsSync(path.join(stateDir, '.live-session.json')));
-  assert.equal(fs.existsSync(cli.getWatchPidPath(stateDir)), true);
-
-  // 4. 客户端换端口/Origin 重开 -> 第二次自动拉起桥接并注入
-  currentOrigin = 'https://127.0.0.1:51002';
-  currentBridgePort = 62002;
-  phase = 'open2';
-  await waitUntil(() => injectCalls === 2 && fs.existsSync(path.join(stateDir, '.live-session.json')));
-  assert.equal(ensureCalls, 2);
-
-  // 5. 停止守护 -> 正常返回并清理 watch.pid
-  ac.abort();
-  const res = await watchPromise;
-  assert.equal(res.ok, true);
-  assert.equal(res.exitReason, 'stopped');
-  assert.equal(res.injectedCount, 2);
-  assert.equal(fs.existsSync(cli.getWatchPidPath(stateDir)), false);
-  assert.equal(fs.existsSync(path.join(stateDir, '.live-session.json')), false);
+  assert.equal(watchRes.ok, true);
+  assert.equal(watchRes.cdpPromptCount, 1, '连续无 CDP 轮询期间仅提示一次手动重启');
+  assert.equal(injected, 1, '用户手动带端口重启后 watch 自动恢复热挂载');
+  assert.equal(watchRes.exitReason, 'window_closed');
 });
 
-test('watch 守护端口变更自愈：live-host 同版本换端口时识别 liveBridgeAttached.port 不一致并重新同步', async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-watch-port-mismatch-'));
+test('discoverAntigravityCdp 与 connect 自动过滤内置浏览器打开的第三方本地预览页', async (t) => {
+  const { connect } = require('./local-api');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-cdp-filter-preview-'));
   t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
-  const stateDir = path.join(tmpDir, 'state');
-  fs.mkdirSync(stateDir, { recursive: true });
-  const pkgVer = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version;
-  const { spawn } = require('child_process');
-  const dummyChild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 15000)'], { stdio: 'ignore' });
-  t.after(() => { try { dummyChild.kill('SIGKILL'); } catch {} });
 
-  const liveSession = {
-    pid: dummyChild.pid,
-    version: pkgVer,
-    port: 62923,
-    token: 'fresh-token-62923',
-    origin: 'https://127.0.0.1:54123',
-    origins: ['https://127.0.0.1:54123']
-  };
-  fs.writeFileSync(path.join(stateDir, '.live-session.json'), JSON.stringify(liveSession), 'utf8');
-
-  let attachedPort = 61645;
-  let pollHits = 0;
-  let hotInjectCalls = 0;
-  let ensureCalls = 0;
-
-  const waitUntil = async (pred, timeoutMs = 4000) => {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (pred()) return;
-      await new Promise(r => setTimeout(r, 10));
-    }
-    throw new Error('Timed out waiting for port mismatch resync');
-  };
-
-  const ac = new AbortController();
-  const watchPromise = cli.runWatchDaemon({
-    stateDir,
-    expectedVersion: pkgVer,
-    expectedBuildId: 'test-build',
-    silent: true,
-    handleSignals: false,
-    signal: ac.signal,
-    pollIntervalMs: 10,
-    startupPollMs: 10,
-    startupTimeoutMs: 2000,
-    _discoverWindow: async () => {
-      pollHits++;
-      return {
-        running: true,
-        pageFound: true,
-        cdpPort: 58321,
-        origin: 'https://127.0.0.1:54123',
-        origins: ['https://127.0.0.1:54123'],
-        active: true,
-        version: pkgVer,
-        hasIpcBridge: false,
-        liveBridgeAttached: {
-          version: pkgVer,
-          port: attachedPort,
-          backendSource: 'live-host'
-        }
-      };
-    },
-    _ensureBridge: async () => {
-      ensureCalls++;
-      return { ready: true, reused: true, backendSource: 'live-host', liveInfo: liveSession };
-    },
-    _hotInject: async (injectOpts) => {
-      hotInjectCalls++;
-      assert.equal(injectOpts.liveInfo?.port, 62923);
-      attachedPort = 62923;
-      return { ok: true, injectedCount: 1 };
-    }
+  const previewSrv = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end('<html><head><title>Preview App</title></head><body><div>Local Dev Page</div></body></html>');
   });
+  await new Promise(r => previewSrv.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise(r => previewSrv.close(r)));
+  const previewOrigin = `http://127.0.0.1:${previewSrv.address().port}`;
 
-  await waitUntil(() => hotInjectCalls === 1);
-  const hitsAtSync = pollHits;
-  await waitUntil(() => pollHits >= hitsAtSync + 3);
+  const mock = createMockCdpServer();
+  await new Promise(r => mock.server.listen(0, '127.0.0.1', r));
+  t.after(() => mock.close());
+  const port = mock.server.address().port;
+  const agOrigin = `http://127.0.0.1:${port}`;
 
-  ac.abort();
-  const res = await watchPromise;
-  assert.equal(res.ok, true);
-  assert.equal(res.exitReason, 'stopped');
-  assert.equal(ensureCalls, 1);
-  assert.equal(hotInjectCalls, 1, '端口不一致时仅重注同步 1 次，对齐后后续轮询不再重复触发');
-  assert.equal(attachedPort, 62923);
+  mock.state.pages = [
+    { type: 'page', id: 'preview-page', title: 'Preview App', url: `${previewOrigin}/`, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/preview-page` },
+    { type: 'page', id: 'ag-main', title: 'Antigravity', url: `${agOrigin}/c/33333333-3333-4333-8333-333333333333`, webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/ag-main` }
+  ];
+
+  const appDataDir = path.join(tmpDir, 'AppSupport');
+  const discovered = await discoverAntigravityCdp({ port, strictPort: true, appDataDir });
+  assert.equal(discovered.pages.length, 1);
+  assert.equal(discovered.page.id, 'ag-main');
+
+  const api = await connect({ port, strictPort: true, appDataDir });
+  assert.equal(api.origin, agOrigin);
+  assert.deepEqual(api.origins, [agOrigin]);
 });

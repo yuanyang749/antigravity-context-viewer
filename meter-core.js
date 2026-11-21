@@ -429,9 +429,12 @@
       };
     }
 
+    // 取消只证明请求已中断，不证明由谁取消；普通 Go context 取消也属于此类。
+    const canceledMatch = /(?:\bcontext cancel(?:l)?ed\b|\buser cancel(?:l)?ed\b|request was aborted|AbortError)/i.test(error);
+
     // 2. 模型或额度池耗尽 (Quota Exhausted)
     const explicitQuotaMatch = /(?:quota\s*(?:exceeded|reached|limit|exhausted)|out\s+of\s+quota|exhausted.*(?:capacity|quota)|resource_exhausted.*(?:quota|capacity|billing)|free\s+tier\s+quota|daily\s+quota|weekly\s+quota)/i.test(error);
-    const quotaZeroEvidence = Boolean(modelQuota && typeof modelQuota.remainingFraction === 'number' && modelQuota.remainingFraction <= 0.0001);
+    const quotaZeroEvidence = !canceledMatch && Boolean(modelQuota && typeof modelQuota.remainingFraction === 'number' && modelQuota.remainingFraction <= 0.0001);
 
     if (explicitQuotaMatch || quotaZeroEvidence) {
       const resetTimeZh = modelQuota?.resetTime ? formatResetTimeZh(modelQuota.resetTime) : null;
@@ -468,14 +471,13 @@
       };
     }
 
-    // 4. 用户主动取消或请求中断 (Canceled)
-    const canceledMatch = /(?:context canceled by user|user cancelled|request was aborted|AbortError)/i.test(error);
+    // 4. 请求取消或中断 (Canceled)，不推断取消发起方或当前轮次状态。
     if (canceledMatch) {
       return {
         kind: 'canceled',
-        title: '已取消',
-        badgeText: '已取消',
-        detail: '本次生成请求已由用户或系统主动取消',
+        title: '请求中断',
+        badgeText: '已中断',
+        detail: '最近一次生成请求已中断，无法仅凭此记录确定取消来源或当前请求状态',
         serviceLimit: null,
         retryAfterSec: null,
         resetTime: null,
@@ -1906,10 +1908,36 @@
     let priceRange = null;
     const rawTeamsTier = typeof planInfo.teamsTier === 'string' ? planInfo.teamsTier.trim() : '';
 
+    let multiplier = null;
+    if (Number.isFinite(Number(userTier.multiplier)) && Number(userTier.multiplier) > 0) {
+      multiplier = Number(userTier.multiplier);
+    } else if (Number.isFinite(Number(planInfo.multiplier)) && Number(planInfo.multiplier) > 0) {
+      multiplier = Number(planInfo.multiplier);
+    } else if (Number.isFinite(Number(planStatus.quotaMultiplier)) && Number(planStatus.quotaMultiplier) > 0) {
+      multiplier = Number(planStatus.quotaMultiplier);
+    } else if (Number.isFinite(Number(userTier.tierMultiplier)) && Number(userTier.tierMultiplier) > 0) {
+      multiplier = Number(userTier.tierMultiplier);
+    }
+
     if (/ultra/i.test(rawTierName) || /ultra/i.test(userTier.id || '') || /pro_ultimate|teams_tier_ultra/i.test(rawTeamsTier)) {
       tierKey = 'ultra';
+      // 检查明确的倍率子档，如 5x / 20x / 5X / 20X
+      let detectedMultiplierStr = null;
+      const combinedMeta = `${rawTierName} ${userTier.id || ''} ${rawTeamsTier}`;
+      const multStrMatch = combinedMeta.match(/(?:ultra)?[_\-\s]*(\d+x)\b/i);
+      if (multStrMatch) {
+        detectedMultiplierStr = multStrMatch[1].toLowerCase();
+        if (!multiplier) multiplier = parseInt(detectedMultiplierStr, 10);
+      } else if (multiplier) {
+        detectedMultiplierStr = `${multiplier}x`;
+      }
+
       const subTierMatch = rawTierName.match(/ultra\s*([0-9a-zA-Z\-_]+)/i);
-      if (subTierMatch && !['plan', 'tier'].includes(subTierMatch[1].toLowerCase())) {
+      if (detectedMultiplierStr) {
+        tierDisplayName = `Google AI Ultra (${detectedMultiplierStr})`;
+        officialPrice = null;
+        priceRange = `Google AI Ultra (${detectedMultiplierStr}) 子档`;
+      } else if (subTierMatch && !['plan', 'tier'].includes(subTierMatch[1].toLowerCase())) {
         tierDisplayName = `Google AI Ultra (${subTierMatch[1]})`;
         officialPrice = null;
         priceRange = '子档定制费率未知';
@@ -1944,6 +1972,7 @@
       status: 'identified',
       tierKey,
       tierName: tierDisplayName,
+      multiplier,
       tierId: userTier.id || null,
       teamsTier: planInfo.teamsTier || null,
       planName: planInfo.planName || tierDisplayName,
@@ -2394,8 +2423,67 @@
     let teamsTier = null;
     let planName = '未知';
     let tierSource = 'unknown';
+    let multiplier = rawLive?.multiplier || cachedLive?.multiplier || null;
 
-    if (rawLive && rawLive.status === 'identified' && rawLive.tierKey !== 'unknown') {
+    const rawTierOverride = effectiveCustom?.planTierOverride || effectiveCustom?.tierOverride || effectiveCustom?.planTier || null;
+    const normTierOverride = (typeof rawTierOverride === 'string' && rawTierOverride.trim() && rawTierOverride.trim().toLowerCase() !== 'auto')
+      ? rawTierOverride.trim()
+      : null;
+
+    if (normTierOverride) {
+      status = (rawLive && rawLive.status === 'identified') ? 'identified' : 'custom';
+      tierSource = 'custom';
+      tierId = rawLive?.tierId || cachedLive?.tierId || null;
+      teamsTier = rawLive?.teamsTier || cachedLive?.teamsTier || null;
+      const lowerOverride = normTierOverride.toLowerCase();
+
+      if (lowerOverride === 'free' || lowerOverride === 'teams_tier_free') {
+        tierKey = 'free';
+        tierName = 'Free';
+        planName = 'Free';
+        multiplier = null;
+      } else if (lowerOverride === 'pro' || lowerOverride === 'teams_tier_pro') {
+        tierKey = 'pro';
+        tierName = 'Google AI Pro';
+        planName = 'Google AI Pro';
+        multiplier = null;
+      } else if (lowerOverride === 'plus' || lowerOverride === 'teams_tier_plus') {
+        tierKey = 'plus';
+        tierName = 'Google AI Plus';
+        planName = 'Google AI Plus';
+        multiplier = null;
+      } else if (lowerOverride === 'ultra_5x' || lowerOverride === 'ultra 5x' || lowerOverride === 'ultra-5x' || lowerOverride === '5x') {
+        tierKey = 'ultra';
+        tierName = 'Google AI Ultra (5x)';
+        planName = 'Google AI Ultra (5x)';
+        multiplier = 5;
+      } else if (lowerOverride === 'ultra_20x' || lowerOverride === 'ultra 20x' || lowerOverride === 'ultra-20x' || lowerOverride === '20x') {
+        tierKey = 'ultra';
+        tierName = 'Google AI Ultra (20x)';
+        planName = 'Google AI Ultra (20x)';
+        multiplier = 20;
+      } else if (lowerOverride === 'ultra' || lowerOverride === 'google ai ultra') {
+        tierKey = 'ultra';
+        tierName = 'Google AI Ultra';
+        planName = 'Google AI Ultra';
+        multiplier = null;
+      } else {
+        const multMatch = normTierOverride.match(/(\d+x)/i);
+        if (/ultra/i.test(normTierOverride)) {
+          tierKey = 'ultra';
+          if (multMatch) {
+            multiplier = parseInt(multMatch[1], 10);
+            tierName = `Google AI Ultra (${multMatch[1].toLowerCase()})`;
+          } else {
+            tierName = normTierOverride;
+          }
+        } else {
+          tierKey = 'custom';
+          tierName = normTierOverride;
+        }
+        planName = tierName;
+      }
+    } else if (rawLive && rawLive.status === 'identified' && rawLive.tierKey !== 'unknown') {
       status = 'identified';
       tierKey = rawLive.tierKey;
       tierName = rawLive.tierName;
@@ -2403,6 +2491,7 @@
       teamsTier = rawLive.teamsTier || null;
       planName = rawLive.planName || rawLive.tierName;
       tierSource = 'live';
+      multiplier = rawLive.multiplier || multiplier;
     } else if (effectiveCustom && effectiveCustom.tierName) {
       status = 'custom';
       tierKey = effectiveCustom.tierKey || 'custom';
@@ -2419,6 +2508,7 @@
       teamsTier = cachedLive.teamsTier || null;
       planName = cachedLive.planName || cachedLive.tierName;
       tierSource = 'cached_live';
+      multiplier = cachedLive.multiplier || multiplier;
     }
 
     // 2A. 账号所在地区 (accountRegion / country) 独立取值：仅表示本地记录，不影响订阅国家与币种
@@ -2626,6 +2716,8 @@
       tierId,
       teamsTier,
       planName,
+      planTierOverride: normTierOverride || 'auto',
+      multiplier: multiplier || null,
       email: currentEmail,
       accountRegion: country,
       country,
@@ -2668,7 +2760,7 @@
         price: priceSource,
         acquisition: effectiveCustom?.acquisitionSource ? 'custom' : 'default'
       },
-      hasCustomSettings: Boolean(effectiveCustom && (effectiveCustom.country || effectiveCustom.region || effectiveCustom.subscriptionRegion || effectiveCustom.currency || effectiveCustom.actualPricePaid !== undefined || effectiveCustom.customNote || effectiveCustom.acquisitionSource)),
+      hasCustomSettings: Boolean(effectiveCustom && (normTierOverride || effectiveCustom.country || effectiveCustom.region || effectiveCustom.subscriptionRegion || effectiveCustom.currency || effectiveCustom.actualPricePaid !== undefined || effectiveCustom.customNote || effectiveCustom.acquisitionSource)),
       pricingTableVerifiedDate: '2026-11-09',
       updatedAt: rawLive?.updatedAt || new Date().toISOString()
     };
@@ -3725,18 +3817,50 @@
   }
 
   /**
-   * 解析严格 v0.x.x 格式的语义化版本
-   * 防御性要求：只接受 ^v0\.\d+\.\d+$，任何 v2.x 或其他前缀均返回 null
+   * 解析严格 v0.x.x(-prerelease) 格式的语义化版本
+   * 防御性要求：只接受 ^v?0\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$，任何 v2.x 或其他前缀均返回 null
    */
   function parseSemver(tag) {
     if (!tag || typeof tag !== 'string') return null;
-    const m = tag.trim().match(/^v?0\.(\d+)\.(\d+)$/);
+    const m = tag.trim().match(/^v?0\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/);
     if (!m) return null;
-    return { major: 0, minor: parseInt(m[1], 10), patch: parseInt(m[2], 10) };
+    const parsed = { major: 0, minor: parseInt(m[1], 10), patch: parseInt(m[2], 10) };
+    if (m[3]) parsed.prerelease = m[3];
+    return parsed;
   }
 
   /**
-   * 语义化版本对比
+   * 对比 SemVer 预发布标识符序列
+   */
+  function comparePrereleaseIdentifiers(preA, preB) {
+    if (!preA && !preB) return 0;
+    if (!preA && preB) return 1;
+    if (preA && !preB) return -1;
+    const partsA = String(preA).split('.');
+    const partsB = String(preB).split('.');
+    const len = Math.max(partsA.length, partsB.length);
+    for (let i = 0; i < len; i += 1) {
+      if (i >= partsA.length) return -1;
+      if (i >= partsB.length) return 1;
+      const a = partsA[i];
+      const b = partsB[i];
+      if (a === b) continue;
+      const aNum = /^\d+$/.test(a);
+      const bNum = /^\d+$/.test(b);
+      if (aNum && bNum) {
+        const diff = parseInt(a, 10) - parseInt(b, 10);
+        if (diff !== 0) return diff > 0 ? 1 : -1;
+      } else if (aNum !== bNum) {
+        return aNum ? -1 : 1;
+      } else {
+        return a > b ? 1 : -1;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 语义化版本对比（支持预发布后缀：0.8.8 < 0.8.9-beta.1 < 0.8.9-beta.2 < 0.8.9）
    * @returns {number} 1 (vA > vB), -1 (vA < vB), 0 (相等或无法对比)
    */
   function compareVersions(vA, vB) {
@@ -3747,24 +3871,35 @@
     if (!b) return 1;
     if (a.minor !== b.minor) return a.minor > b.minor ? 1 : -1;
     if (a.patch !== b.patch) return a.patch > b.patch ? 1 : -1;
-    return 0;
+    return comparePrereleaseIdentifiers(a.prerelease, b.prerelease);
   }
 
   /**
    * 过滤并筛选可用更新 Release
+   * - 正式版用户默认（allowBetaUpdates !== true）不推送预发布版本
+   * - 预发布用户（如 0.8.9-beta.1）可识别并升级到后续 beta 或正式版（如 0.8.9）
    */
-  function filterReleases(releasesList, currentVersion = '0.8.8') {
+  function filterReleases(releasesList, currentVersion = '0.8.8', options = {}) {
     if (!Array.isArray(releasesList)) return [];
+    const allowBetaUpdates = options?.allowBetaUpdates === true;
+    const currentParsed = parseSemver(currentVersion);
+    const isCurrentBeta = Boolean(currentParsed && currentParsed.prerelease);
+    const acceptPrerelease = allowBetaUpdates || isCurrentBeta;
     const valid = [];
     for (const rel of releasesList) {
-      if (!rel || rel.draft || rel.prerelease) continue;
+      if (!rel || rel.draft) continue;
       const parsed = parseSemver(rel.tag_name);
       if (!parsed) continue; // 忽略非 v0.x 编号
-      const verStr = `0.${parsed.minor}.${parsed.patch}`;
+      const isRelPrerelease = Boolean(rel.prerelease || parsed.prerelease);
+      if (isRelPrerelease && !acceptPrerelease) continue;
+      const verStr = parsed.prerelease
+        ? `0.${parsed.minor}.${parsed.patch}-${parsed.prerelease}`
+        : `0.${parsed.minor}.${parsed.patch}`;
       if (compareVersions(verStr, currentVersion) > 0) {
         valid.push({
           tagName: rel.tag_name,
           version: verStr,
+          prerelease: isRelPrerelease,
           htmlUrl: rel.html_url,
           body: rel.body || '',
           publishedAt: rel.published_at || '',
@@ -3851,15 +3986,47 @@
     return 10;
   }
 
+  function resolveQuotaWindowBucketPair(buckets = []) {
+    const list = Array.isArray(buckets) ? buckets.filter(Boolean) : [];
+    const findWindow = (targetKey, targetShort) => {
+      const candidates = list.filter(b => {
+        const wk = String(b.windowKey || '').trim().toLowerCase();
+        const ws = String(b.windowShort || '').trim().toLowerCase();
+        return wk === targetKey || ws === targetShort;
+      });
+      if (!candidates.length) return null;
+      const priced = candidates.filter(b => b.remainingFraction !== null && b.remainingFraction !== undefined && Number.isFinite(Number(b.remainingFraction)));
+      if (priced.length) {
+        return priced.slice().sort((a, b) => Number(a.remainingFraction) - Number(b.remainingFraction))[0];
+      }
+      return candidates[0];
+    };
+    return {
+      bucket5h: findWindow('5h', '5h'),
+      bucket7d: findWindow('weekly', '7d')
+    };
+  }
+
   /**
    * 统一选择主限额窗口（被 buildModelQuotaSnapshot 与顶栏徽章渲染共用）：
-   * 1) 优先 remainingFraction 最小的更紧缩窗口；
+   * 1) 支持 preferredMode: 'auto' (最紧缩优先) | '5h' | 'weekly' | 'both'；
    * 2) 相同剩余量按 5h -> 24h/daily -> 7d/weekly -> 其他 确定性排序；
    * 3) 返回 { primaryBucket, selectionReason } 供悬浮详情解释选择依据。
    */
-  function selectPrimaryQuotaBucket(buckets = []) {
+  function selectPrimaryQuotaBucket(buckets = [], preferredMode = 'auto') {
     const list = Array.isArray(buckets) ? buckets.filter(Boolean) : [];
     if (!list.length) return { primaryBucket: null, selectionReason: 'none' };
+    const mode = String(preferredMode || 'auto').trim().toLowerCase();
+    if (mode === '5h' || mode === 'weekly') {
+      const pair = resolveQuotaWindowBucketPair(list);
+      const picked = mode === '5h' ? pair.bucket5h : pair.bucket7d;
+      if (picked && picked.remainingFraction !== null && picked.remainingFraction !== undefined && Number.isFinite(Number(picked.remainingFraction))) {
+        return {
+          primaryBucket: picked,
+          selectionReason: list.length === 1 ? 'single_window' : (mode === '5h' ? 'user_5h' : 'user_weekly')
+        };
+      }
+    }
     const priced = list.filter(b => b.remainingFraction !== null && b.remainingFraction !== undefined && Number.isFinite(Number(b.remainingFraction)));
     if (!priced.length) {
       return { primaryBucket: list[0], selectionReason: list.length === 1 ? 'single_window' : 'unpriced_fallback' };
@@ -3969,10 +4136,16 @@
       shared_gemini_argon: 'Gemini 4 Argon / Orchestrator',
       shared_gemini_carbon: 'Gemini 4 Carbon'
     };
+    const CORE_SHARED_POOLS = new Set(Object.keys(fallbackGroupNames));
 
     for (const cfg of rawConfigs) {
       if (!cfg || typeof cfg !== 'object') continue;
       if (cfg.isHistorical === true) continue;
+      if (cfg.isInternal === true) continue;
+      const rawMId = String(cfg.modelId || cfg.model || '').trim().toLowerCase();
+      const rawMAlias = String(cfg.modelOrAlias?.model || '').trim().toLowerCase();
+      if ((rawMId.startsWith('chat_') && /^chat_\d+$/.test(rawMId)) || (rawMAlias.startsWith('chat_') && /^chat_\d+$/.test(rawMAlias))) continue;
+      if (rawMId.startsWith('tab_') || rawMAlias.startsWith('tab_')) continue;
       const gInfo = groupModelProduct(cfg);
       const avail = classifyModelQuotaAvailability(cfg, planStatus);
       const qi = cfg.quotaInfo || {};
@@ -3991,6 +4164,8 @@
       }) || null;
 
       const resolvedSharedKey = matchedSummaryGroup ? matchedSummaryGroup.sharedKey : defaultSharedKey;
+      if (!CORE_SHARED_POOLS.has(resolvedSharedKey)) continue;
+
       const pKey = `${resolvedSharedKey}::${gInfo.productKey}`;
 
       let prod = productMap.get(pKey);
@@ -4102,11 +4277,14 @@
     };
 
     for (const pg of parsedGroups) {
-      ensurePool(pg.sharedKey, pg.title, pg);
+      if (CORE_SHARED_POOLS.has(pg.sharedKey)) {
+        ensurePool(pg.sharedKey, pg.title, pg);
+      }
     }
 
     for (const prod of productMap.values()) {
       const sKey = prod.sharedGroupKey;
+      if (!CORE_SHARED_POOLS.has(sKey)) continue;
       const summaryGroup = parsedGroups.find(pg => pg.sharedKey === sKey) || null;
       const pool = ensurePool(sKey, prod.productLabel, summaryGroup);
       pool.models.push({
@@ -7046,6 +7224,7 @@
     classifyModelQuotaAvailability,
     isDecorativeBadgeTagTitle,
     selectPrimaryQuotaBucket,
+    resolveQuotaWindowBucketPair,
     buildModelQuotaSnapshot,
     splitModelDisplayAndEffort,
     resolvePlaceholderModelInfo,
